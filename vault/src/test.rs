@@ -165,3 +165,59 @@ fn withdraw_rejects_a_non_positive_amount() {
     h.client.deposit(&depositor, &7, &400);
     h.client.withdraw(&7, &depositor, &0);
 }
+
+// ─── transfer_admin ─────────────────────────────────────────────────────────
+
+#[test]
+fn transfer_admin_hands_off_control() {
+    let h = setup();
+    assert_eq!(h.client.get_admin(), h.admin);
+
+    let new_admin = Address::generate(&h.env);
+    h.client.transfer_admin(&new_admin);
+    assert_eq!(h.client.get_admin(), new_admin);
+}
+
+// ─── pause / unpause ────────────────────────────────────────────────────────
+
+#[test]
+fn pause_blocks_deposit_and_withdraw_unpause_restores_them() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+
+    assert!(!h.client.is_paused());
+    h.client.pause();
+    assert!(h.client.is_paused());
+
+    h.client.unpause();
+    assert!(!h.client.is_paused());
+
+    // Both sides work again post-unpause.
+    h.client.deposit(&depositor, &7, &100);
+    h.client.withdraw(&7, &depositor, &50);
+    assert_eq!(h.client.balance_of(&7), 450);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // ContractPaused
+fn deposit_is_rejected_while_paused() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.pause();
+    h.client.deposit(&depositor, &7, &400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // ContractPaused
+fn withdraw_is_rejected_while_paused() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+
+    h.client.pause();
+    h.client.withdraw(&7, &depositor, &100);
+}

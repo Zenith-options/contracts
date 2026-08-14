@@ -50,6 +50,42 @@ impl Vault {
             .set(&DataKey::TotalEscrowed, &0i128);
     }
 
+    /// Hands off control to a new address. Requires the CURRENT admin's
+    /// signature, not the incoming one. Since `admin` also gates every
+    /// withdraw, this is how the calling contract a vault serves would
+    /// change (e.g. after an options_market upgrade to a new contract
+    /// address).
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
+    /// Emergency stop: blocks deposit and withdraw. Both sides, unlike
+    /// options_market's pause (which only blocks new exposure, not
+    /// winding existing positions down) — a vault holding real funds
+    /// should be freezable outright if something's gone wrong, since
+    /// there's no "existing position" here that needs an exit path
+    /// independent of the vault itself.
+    pub fn pause(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+    }
+
+    pub fn unpause(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Pulls `amount` of the vault's token from `from` into the vault's
     /// own balance, crediting `tag`'s escrow ledger. `from` must authorize
     /// the transfer — this contract never moves funds without the source
