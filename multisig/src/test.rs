@@ -89,3 +89,87 @@ fn initialize_rejects_a_duplicate_signer() {
     let client = MultisigClient::new(&env, &contract_id);
     client.initialize(&signers, &1);
 }
+
+// ─── approve / revoke / is_approved ────────────────────────────────────────
+
+#[test]
+fn approve_records_the_signers_own_vote() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+
+    assert!(h.client.has_approved(&42, &h.signers[0]));
+    assert!(!h.client.has_approved(&42, &h.signers[1]));
+    assert_eq!(h.client.get_approval_count(&42), 1);
+}
+
+#[test]
+fn is_approved_flips_true_once_the_threshold_is_reached() {
+    let h = setup();
+    // Threshold is 2 of 3.
+    assert!(!h.client.is_approved(&42));
+
+    h.client.approve(&h.signers[0], &42);
+    assert!(!h.client.is_approved(&42));
+
+    h.client.approve(&h.signers[1], &42);
+    assert!(h.client.is_approved(&42));
+}
+
+#[test]
+fn different_action_ids_track_approvals_independently() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &1);
+    h.client.approve(&h.signers[0], &2);
+    h.client.approve(&h.signers[1], &2);
+
+    assert!(!h.client.is_approved(&1)); // only 1 of 3
+    assert!(h.client.is_approved(&2)); // 2 of 3
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // NotASigner
+fn approve_rejects_a_non_signer() {
+    let h = setup();
+    let stranger = Address::generate(&h.env);
+    h.client.approve(&stranger, &42);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")] // AlreadyApproved
+fn approve_rejects_the_same_signer_voting_twice() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+    h.client.approve(&h.signers[0], &42);
+}
+
+#[test]
+fn revoke_withdraws_the_signers_vote() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+    h.client.approve(&h.signers[1], &42);
+    assert!(h.client.is_approved(&42));
+
+    h.client.revoke(&h.signers[1], &42);
+    assert!(!h.client.has_approved(&42, &h.signers[1]));
+    assert_eq!(h.client.get_approval_count(&42), 1);
+    // Dropping below threshold un-approves the action.
+    assert!(!h.client.is_approved(&42));
+}
+
+#[test]
+fn a_revoked_signer_can_approve_again() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+    h.client.revoke(&h.signers[0], &42);
+    h.client.approve(&h.signers[0], &42);
+
+    assert!(h.client.has_approved(&42, &h.signers[0]));
+    assert_eq!(h.client.get_approval_count(&42), 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // NotYetApproved
+fn revoke_rejects_a_signer_who_never_approved() {
+    let h = setup();
+    h.client.revoke(&h.signers[0], &42);
+}
