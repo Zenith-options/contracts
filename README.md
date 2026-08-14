@@ -130,7 +130,9 @@ documented per field.
 | `upgrade(new_wasm_hash)` | Swaps the contract's executable via Soroban's deployer, keeping the same address, ID, and storage. |
 | `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
 | `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out. Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. |
+| `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Same validation and per-underlying cap apply. |
 | `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. |
+| `update_premium_via_multisig(multisig_contract, action_id, series_id, new_premium, new_implied_vol)` | Permissionless alternative to `update_premium`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
 | `cancel_series(series_id)` | Cancels an Active series. Position holders then call `claim_refund` individually — the admin doesn't push funds to everyone in one call, since that would scale badly against Soroban's per-call resource limits. |
 | `cancel_series_via_multisig(multisig_contract, action_id, series_id)` | Permissionless alternative to `cancel_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Cancelling disrupts every open position in a series, so gating it behind M-of-N is at least as warranted as pause. |
 
@@ -331,20 +333,19 @@ compromised signer can never add another compromised signer.
   (zero risk to the original flow's existing test coverage) but means
   there's no enforcement that a series *must* use the cross-contract
   path just because a `price_oracle` deployment exists.
-- **`multisig` is wired into a subset of each contract's admin-gated
-  functions, not all of them.** On options_market:
-  `pause`/`unpause`/`transfer_admin`/`set_fee_rate`/`upgrade`/`cancel_series`
-  all now have a `_via_multisig` alternative. On price_oracle:
+- **Every admin-gated function on options_market now has a
+  `_via_multisig` alternative** (`pause`, `unpause`, `transfer_admin`,
+  `set_fee_rate`, `upgrade`, `cancel_series`, `create_series`,
+  `update_premium`). price_oracle and vault are wired for their own
+  most sensitive functions but not exhaustively: price_oracle covers
   `pause`/`unpause`/`transfer_admin`/`set_max_staleness`/`add_feeder`/
-  `remove_feeder` do. On vault:
-  `pause`/`unpause`/`transfer_admin`/`withdraw`/`transfer_tag`/`sweep_untagged`
-  do — every vault function that moves or reassigns funds now has one.
-  Every `_via_multisig` function is additive (the original admin-gated
-  version is unchanged) and checks `is_approved(action_id)` on a
-  deployed Multisig instead of a single signature. Every OTHER
-  sensitive function — `create_series`, `update_premium` on
-  options_market — still goes through a bare `admin: Address`, one
-  key, not M-of-N. A caller wiring more of these in is responsible for
-  picking its own
-  stable `action_id` scheme per function, since Multisig never
-  interprets what an id means.
+  `remove_feeder`; vault covers `pause`/`unpause`/`transfer_admin`/
+  `withdraw`/`transfer_tag`/`sweep_untagged` (every vault function that
+  moves or reassigns funds). Every `_via_multisig` function is additive
+  (the original admin-gated version is unchanged) and checks
+  `is_approved(action_id)` on a deployed Multisig instead of a single
+  signature, with the same validation the original enforces — approval
+  only changes who can call a function, never what a valid call to it
+  looks like. A caller wiring more of these in is responsible for
+  picking its own stable `action_id` scheme per function, since
+  Multisig never interprets what an id means.
