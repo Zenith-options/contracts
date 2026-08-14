@@ -14,9 +14,10 @@ on:
 # job below installs wasm32-unknown-unknown and builds price_oracle's and
 # multisig's wasm first when it's about to touch options_market.
 #
-# price_oracle itself also now cross-calls multisig the same way (for
-# pause_via_multisig/transfer_admin_via_multisig), so it needs multisig's
-# wasm built first too — a second, independent build-order edge.
+# price_oracle and vault each also now cross-call multisig the same way
+# (for pause_via_multisig/unpause_via_multisig/transfer_admin_via_multisig),
+# so both need multisig's wasm built first too — two more independent
+# build-order edges, both satisfied by the same pre-build step.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -35,7 +36,7 @@ jobs:
       - if: matrix.crate == 'options_market'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
-      - if: matrix.crate == 'price_oracle'
+      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
       - run: cargo build --all-targets
@@ -61,7 +62,7 @@ jobs:
       - if: matrix.crate == 'options_market'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
-      - if: matrix.crate == 'price_oracle'
+      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
       - run: cargo clippy --all-targets -- -D warnings
@@ -97,7 +98,7 @@ jobs:
       - if: matrix.crate == 'options_market'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
-      - if: matrix.crate == 'price_oracle'
+      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
       - run: cargo build --target wasm32-unknown-unknown --release
