@@ -196,6 +196,35 @@ impl PriceOracle {
         events::feeder_added(&env, feeder);
     }
 
+    /// Permissionless alternative to add_feeder: cross-calls a deployed
+    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// the admin's own signature. Adding a feeder expands who can move
+    /// get_price's aggregate, so gating it behind M-of-N is at least as
+    /// warranted as pause.
+    pub fn add_feeder_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        feeder: Address,
+    ) {
+        require_not_paused(&env);
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
+        if feeders.contains(&feeder) {
+            panic_with_error!(&env, Error::FeederAlreadyAdded);
+        }
+        if feeders.len() >= MAX_FEEDERS {
+            panic_with_error!(&env, Error::TooManyFeeders);
+        }
+        feeders.push_back(feeder.clone());
+        env.storage().instance().set(&DataKey::Feeders, &feeders);
+        events::feeder_added(&env, feeder);
+    }
+
     /// Admin revokes a feeder's authorization. Their most recent price
     /// report is left in storage (for audit purposes) but is no longer
     /// counted toward the aggregate once removed.
