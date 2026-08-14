@@ -7,13 +7,17 @@
 //! Writers lock collateral; buyers pay premium. Settlement at expiry via oracle.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror,
+    contract, contractimpl, contracttype,
     Address, Env, Symbol, Vec, token,
     panic_with_error,
 };
 
 #[cfg(test)]
 mod test;
+
+mod error;
+
+use error::Error;
 
 // ─── Precision & Limits ──────────────────────────────────────────────────────
 
@@ -99,30 +103,6 @@ pub struct OptionPosition {
     pub is_exercised: bool,
     pub is_settled: bool,
     pub opened_at: u64,
-}
-
-// ─── Errors ───────────────────────────────────────────────────────────────────
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum Error {
-    AlreadyInitialized    = 1,
-    Unauthorized          = 2,
-    SeriesNotFound        = 3,
-    SeriesNotActive       = 4,
-    SeriesNotExpired      = 5,
-    PositionNotFound      = 6,
-    InsufficientPremium   = 7,
-    InsufficientCollateral= 8,
-    AlreadyExercised      = 9,
-    AlreadySettled        = 10,
-    ExerciseWindowClosed  = 11,
-    ZeroContracts         = 12,
-    PriceNotSet           = 13,
-    NotInTheMoney         = 14,
-    WrongSide             = 15,
-    ExpiryTooSoon         = 16,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
