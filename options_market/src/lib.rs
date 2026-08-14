@@ -8,7 +8,7 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror,
-    Address, Env, Map, Symbol, Vec, String, token,
+    Address, Env, Symbol, Vec, token,
     panic_with_error,
 };
 
@@ -16,7 +16,6 @@ use soroban_sdk::{
 
 const PRICE_PRECISION: i128 = 10_000_000;       // 1e7
 const RATE_PRECISION:  i128 = 1_000_000_000;    // 1e9
-const MAX_SERIES_PER_UNDERLYING: u32 = 50;
 const MIN_COLLATERAL_RATIO: i128 = 1_100_000_000; // 110% over-collateralization for puts
 const SETTLEMENT_WINDOW: u64 = 86_400;           // 24h window after expiry to exercise
 
