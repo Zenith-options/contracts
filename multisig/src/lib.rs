@@ -38,6 +38,18 @@ pub struct Multisig;
 
 #[contractimpl]
 impl Multisig {
+    /// Deliberately does NOT call require_auth() on any signer, unlike
+    /// every other contract's initialize() here requiring its incoming
+    /// admin's signature. Naming an address as a signer costs an
+    /// attacker nothing without that address's cooperation: approve()
+    /// still requires the REAL signer's own signature, so a Multisig
+    /// initialized with signers who never consented can simply never
+    /// reach is_approved() unless enough of them independently choose
+    /// to approve — at which point they could have deployed an honest
+    /// instance themselves anyway. The signer list here is declarative
+    /// metadata, not a claim of consent; the actual security property
+    /// (only real signers can approve) lives entirely in approve()'s
+    /// own require_auth().
     pub fn initialize(env: Env, signers: Vec<Address>, threshold: u32) {
         if env.storage().instance().has(&DataKey::Signers) {
             panic_with_error!(&env, Error::AlreadyInitialized);
