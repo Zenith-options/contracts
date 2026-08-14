@@ -264,3 +264,61 @@ fn reset_emits_a_reset_event_with_the_action_id_as_data() {
     let (_, _topics, data) = events.last().unwrap();
     assert_eq!(u64::try_from_val(&h.env, &data).unwrap(), 42);
 }
+
+// ─── require_auth is load-bearing where it exists, absent where it doesn't ─
+
+/// Confirms initialize()'s lack of require_auth() is an intentional
+/// design choice, not an untested oversight: it succeeds even with NO
+/// auths mocked at all, unlike every other contract's initialize()
+/// here (which all require the incoming admin's own signature). See
+/// the doc comment on initialize() for why this is safe — approve()'s
+/// own require_auth() is what actually gates anything.
+#[test]
+fn initialize_does_not_require_any_signers_authorization() {
+    let env = Env::default(); // deliberately no mock_all_auths()
+    let signers = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let contract_id = env.register_contract(None, Multisig);
+    let client = MultisigClient::new(&env, &contract_id);
+
+    client.initialize(
+        &vec![
+            &env,
+            signers[0].clone(),
+            signers[1].clone(),
+            signers[2].clone(),
+        ],
+        &2,
+    );
+    assert_eq!(client.get_signer_count(), 3);
+}
+
+#[test]
+#[should_panic] // no auth was mocked at all — require_auth() has nothing to accept
+fn approve_without_any_authorization_panics() {
+    // Unlike initialize(), approve() DOES require the signer's own
+    // signature — this confirms that check is load-bearing, not a
+    // no-op, by never arming mock_all_auths() in the first place.
+    let env = Env::default();
+    let signers = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let contract_id = env.register_contract(None, Multisig);
+    let client = MultisigClient::new(&env, &contract_id);
+    client.initialize(
+        &vec![
+            &env,
+            signers[0].clone(),
+            signers[1].clone(),
+            signers[2].clone(),
+        ],
+        &2,
+    );
+
+    client.approve(&signers[0], &42);
+}
