@@ -68,6 +68,31 @@ impl PriceOracle {
         events::max_staleness_updated(&env, seconds);
     }
 
+    /// Permissionless alternative to set_max_staleness: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Worth gating the same way as
+    /// pause/transfer_admin — a compromised admin widening max_staleness
+    /// is a quiet way to make get_price accept increasingly stale, and
+    /// therefore increasingly manipulable, prices.
+    pub fn set_max_staleness_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        seconds: u64,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if seconds == 0 {
+            panic_with_error!(&env, Error::InvalidStaleness);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxStaleness, &seconds);
+        events::max_staleness_updated(&env, seconds);
+    }
+
     pub fn get_max_staleness(env: Env) -> u64 {
         env.storage()
             .instance()
