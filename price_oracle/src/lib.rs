@@ -15,6 +15,7 @@ mod test;
 mod error;
 mod events;
 mod math;
+mod multisig_client;
 mod types;
 
 use error::Error;
@@ -87,6 +88,25 @@ impl PriceOracle {
         events::admin_transferred(&env, admin, new_admin);
     }
 
+    /// Permissionless alternative to transfer_admin: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the current admin's own signature — same pattern as
+    /// options_market's transfer_admin_via_multisig.
+    pub fn transfer_admin_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        new_admin: Address,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
+    }
+
     /// Emergency stop: blocks add_feeder, remove_feeder, and report_price.
     /// Does NOT block get_price or any other view — a pause should freeze
     /// further changes to the feed, not hide the last-known price from
@@ -101,6 +121,26 @@ impl PriceOracle {
     pub fn unpause(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        events::unpaused(&env);
+    }
+
+    /// Permissionless alternative to pause(), same rationale and pattern
+    /// as options_market's pause_via_multisig.
+    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        events::paused(&env);
+    }
+
+    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         env.storage().instance().set(&DataKey::Paused, &false);
         events::unpaused(&env);
     }

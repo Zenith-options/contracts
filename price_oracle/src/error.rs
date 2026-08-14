@@ -12,4 +12,5 @@ pub enum Error {
     ContractPaused = 6,
     InvalidStaleness = 7,
     TooManyFeeders = 8,
+    Unauthorized = 9,
 }

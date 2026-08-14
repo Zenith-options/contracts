@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use crate::{PriceOracle, PriceOracleClient};
+use multisig::{Multisig, MultisigClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
     Address, Env, Symbol, TryFromVal,
@@ -344,4 +345,109 @@ fn pause_and_unpause_each_emit_their_own_event() {
 
     let events_after = h.env.events().all().len();
     assert_eq!(events_after - events_before, 2);
+}
+
+// ─── cross-contract: pause_via_multisig / transfer_admin_via_multisig ─────
+
+/// Deploys a real multisig contract in the SAME Env as the price
+/// oracle under test, with a 2-of-3 threshold.
+fn setup_multisig(h: &Harness) -> (Address, [Address; 3]) {
+    let signers = [
+        Address::generate(&h.env),
+        Address::generate(&h.env),
+        Address::generate(&h.env),
+    ];
+    let contract_id = h.env.register_contract(None, Multisig);
+    let client = MultisigClient::new(&h.env, &contract_id);
+    client.initialize(
+        &soroban_sdk::vec![
+            &h.env,
+            signers[0].clone(),
+            signers[1].clone(),
+            signers[2].clone()
+        ],
+        &2,
+    );
+    (contract_id, signers)
+}
+
+#[test]
+fn pause_via_multisig_pauses_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 1u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    assert!(!h.client.is_paused());
+    h.client.pause_via_multisig(&multisig_id, &action_id);
+    assert!(h.client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // Unauthorized
+fn pause_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    multisig_client.approve(&signers[0], &1u64); // only 1 of 3
+
+    h.client.pause_via_multisig(&multisig_id, &1u64);
+}
+
+#[test]
+fn unpause_via_multisig_unpauses_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    h.client.pause();
+    assert!(h.client.is_paused());
+
+    let action_id = 3u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client.unpause_via_multisig(&multisig_id, &action_id);
+    assert!(!h.client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // Unauthorized
+fn unpause_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    h.client.pause();
+    h.client.unpause_via_multisig(&multisig_id, &99u64);
+}
+
+#[test]
+fn transfer_admin_via_multisig_hands_off_control_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 2u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let new_admin = Address::generate(&h.env);
+    h.client
+        .transfer_admin_via_multisig(&multisig_id, &action_id, &new_admin);
+    assert_eq!(h.client.get_admin(), new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // Unauthorized
+fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, _signers) = setup_multisig(&h);
+    let new_admin = Address::generate(&h.env);
+
+    h.client
+        .transfer_admin_via_multisig(&multisig_id, &99u64, &new_admin);
 }
