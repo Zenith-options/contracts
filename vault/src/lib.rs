@@ -304,6 +304,44 @@ impl Vault {
         events::tag_transferred(&env, from_tag, to_tag, amount);
     }
 
+    /// Permissionless alternative to transfer_tag: cross-calls a deployed
+    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// the admin's own signature. Same rationale as withdraw_via_multisig.
+    pub fn transfer_tag_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        from_tag: u64,
+        to_tag: u64,
+        amount: i128,
+    ) {
+        require_not_paused(&env);
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+
+        let from_key = DataKey::Escrow(from_tag);
+        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+        if from_balance < amount {
+            panic_with_error!(&env, Error::InsufficientEscrowBalance);
+        }
+        env.storage()
+            .persistent()
+            .set(&from_key, &from_balance.checked_sub(amount).unwrap());
+
+        let to_key = DataKey::Escrow(to_tag);
+        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&to_key, &to_balance.checked_add(amount).unwrap());
+
+        events::tag_transferred(&env, from_tag, to_tag, amount);
+    }
+
     pub fn balance_of(env: Env, tag: u64) -> i128 {
         env.storage()
             .persistent()
