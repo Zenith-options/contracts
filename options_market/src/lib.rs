@@ -91,6 +91,31 @@ impl OptionsMarket {
         events::fee_rate_updated(&env, new_bps);
     }
 
+    /// Permissionless alternative to set_fee_rate: cross-calls a deployed
+    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// the admin's own signature. Same MAX_FEE_RATE_BPS cap applies —
+    /// M-of-N approval doesn't bypass the sanity check, it just replaces
+    /// whose signature satisfies the auth requirement.
+    pub fn set_fee_rate_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        new_bps: u32,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let new_bps = new_bps as i128;
+        if new_bps > MAX_FEE_RATE_BPS {
+            panic_with_error!(&env, Error::InvalidFeeRate);
+        }
+
+        env.storage().instance().set(&DataKey::FeeRateBps, &new_bps);
+        events::fee_rate_updated(&env, new_bps);
+    }
+
     /// Admin hands off control to a new address. Requires the CURRENT admin's
     /// signature, not the incoming one — the new admin doesn't need to do
     /// anything to receive control.
@@ -130,6 +155,25 @@ impl OptionsMarket {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Permissionless alternative to upgrade: cross-calls a deployed
+    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// the admin's own signature. Swapping the contract's executable is
+    /// the single most consequential action any of these contracts can
+    /// take — gating it behind M-of-N approval rather than one key is the
+    /// clearest case for this pattern in the whole codebase.
+    pub fn upgrade_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        new_wasm_hash: BytesN<32>,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
@@ -284,6 +328,41 @@ impl OptionsMarket {
     pub fn cancel_series(env: Env, series_id: u64) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Active {
+            panic_with_error!(&env, Error::SeriesNotActive);
+        }
+
+        series.state = SeriesState::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+
+        events::series_cancelled(&env, series_id);
+    }
+
+    /// Permissionless alternative to cancel_series: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Cancelling a series is
+    /// disruptive to every open position in it, so gating it behind M-of-N
+    /// approval (rather than a single key) is at least as warranted here
+    /// as for pause.
+    pub fn cancel_series_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        series_id: u64,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
 
         let mut series: OptionSeries = env
             .storage()
