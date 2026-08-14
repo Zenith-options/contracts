@@ -250,7 +250,7 @@ impl OptionsMarket {
         // decision, not a token-contract-level guarantee we can enforce
         // retroactively.
         let refund = match position.side {
-            PositionSide::Long => position.premium_paid - position.fee_paid,
+            PositionSide::Long => position.premium_paid.checked_sub(position.fee_paid).unwrap(),
             PositionSide::Short => position.collateral_locked,
         };
 
@@ -334,17 +334,20 @@ impl OptionsMarket {
         add_user_position(&env, &buyer, pos_id);
 
         // Update OI
-        series.open_interest += contracts;
+        series.open_interest = series.open_interest.checked_add(contracts).unwrap();
         env.storage().persistent().set(&DataKey::Series(series_id), &series);
 
         let total_collected: i128 = env.storage().instance().get(&DataKey::TotalPremiumsCollected).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalPremiumsCollected, &(total_collected + premium_after_fee));
+        env.storage().instance().set(
+            &DataKey::TotalPremiumsCollected,
+            &(total_collected.checked_add(premium_after_fee).unwrap()),
+        );
 
         // Funds the pool writers get paid out of — see write_option for why
         // this indirection exists instead of writers drawing directly off
         // the vault's raw token balance.
         let pool: i128 = env.storage().instance().get(&DataKey::PremiumPool).unwrap_or(0);
-        env.storage().instance().set(&DataKey::PremiumPool, &(pool + premium_after_fee));
+        env.storage().instance().set(&DataKey::PremiumPool, &(pool.checked_add(premium_after_fee).unwrap()));
 
         events::option_bought(&env, buyer, pos_id, series_id, contracts, total_premium);
 
@@ -431,7 +434,7 @@ impl OptionsMarket {
         if pool < writer_premium {
             panic_with_error!(&env, Error::InsufficientPremiumPool);
         }
-        env.storage().instance().set(&DataKey::PremiumPool, &(pool - writer_premium));
+        env.storage().instance().set(&DataKey::PremiumPool, &(pool.checked_sub(writer_premium).unwrap()));
 
         usdc.transfer(&env.current_contract_address(), &writer, &writer_premium);
 
@@ -453,7 +456,7 @@ impl OptionsMarket {
         env.storage().persistent().set(&DataKey::Position(pos_id), &position);
         add_user_position(&env, &writer, pos_id);
 
-        series.open_interest += contracts;
+        series.open_interest = series.open_interest.checked_add(contracts).unwrap();
         env.storage().persistent().set(&DataKey::Series(series_id), &series);
 
         events::option_written(&env, writer, pos_id, series_id, contracts, writer_premium, required_collateral);
@@ -569,7 +572,7 @@ impl OptionsMarket {
 
         // Compute how much of collateral was consumed by exercised long positions
         let max_loss = calc_payout(&series.option_type, series.strike_price, settlement_price, position.contracts);
-        let reclaim = (position.collateral_locked - max_loss).max(0);
+        let reclaim = position.collateral_locked.checked_sub(max_loss).unwrap().max(0);
 
         if reclaim > 0 {
             let collateral_token: Address = env.storage().instance().get(&DataKey::CollateralToken).unwrap();
