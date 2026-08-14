@@ -25,4 +25,5 @@ pub enum Error {
     InvalidFeeRate = 19,
     TooManySeriesForUnderlying = 20,
     InsufficientPremiumPool = 21,
+    InvalidSeriesParams = 22,
 }

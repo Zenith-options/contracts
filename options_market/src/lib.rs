@@ -137,6 +137,9 @@ impl OptionsMarket {
         if expiry <= now + 3600 {
             panic_with_error!(&env, Error::ExpiryTooSoon);
         }
+        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
+            panic_with_error!(&env, Error::InvalidSeriesParams);
+        }
 
         let underlying_count_key = DataKey::SeriesCountForUnderlying(underlying.clone());
         let underlying_count: u32 = env.storage().persistent().get(&underlying_count_key).unwrap_or(0);

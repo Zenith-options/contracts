@@ -124,6 +124,51 @@ fn create_series_rejects_expiry_less_than_an_hour_out() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #22)")] // InvalidSeriesParams
+fn create_series_rejects_a_non_positive_strike() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    h.client.create_series(
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &0,
+        &expiry,
+        &40_000_000,
+        &450_000_000,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")] // InvalidSeriesParams
+fn create_series_rejects_a_negative_premium() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    h.client.create_series(
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &-1,
+        &450_000_000,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")] // InvalidSeriesParams
+fn create_series_rejects_a_negative_implied_vol() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    h.client.create_series(
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &-1,
+    );
+}
+
+#[test]
 #[should_panic] // no auth was mocked at all — require_auth() has nothing to accept
 fn initialize_without_any_authorization_panics() {
     // Deliberately skips mock_all_auths(): every other test in this file
