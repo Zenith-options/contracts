@@ -13,6 +13,7 @@ use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Symbol
 mod test;
 
 mod error;
+mod events;
 mod math;
 mod types;
 
@@ -63,6 +64,7 @@ impl PriceOracle {
         env.storage()
             .instance()
             .set(&DataKey::MaxStaleness, &seconds);
+        events::max_staleness_updated(&env, seconds);
     }
 
     pub fn get_max_staleness(env: Env) -> u64 {
@@ -82,6 +84,7 @@ impl PriceOracle {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
     }
 
     /// Emergency stop: blocks add_feeder, remove_feeder, and report_price.
@@ -92,12 +95,14 @@ impl PriceOracle {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        events::paused(&env);
     }
 
     pub fn unpause(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        events::unpaused(&env);
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -121,8 +126,9 @@ impl PriceOracle {
         if feeders.len() >= MAX_FEEDERS {
             panic_with_error!(&env, Error::TooManyFeeders);
         }
-        feeders.push_back(feeder);
+        feeders.push_back(feeder.clone());
         env.storage().instance().set(&DataKey::Feeders, &feeders);
+        events::feeder_added(&env, feeder);
     }
 
     /// Admin revokes a feeder's authorization. Their most recent price
@@ -138,6 +144,7 @@ impl PriceOracle {
             Some(i) => {
                 feeders.remove(i).unwrap();
                 env.storage().instance().set(&DataKey::Feeders, &feeders);
+                events::feeder_removed(&env, feeder);
             }
             None => panic_with_error!(&env, Error::FeederNotFound),
         }
@@ -169,9 +176,11 @@ impl PriceOracle {
         }
 
         let now = env.ledger().timestamp();
-        env.storage()
-            .persistent()
-            .set(&DataKey::PriceReport(symbol, feeder), &(price, now));
+        env.storage().persistent().set(
+            &DataKey::PriceReport(symbol.clone(), feeder.clone()),
+            &(price, now),
+        );
+        events::price_reported(&env, feeder, symbol, price);
     }
 
     pub fn get_latest_report(env: Env, symbol: Symbol, feeder: Address) -> Option<(i128, u64)> {

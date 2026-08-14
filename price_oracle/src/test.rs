@@ -2,8 +2,8 @@
 
 use crate::{PriceOracle, PriceOracleClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, Env, Symbol,
+    testutils::{Address as _, Events as _, Ledger},
+    Address, Env, Symbol, TryFromVal,
 };
 
 struct Harness<'a> {
@@ -304,4 +304,44 @@ fn pause_does_not_block_get_price() {
 
     h.client.pause();
     assert_eq!(h.client.get_price(&xlm).unwrap(), 1_200_000);
+}
+
+// ─── events ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn add_feeder_emits_a_feeder_added_event() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+
+    let events = h.env.events().all();
+    let (contract_id, _topics, data) = events.last().unwrap();
+    assert_eq!(contract_id, h.client.address);
+    assert_eq!(Address::try_from_val(&h.env, &data).unwrap(), feeder);
+}
+
+#[test]
+fn report_price_emits_a_price_reported_event() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    let xlm = Symbol::new(&h.env, "XLM");
+
+    h.client.report_price(&feeder, &xlm, &1_200_000);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 1_200_000);
+}
+
+#[test]
+fn pause_and_unpause_each_emit_their_own_event() {
+    let h = setup();
+    let events_before = h.env.events().all().len();
+
+    h.client.pause();
+    h.client.unpause();
+
+    let events_after = h.env.events().all().len();
+    assert_eq!(events_after - events_before, 2);
 }
