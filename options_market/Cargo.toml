@@ -27,6 +27,8 @@ soroban-sdk = { version = "21.0.0", features = ["testutils"] }
 # contract instead — via contractimport! against its compiled wasm, not by
 # depending on and linking its actual implementation).
 price_oracle = { package = "zenith-price-oracle", path = "../price_oracle", features = ["testutils"] }
+# Same reasoning as price_oracle above, for src/multisig_client.rs.
+multisig = { package = "zenith-multisig", path = "../multisig", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

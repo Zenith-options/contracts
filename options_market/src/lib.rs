@@ -16,6 +16,7 @@ mod test;
 mod error;
 mod events;
 mod math;
+mod multisig_client;
 mod price_oracle_client;
 mod storage;
 mod types;
@@ -125,6 +126,33 @@ impl OptionsMarket {
     pub fn unpause(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        events::unpaused(&env);
+    }
+
+    /// Permissionless alternative to pause(): instead of the single
+    /// admin address asserting the pause directly, anyone can trigger it
+    /// once a deployed Multisig reports `action_id` as approved — no
+    /// require_auth() needed, since the approval itself (M-of-N signers,
+    /// checked on-chain by the Multisig) is what's actually authorizing
+    /// this, not the caller triggering it. Same `action_id`-is-opaque
+    /// contract as everywhere Multisig is used: it's this caller's job to
+    /// pick a stable id scheme, not Multisig's or options_market's to
+    /// interpret one.
+    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        events::paused(&env);
+    }
+
+    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
         env.storage().instance().set(&DataKey::Paused, &false);
         events::unpaused(&env);
     }

@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
+use multisig::{Multisig, MultisigClient};
 use price_oracle::{PriceOracle, PriceOracleClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -1030,4 +1031,85 @@ fn set_settlement_price_from_oracle_rejects_a_stale_or_missing_oracle_price() {
     advance_past_expiry(&h, series_id);
     h.client
         .set_settlement_price_from_oracle(&series_id, &oracle_id);
+}
+
+// ─── cross-contract: pause_via_multisig / unpause_via_multisig ─────────────
+
+/// Deploys a real multisig contract in the SAME Env, the third
+/// cross-contract dependency options_market has (alongside price_oracle).
+/// Returns (contract_id, [signer0, signer1, signer2]) with a 2-of-3
+/// threshold.
+fn setup_multisig(h: &Harness) -> (Address, [Address; 3]) {
+    let signers = [
+        Address::generate(&h.env),
+        Address::generate(&h.env),
+        Address::generate(&h.env),
+    ];
+    let contract_id = h.env.register_contract(None, Multisig);
+    let client = MultisigClient::new(&h.env, &contract_id);
+    client.initialize(
+        &soroban_sdk::vec![
+            &h.env,
+            signers[0].clone(),
+            signers[1].clone(),
+            signers[2].clone()
+        ],
+        &2,
+    );
+    (contract_id, signers)
+}
+
+#[test]
+fn pause_via_multisig_pauses_once_the_action_is_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 1u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id); // 2 of 3, reaches threshold
+
+    assert!(!h.client.is_paused());
+    h.client.pause_via_multisig(&multisig_id, &action_id);
+    assert!(h.client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn pause_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    // Only 1 of 3 — below the 2-of-3 threshold.
+    multisig_client.approve(&signers[0], &1u64);
+
+    h.client.pause_via_multisig(&multisig_id, &1u64);
+}
+
+#[test]
+fn unpause_via_multisig_unpauses_once_the_action_is_approved() {
+    let h = setup();
+    h.client.pause();
+    assert!(h.client.is_paused());
+
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 2u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client.unpause_via_multisig(&multisig_id, &action_id);
+    assert!(!h.client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn unpause_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    h.client.pause();
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    // No approvals at all for this action_id.
+    h.client.unpause_via_multisig(&multisig_id, &99u64);
 }
