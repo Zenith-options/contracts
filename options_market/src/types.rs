@@ -77,7 +77,7 @@ pub struct OptionPosition {
     pub side: PositionSide,
     pub contracts: i128,         // PRICE_PRECISION scale (1.0 = 10_000_000)
     pub premium_paid: i128,      // total premium paid or received (gross, includes fee for longs)
-    pub fee_paid: i128,          // protocol fee actually deducted at open time (longs only; 0 for shorts)
+    pub fee_paid: i128, // protocol fee actually deducted at open time (longs only; 0 for shorts)
     pub collateral_locked: i128, // for writers only
     pub is_exercised: bool,
     pub is_settled: bool,

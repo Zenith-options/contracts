@@ -18,16 +18,29 @@ pub const MAX_SERIES_PER_UNDERLYING: u32 = 50;
 
 /// Protocol fee on an amount, given a rate in basis points (1 bps = 0.01%).
 pub fn calc_fee(amount: i128, fee_rate_bps: i128) -> i128 {
-    amount.checked_mul(fee_rate_bps).unwrap().checked_div(10_000).unwrap()
+    amount
+        .checked_mul(fee_rate_bps)
+        .unwrap()
+        .checked_div(10_000)
+        .unwrap()
 }
 
 /// Cash payout at settlement:
 /// Call: max(0, settlement - strike) × contracts / PRICE_PRECISION
 /// Put:  max(0, strike - settlement) × contracts / PRICE_PRECISION
-pub fn calc_payout(option_type: &OptionType, strike: i128, settlement: i128, contracts: i128) -> i128 {
+pub fn calc_payout(
+    option_type: &OptionType,
+    strike: i128,
+    settlement: i128,
+    contracts: i128,
+) -> i128 {
     let intrinsic = match option_type {
         OptionType::Call => (settlement - strike).max(0),
         OptionType::Put => (strike - settlement).max(0),
     };
-    contracts.checked_mul(intrinsic).unwrap().checked_div(PRICE_PRECISION).unwrap()
+    contracts
+        .checked_mul(intrinsic)
+        .unwrap()
+        .checked_div(PRICE_PRECISION)
+        .unwrap()
 }

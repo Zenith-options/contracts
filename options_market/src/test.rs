@@ -39,7 +39,14 @@ fn setup<'a>() -> Harness<'a> {
     let client = OptionsMarketClient::new(&env, &contract_id);
     client.initialize(&admin, &oracle, &token_address, &fee_recipient);
 
-    Harness { env, client, token: token_address, admin, oracle, fee_recipient }
+    Harness {
+        env,
+        client,
+        token: token_address,
+        admin,
+        oracle,
+        fee_recipient,
+    }
 }
 
 /// Mints `amount` of the test collateral token to `to` via the Stellar
@@ -73,7 +80,12 @@ fn make_series(h: &Harness, option_type: OptionType, strike: i128, premium: i128
 fn fund_premium_pool(h: &Harness, series_id: u64, contracts: i128) {
     let filler_buyer = Address::generate(&h.env);
     mint(h, &filler_buyer, 1_000 * USDC_DECIMALS);
-    h.client.buy_option(&filler_buyer, &series_id, &contracts, &(1_000 * USDC_DECIMALS));
+    h.client.buy_option(
+        &filler_buyer,
+        &series_id,
+        &contracts,
+        &(1_000 * USDC_DECIMALS),
+    );
 }
 
 #[test]
@@ -92,7 +104,8 @@ fn initialize_sets_admin_and_zeroed_counters() {
 #[should_panic(expected = "Error(Contract, #1)")] // AlreadyInitialized
 fn initialize_twice_panics() {
     let h = setup();
-    h.client.initialize(&h.admin, &h.oracle, &h.token, &h.fee_recipient);
+    h.client
+        .initialize(&h.admin, &h.oracle, &h.token, &h.fee_recipient);
 }
 
 #[test]
@@ -182,7 +195,9 @@ fn initialize_without_any_authorization_panics() {
     let oracle = Address::generate(&env);
     let fee_recipient = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
 
     let contract_id = env.register_contract(None, OptionsMarket);
     let client = OptionsMarketClient::new(&env, &contract_id);
@@ -199,7 +214,9 @@ fn buy_option_transfers_premium_and_opens_a_long_position() {
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
 
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     let position = h.client.get_position(&pos_id).unwrap();
     assert!(position.side == PositionSide::Long);
@@ -224,7 +241,8 @@ fn buy_option_rejects_zero_contracts() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    h.client.buy_option(&buyer, &series_id, &0, &(50 * USDC_DECIMALS));
+    h.client
+        .buy_option(&buyer, &series_id, &0, &(50 * USDC_DECIMALS));
 }
 
 #[test]
@@ -237,7 +255,8 @@ fn buy_option_enforces_slippage_protection() {
     // Series premium is 40_000_000 for 1 contract; offering a max_premium
     // below that must be rejected rather than silently charging more than
     // the caller agreed to.
-    h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &30_000_000);
+    h.client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &30_000_000);
 }
 
 #[test]
@@ -246,7 +265,8 @@ fn buy_option_rejects_unknown_series() {
     let h = setup();
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    h.client.buy_option(&buyer, &999, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    h.client
+        .buy_option(&buyer, &999, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 }
 
 // ─── write_option ───────────────────────────────────────────────────────────
@@ -264,7 +284,9 @@ fn write_covered_call_locks_collateral_equal_to_notional() {
     let required = 700_000_000; // 1 contract * strike (fallback price)
     mint(&h, &writer, required);
 
-    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &required);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &required);
     let position = h.client.get_position(&pos_id).unwrap();
 
     assert!(position.side == PositionSide::Short);
@@ -285,7 +307,9 @@ fn write_cash_secured_put_requires_110_percent_of_strike() {
     let required = 700_000_000 * 11 / 10; // strike * contracts * 110%
     mint(&h, &writer, required);
 
-    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &required);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &required);
     let position = h.client.get_position(&pos_id).unwrap();
     assert_eq!(position.collateral_locked, required);
 }
@@ -298,7 +322,8 @@ fn write_option_rejects_undercollateralized_offer() {
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
     // Offers exactly 100% of strike for a put, which needs 110%.
-    h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    h.client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 }
 
 #[test]
@@ -311,7 +336,8 @@ fn write_option_rejects_a_write_with_no_buyer_premium_to_draw_from() {
     // No buyer has ever bought into this series, so the premium pool is
     // empty — write_option must not pay the writer out of its own
     // just-deposited collateral, which isn't a premium anyone paid.
-    h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    h.client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 }
 
 #[test]
@@ -325,7 +351,8 @@ fn write_option_succeeds_once_the_pool_partially_covers_it() {
 
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    h.client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     // The writer's premium exactly drained the pool the lone buyer funded.
     assert_eq!(h.client.get_premium_pool(), 0);
@@ -345,7 +372,9 @@ fn exercise_itm_call_pays_out_the_intrinsic_value() {
 
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     advance_past_expiry(&h, series_id);
     // Settlement price above strike -> call finishes in the money.
@@ -371,7 +400,9 @@ fn exercise_itm_put_pays_out_the_intrinsic_value() {
 
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     advance_past_expiry(&h, series_id);
     // Settlement price below strike -> put finishes in the money.
@@ -391,7 +422,9 @@ fn exercise_otm_call_is_rejected() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     advance_past_expiry(&h, series_id);
     // Settlement below strike -> call is worthless.
@@ -406,7 +439,9 @@ fn exercise_before_expiry_is_rejected() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
     h.client.exercise(&buyer, &pos_id);
 }
 
@@ -418,7 +453,9 @@ fn exercise_rejects_a_short_position() {
     fund_premium_pool(&h, series_id, USDC_DECIMALS);
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(750_000_000));
@@ -432,7 +469,9 @@ fn exercise_twice_is_rejected() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(750_000_000));
@@ -460,7 +499,9 @@ fn reclaim_collateral_returns_locked_minus_max_loss() {
 
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(750_000_000)); // ITM by 50
@@ -487,7 +528,9 @@ fn reclaim_collateral_returns_everything_when_otm() {
 
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM
@@ -504,7 +547,9 @@ fn reclaim_collateral_rejects_a_long_position() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(750_000_000));
@@ -527,7 +572,9 @@ fn reclaim_collateral_twice_is_rejected() {
 
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(650_000_000));
@@ -541,7 +588,8 @@ fn reclaim_collateral_twice_is_rejected() {
 fn update_premium_changes_price_and_iv() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
-    h.client.update_premium(&series_id, &(45_000_000), &(500_000_000));
+    h.client
+        .update_premium(&series_id, &(45_000_000), &(500_000_000));
 
     let series: OptionSeries = h.client.get_series(&series_id).unwrap();
     assert_eq!(series.premium, 45_000_000);
@@ -555,7 +603,8 @@ fn update_premium_on_a_settled_series_is_rejected() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(750_000_000));
-    h.client.update_premium(&series_id, &(45_000_000), &(500_000_000));
+    h.client
+        .update_premium(&series_id, &(45_000_000), &(500_000_000));
 }
 
 // ─── views ──────────────────────────────────────────────────────────────────
@@ -594,11 +643,15 @@ fn full_lifecycle_covered_call_itm() {
     // funds before a writer can be paid out of it.
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let buyer_pos = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let buyer_pos = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    let writer_pos = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let writer_pos = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     let series: OptionSeries = h.client.get_series(&series_id).unwrap();
     assert_eq!(series.open_interest, 2 * USDC_DECIMALS); // one long + one short
@@ -668,7 +721,8 @@ fn buy_option_is_rejected_while_paused() {
 
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    h.client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 }
 
 #[test]
@@ -680,7 +734,8 @@ fn write_option_is_rejected_while_paused() {
 
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    h.client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 }
 
 /// A pause must not trap funds already at risk: an existing writer can still
@@ -692,7 +747,9 @@ fn pause_does_not_block_settlement_of_existing_positions() {
     fund_premium_pool(&h, series_id, USDC_DECIMALS);
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     h.client.pause();
 
@@ -713,7 +770,9 @@ fn cancelled_series_refunds_buyer_premium_net_of_fee() {
 
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     h.client.cancel_series(&series_id);
 
@@ -731,7 +790,9 @@ fn cancelled_series_refunds_writer_full_collateral() {
     fund_premium_pool(&h, series_id, USDC_DECIMALS);
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
-    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     h.client.cancel_series(&series_id);
 
@@ -747,7 +808,9 @@ fn claim_refund_rejects_a_still_active_series() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     h.client.claim_refund(&buyer, &pos_id);
 }
@@ -759,7 +822,9 @@ fn claim_refund_twice_is_rejected() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     h.client.cancel_series(&series_id);
     h.client.claim_refund(&buyer, &pos_id);
@@ -801,7 +866,9 @@ fn buy_option_applies_the_currently_configured_fee_rate() {
 
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     let position = h.client.get_position(&pos_id).unwrap();
     assert_eq!(position.fee_paid, 400_000); // 1% of 40_000_000
@@ -815,7 +882,9 @@ fn refund_uses_the_fee_rate_in_effect_at_buy_time_not_the_current_one() {
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
     // Bought while the fee rate was still the default 0.5% (fee_paid = 200_000).
-    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     // Admin raises the rate afterward — this must NOT retroactively change
     // what this position refunds, since the position already stored the
@@ -852,7 +921,11 @@ fn create_series_tracks_the_count_per_underlying() {
     for _ in 0..50 {
         make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     }
-    assert_eq!(h.client.get_series_count_for_underlying(&Symbol::new(&h.env, "XLM")), 50);
+    assert_eq!(
+        h.client
+            .get_series_count_for_underlying(&Symbol::new(&h.env, "XLM")),
+        50
+    );
 }
 
 #[test]
@@ -883,5 +956,9 @@ fn series_cap_is_tracked_independently_per_underlying() {
         &450_000_000i128,
     );
     assert!(h.client.get_series(&btc_series).is_some());
-    assert_eq!(h.client.get_series_count_for_underlying(&Symbol::new(&h.env, "BTC")), 1);
+    assert_eq!(
+        h.client
+            .get_series_count_for_underlying(&Symbol::new(&h.env, "BTC")),
+        1
+    );
 }
