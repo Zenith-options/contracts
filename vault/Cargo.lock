@@ -1732,10 +1732,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith-multisig"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "zenith-vault"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "zenith-multisig",
 ]
 
 [[package]]
