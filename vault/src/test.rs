@@ -309,3 +309,72 @@ fn sweep_untagged_emits_a_swept_untagged_event() {
     let (_, _topics, data) = events.last().unwrap();
     assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 250);
 }
+
+// ─── transfer_tag ───────────────────────────────────────────────────────────
+
+#[test]
+fn transfer_tag_moves_escrow_without_any_token_movement() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &1, &400);
+
+    let vault_balance_before = balance(&h, &h.client.address);
+    h.client.transfer_tag(&1, &2, &150);
+
+    assert_eq!(h.client.balance_of(&1), 250);
+    assert_eq!(h.client.balance_of(&2), 150);
+    // TotalEscrowed unchanged — nothing entered or left the vault.
+    assert_eq!(h.client.get_total_escrowed(), 400);
+    assert_eq!(balance(&h, &h.client.address), vault_balance_before);
+}
+
+#[test]
+fn transfer_tag_accumulates_into_an_already_funded_destination() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &1, &400);
+    h.client.deposit(&depositor, &2, &100);
+
+    h.client.transfer_tag(&1, &2, &400);
+
+    assert_eq!(h.client.balance_of(&1), 0);
+    assert_eq!(h.client.balance_of(&2), 500);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // InsufficientEscrowBalance
+fn transfer_tag_rejects_more_than_the_source_tags_balance() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &1, &100);
+
+    h.client.transfer_tag(&1, &2, &101);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // InvalidAmount
+fn transfer_tag_rejects_a_non_positive_amount() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &1, &100);
+
+    h.client.transfer_tag(&1, &2, &0);
+}
+
+#[test]
+fn transfer_tag_emits_a_tag_transferred_event() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &1, &400);
+
+    h.client.transfer_tag(&1, &2, &150);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 150);
+}

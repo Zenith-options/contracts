@@ -176,6 +176,41 @@ impl Vault {
         events::withdrawn(&env, to, tag, amount);
     }
 
+    /// Moves `amount` of escrow from `from_tag` to `to_tag` without any
+    /// token movement at all — a pure ledger reassignment. Meant for
+    /// exactly the case options_market's roll_position represents: a
+    /// position closes and its replacement opens in the same breath, so
+    /// the collateral doesn't need to leave the vault and come back, it
+    /// just needs to be re-earmarked under the new position's tag.
+    /// Admin-gated, same as withdraw.
+    pub fn transfer_tag(env: Env, from_tag: u64, to_tag: u64, amount: i128) {
+        require_not_paused(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+
+        let from_key = DataKey::Escrow(from_tag);
+        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+        if from_balance < amount {
+            panic_with_error!(&env, Error::InsufficientEscrowBalance);
+        }
+        env.storage()
+            .persistent()
+            .set(&from_key, &from_balance.checked_sub(amount).unwrap());
+
+        let to_key = DataKey::Escrow(to_tag);
+        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&to_key, &to_balance.checked_add(amount).unwrap());
+
+        // TotalEscrowed is unaffected — nothing entered or left the vault,
+        // only which tag it's earmarked under changed.
+        events::tag_transferred(&env, from_tag, to_tag, amount);
+    }
+
     pub fn balance_of(env: Env, tag: u64) -> i128 {
         env.storage()
             .persistent()
