@@ -118,6 +118,7 @@ documented per field.
 |---|---|
 | `initialize(admin, oracle, collateral_token, fee_recipient)` | One-time setup. Panics with `AlreadyInitialized` if called twice. |
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
+| `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
 | `set_fee_rate(new_bps)` | Sets the protocol fee (basis points). Capped at `MAX_FEE_RATE_BPS` (1000 = 10%). |
 | `pause()` / `unpause()` | Emergency stop. Blocks `create_series`, `update_premium`, `buy_option`, `write_option`. Does **not** block `exercise`, `set_settlement_price`, or `reclaim_collateral` — a pause winds existing positions down, it doesn't trap funds. |
 | `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
@@ -312,14 +313,14 @@ compromised signer can never add another compromised signer.
   (zero risk to the original flow's existing test coverage) but means
   there's no enforcement that a series *must* use the cross-contract
   path just because a `price_oracle` deployment exists.
-- **`multisig` is wired into exactly one thing so far:
-  options_market's pause.** `pause_via_multisig`/`unpause_via_multisig`
-  are additive (the original admin-gated `pause`/`unpause` are
-  unchanged) and check `is_approved(action_id)` on a deployed Multisig
-  instead of a single signature. Every OTHER sensitive function across
-  all four contracts — `transfer_admin`, `set_fee_rate`, `upgrade`,
-  `withdraw`, price_oracle's and vault's own admin-gated calls — still
-  goes through a bare `admin: Address`, one key, not M-of-N. A caller
-  wiring more of these in is responsible for picking its own stable
-  `action_id` scheme per function, since Multisig never interprets what
-  an id means.
+- **`multisig` is only wired into options_market so far, and only two
+  functions there.** `pause_via_multisig`/`unpause_via_multisig` and
+  `transfer_admin_via_multisig` are all additive (the original
+  admin-gated versions are unchanged) and check `is_approved(action_id)`
+  on a deployed Multisig instead of a single signature. Every OTHER
+  sensitive function — `set_fee_rate`, `upgrade`, `cancel_series` on
+  options_market; price_oracle's and vault's own admin-gated calls
+  entirely — still goes through a bare `admin: Address`, one key, not
+  M-of-N. A caller wiring more of these in is responsible for picking
+  its own stable `action_id` scheme per function, since Multisig never
+  interprets what an id means.
