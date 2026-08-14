@@ -12,4 +12,5 @@ pub enum Error {
     NoFreshPrice = 6,
     ContractPaused = 7,
     InvalidStaleness = 8,
+    TooManyFeeders = 9,
 }

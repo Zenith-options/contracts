@@ -126,6 +126,17 @@ fn report_price_rejects_a_revoked_feeder() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #9)")] // TooManyFeeders
+fn add_feeder_rejects_beyond_the_cap() {
+    let h = setup();
+    for _ in 0..16 {
+        h.client.add_feeder(&Address::generate(&h.env));
+    }
+    assert_eq!(h.client.get_feeder_count(), 16);
+    h.client.add_feeder(&Address::generate(&h.env));
+}
+
+#[test]
 fn get_latest_report_is_none_before_any_report() {
     let h = setup();
     let feeder = Address::generate(&h.env);

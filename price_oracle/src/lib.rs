@@ -13,9 +13,11 @@ use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Symbol
 mod test;
 
 mod error;
+mod math;
 mod types;
 
 use error::Error;
+use math::MAX_FEEDERS;
 use types::DataKey;
 
 #[contract]
@@ -41,6 +43,9 @@ impl PriceOracle {
         let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
         if feeders.contains(&feeder) {
             panic_with_error!(&env, Error::FeederAlreadyAdded);
+        }
+        if feeders.len() >= MAX_FEEDERS {
+            panic_with_error!(&env, Error::TooManyFeeders);
         }
         feeders.push_back(feeder);
         env.storage().instance().set(&DataKey::Feeders, &feeders);
