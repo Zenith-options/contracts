@@ -1144,3 +1144,120 @@ fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
     h.client
         .transfer_admin_via_multisig(&multisig_id, &4u64, &new_admin);
 }
+
+// ─── cross-contract: set_fee_rate_via_multisig ─────────────────────────────
+
+#[test]
+fn set_fee_rate_via_multisig_applies_once_the_action_is_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 5u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client
+        .set_fee_rate_via_multisig(&multisig_id, &action_id, &100);
+    assert_eq!(h.client.get_fee_rate(), 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn set_fee_rate_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    h.client
+        .set_fee_rate_via_multisig(&multisig_id, &99u64, &100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")] // InvalidFeeRate
+fn set_fee_rate_via_multisig_still_enforces_the_ceiling_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 6u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    // M-of-N approval authorizes WHO can call this, not an absurd rate.
+    h.client
+        .set_fee_rate_via_multisig(&multisig_id, &action_id, &1_001);
+}
+
+// ─── cross-contract: cancel_series_via_multisig ────────────────────────────
+
+#[test]
+fn cancel_series_via_multisig_cancels_once_the_action_is_approved() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 7u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+    h.client
+        .cancel_series_via_multisig(&multisig_id, &action_id, &series_id);
+
+    // claim_refund only succeeds on a Cancelled series — proves the
+    // multisig-gated call actually flipped the series' state, not just
+    // that it didn't panic.
+    let before = balance(&h, &buyer);
+    h.client.claim_refund(&buyer, &pos_id);
+    assert_eq!(balance(&h, &buyer) - before, 39_800_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn cancel_series_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    h.client
+        .cancel_series_via_multisig(&multisig_id, &99u64, &series_id);
+}
+
+// ─── cross-contract: upgrade_via_multisig ──────────────────────────────────
+
+/// Same caveat as upgrade_reaches_the_host_deployer_past_the_admin_check:
+/// this harness runs native code, not wasm32, so there's no second
+/// artifact to actually upgrade to. This only proves the multisig check
+/// passed and execution reached the host's deployer, which then panics on
+/// the bogus, never-uploaded hash — a different panic than our own
+/// Unauthorized check would raise.
+#[test]
+#[should_panic]
+fn upgrade_via_multisig_reaches_the_host_deployer_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 8u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let bogus_hash = BytesN::from_array(&h.env, &[0u8; 32]);
+    h.client
+        .upgrade_via_multisig(&multisig_id, &action_id, &bogus_hash);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn upgrade_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    let bogus_hash = BytesN::from_array(&h.env, &[0u8; 32]);
+    h.client
+        .upgrade_via_multisig(&multisig_id, &99u64, &bogus_hash);
+}
