@@ -197,4 +197,36 @@ impl Vault {
     pub fn get_token(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Token).unwrap()
     }
+
+    /// Recovers tokens that landed on the vault's own address OUTSIDE
+    /// deposit() — e.g. a direct token transfer sent straight to this
+    /// contract's address by mistake, rather than through deposit(),
+    /// which is the only path that actually credits a tag's ledger. Those
+    /// tokens sit in the vault's real balance but aren't accounted for
+    /// under any tag, so they'd otherwise be stuck forever: no tag's
+    /// withdraw could ever reach them (withdraw is capped at that tag's
+    /// OWN escrowed balance), and get_total_escrowed's ledger sum would
+    /// permanently under-report the vault's actual token balance.
+    pub fn sweep_untagged(env: Env, to: Address) -> i128 {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token_address);
+        let actual_balance = token_client.balance(&env.current_contract_address());
+        let total_escrowed: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalEscrowed)
+            .unwrap();
+
+        let untagged = actual_balance.checked_sub(total_escrowed).unwrap();
+        if untagged <= 0 {
+            panic_with_error!(&env, Error::NoUntaggedFunds);
+        }
+
+        token_client.transfer(&env.current_contract_address(), &to, &untagged);
+        events::swept_untagged(&env, to, untagged);
+        untagged
+    }
 }

@@ -24,3 +24,8 @@ pub fn paused(env: &Env) {
 pub fn unpaused(env: &Env) {
     env.events().publish((Symbol::new(env, "unpaused"),), ());
 }
+
+pub fn swept_untagged(env: &Env, to: Address, amount: i128) {
+    env.events()
+        .publish((Symbol::new(env, "swept_untagged"), to), amount);
+}

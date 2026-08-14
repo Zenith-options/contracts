@@ -254,3 +254,58 @@ fn withdraw_emits_a_withdrawn_event_with_the_amount_as_data() {
     let (_, _topics, data) = events.last().unwrap();
     assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 150);
 }
+
+// ─── sweep_untagged ─────────────────────────────────────────────────────────
+
+#[test]
+fn sweep_untagged_recovers_a_direct_transfer_that_bypassed_deposit() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+
+    // Simulate a stray direct transfer straight to the vault's own
+    // address, bypassing deposit() entirely — those funds aren't credited
+    // to any tag.
+    mint(&h, &h.client.address, 250);
+
+    let rescuer = Address::generate(&h.env);
+    let swept = h.client.sweep_untagged(&rescuer);
+
+    assert_eq!(swept, 250);
+    assert_eq!(balance(&h, &rescuer), 250);
+    // Tag 7's own escrowed balance must be completely untouched.
+    assert_eq!(h.client.balance_of(&7), 400);
+    assert_eq!(h.client.get_total_escrowed(), 400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")] // NoUntaggedFunds
+fn sweep_untagged_rejects_when_the_balance_exactly_matches_the_ledger() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+
+    // No stray transfer this time — the vault's actual balance (400)
+    // exactly matches get_total_escrowed (400), so there's nothing to
+    // sweep.
+    let rescuer = Address::generate(&h.env);
+    h.client.sweep_untagged(&rescuer);
+}
+
+#[test]
+fn sweep_untagged_emits_a_swept_untagged_event() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+    mint(&h, &h.client.address, 250);
+
+    let rescuer = Address::generate(&h.env);
+    h.client.sweep_untagged(&rescuer);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 250);
+}
