@@ -451,3 +451,43 @@ fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
     h.client
         .transfer_admin_via_multisig(&multisig_id, &99u64, &new_admin);
 }
+
+#[test]
+fn set_max_staleness_via_multisig_applies_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 4u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client
+        .set_max_staleness_via_multisig(&multisig_id, &action_id, &7200);
+    assert_eq!(h.client.get_max_staleness(), 7200);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // Unauthorized
+fn set_max_staleness_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    h.client
+        .set_max_staleness_via_multisig(&multisig_id, &99u64, &7200);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // InvalidStaleness
+fn set_max_staleness_via_multisig_still_rejects_zero_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 5u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client
+        .set_max_staleness_via_multisig(&multisig_id, &action_id, &0);
+}
