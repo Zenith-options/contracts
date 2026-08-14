@@ -484,3 +484,135 @@ fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
     h.client
         .transfer_admin_via_multisig(&multisig_id, &99u64, &new_admin);
 }
+
+// ─── cross-contract: withdraw_via_multisig ─────────────────────────────────
+
+#[test]
+fn withdraw_via_multisig_pays_out_once_approved() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 4u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let payee = Address::generate(&h.env);
+    h.client
+        .withdraw_via_multisig(&multisig_id, &action_id, &7, &payee, &150);
+
+    assert_eq!(h.client.balance_of(&7), 250);
+    assert_eq!(balance(&h, &payee), 150);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // Unauthorized
+fn withdraw_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    let payee = Address::generate(&h.env);
+    h.client
+        .withdraw_via_multisig(&multisig_id, &99u64, &7, &payee, &150);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // InsufficientEscrowBalance
+fn withdraw_via_multisig_still_enforces_the_tags_own_balance_once_approved() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 5u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    // Approval authorizes WHO can call this, not draining more than
+    // tag 7 actually has earmarked.
+    let payee = Address::generate(&h.env);
+    h.client
+        .withdraw_via_multisig(&multisig_id, &action_id, &7, &payee, &401);
+}
+
+// ─── cross-contract: transfer_tag_via_multisig ─────────────────────────────
+
+#[test]
+fn transfer_tag_via_multisig_moves_escrow_once_approved() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &1, &400);
+
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 6u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client
+        .transfer_tag_via_multisig(&multisig_id, &action_id, &1, &2, &150);
+
+    assert_eq!(h.client.balance_of(&1), 250);
+    assert_eq!(h.client.balance_of(&2), 150);
+    assert_eq!(h.client.get_total_escrowed(), 400); // unaffected by the reassignment
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // Unauthorized
+fn transfer_tag_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &1, &400);
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    h.client
+        .transfer_tag_via_multisig(&multisig_id, &99u64, &1, &2, &150);
+}
+
+// ─── cross-contract: sweep_untagged_via_multisig ───────────────────────────
+
+#[test]
+fn sweep_untagged_via_multisig_recovers_once_approved() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &1, &400);
+    // A stray direct transfer that bypassed deposit() entirely.
+    mint(&h, &h.client.address, 100);
+
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 7u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let recovered_to = Address::generate(&h.env);
+    let swept = h
+        .client
+        .sweep_untagged_via_multisig(&multisig_id, &action_id, &recovered_to);
+
+    assert_eq!(swept, 100);
+    assert_eq!(balance(&h, &recovered_to), 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // Unauthorized
+fn sweep_untagged_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    mint(&h, &h.client.address, 100);
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    let recovered_to = Address::generate(&h.env);
+    h.client
+        .sweep_untagged_via_multisig(&multisig_id, &99u64, &recovered_to);
+}
