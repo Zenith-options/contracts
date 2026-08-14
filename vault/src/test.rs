@@ -58,6 +58,28 @@ fn initialize_twice_panics() {
     h.client.initialize(&h.admin, &h.token);
 }
 
+#[test]
+#[should_panic] // no auth was mocked at all — require_auth() has nothing to accept
+fn initialize_without_any_authorization_panics() {
+    // Deliberately skips mock_all_auths(): every other test in this file
+    // uses it (mock_all_auths() arms for the env's whole lifetime once
+    // called, so there's no way to "unmock" partway through a test to
+    // check a LATER call specifically) — this test exists just to
+    // confirm require_auth() is actually load-bearing on initialize(),
+    // not a no-op, by never arming it in the first place. Mirrors
+    // options_market's identically-named test.
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+
+    let contract_id = env.register_contract(None, Vault);
+    let client = VaultClient::new(&env, &contract_id);
+    client.initialize(&admin, &token_address);
+}
+
 // ─── deposit ─────────────────────────────────────────────────────────────────
 
 #[test]
