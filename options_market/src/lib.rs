@@ -143,10 +143,10 @@ impl OptionsMarket {
         if underlying_count >= MAX_SERIES_PER_UNDERLYING {
             panic_with_error!(&env, Error::TooManySeriesForUnderlying);
         }
-        env.storage().persistent().set(&underlying_count_key, &(underlying_count + 1));
+        env.storage().persistent().set(&underlying_count_key, &(underlying_count.checked_add(1).unwrap()));
 
         let counter: u64 = env.storage().instance().get(&DataKey::SeriesCounter).unwrap();
-        let series_id = counter + 1;
+        let series_id = counter.checked_add(1).unwrap();
 
         let series = OptionSeries {
             series_id,

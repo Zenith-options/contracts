@@ -34,7 +34,7 @@ pub fn require_active_series(env: &Env, series_id: u64) -> OptionSeries {
 
 pub fn next_position_id(env: &Env) -> u64 {
     let counter: u64 = env.storage().instance().get(&DataKey::PositionCounter).unwrap_or(0);
-    let next = counter + 1;
+    let next = counter.checked_add(1).unwrap();
     env.storage().instance().set(&DataKey::PositionCounter, &next);
     next
 }
