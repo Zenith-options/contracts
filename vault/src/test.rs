@@ -204,6 +204,19 @@ fn transfer_admin_hands_off_control() {
     assert_eq!(h.client.get_admin(), new_admin);
 }
 
+#[test]
+fn transfer_admin_emits_an_admin_transferred_event_with_old_and_new_admin() {
+    let h = setup();
+    let new_admin = Address::generate(&h.env);
+    h.client.transfer_admin(&new_admin);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (old_admin, event_new_admin) = <(Address, Address)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(old_admin, h.admin);
+    assert_eq!(event_new_admin, new_admin);
+}
+
 // ─── pause / unpause ────────────────────────────────────────────────────────
 
 #[test]
