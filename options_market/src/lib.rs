@@ -397,6 +397,43 @@ impl OptionsMarket {
         events::premium_updated(&env, series_id, new_premium, new_implied_vol);
     }
 
+    /// Permissionless alternative to update_premium: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Same rationale as
+    /// create_series_via_multisig.
+    pub fn update_premium_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        series_id: u64,
+        new_premium: i128,
+        new_implied_vol: i128,
+    ) {
+        require_not_paused(&env);
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Active {
+            panic_with_error!(&env, Error::SeriesNotActive);
+        }
+
+        series.premium = new_premium;
+        series.implied_vol = new_implied_vol;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+
+        events::premium_updated(&env, series_id, new_premium, new_implied_vol);
+    }
+
     /// Admin cancels an Active series (e.g. mispriced, or the underlying
     /// feed is compromised). Existing position holders then pull their own
     /// refund via claim_refund rather than the admin pushing funds to
