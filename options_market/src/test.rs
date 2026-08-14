@@ -359,3 +359,169 @@ fn set_settlement_price_before_expiry_is_rejected() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     h.client.set_settlement_price(&series_id, &(750_000_000));
 }
+
+// ─── reclaim_collateral ─────────────────────────────────────────────────────
+
+#[test]
+fn reclaim_collateral_returns_locked_minus_max_loss() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000)); // ITM by 50
+
+    let before = balance(&h, &writer);
+    h.client.reclaim_collateral(&writer, &pos_id);
+    // 700 locked - 50 max loss = 650 reclaimed.
+    assert_eq!(balance(&h, &writer) - before, 650_000_000);
+
+    let position = h.client.get_position(&pos_id).unwrap();
+    assert!(position.is_settled);
+}
+
+#[test]
+fn reclaim_collateral_returns_everything_when_otm() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    // NOTE (real gap, not just test setup): write_option pays the writer's
+    // premium out of whatever the vault currently holds, which in this
+    // single-writer scenario is only the collateral this same call just
+    // deposited — so the vault is already short the fee-adjusted premium
+    // amount before reclaim ever runs. In production this is covered by
+    // buyer premiums already sitting in the shared vault; topping it up
+    // here stands in for "other market activity already funded it." This
+    // is worth a real fix later: the vault has no per-position accounting
+    // of which balance is actually earmarked for what, so a standalone
+    // write with no matching buyer can't always reclaim its full
+    // collateral even when nothing was paid out against it.
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM
+
+    let before = balance(&h, &writer);
+    h.client.reclaim_collateral(&writer, &pos_id);
+    assert_eq!(balance(&h, &writer) - before, 700_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")] // WrongSide
+fn reclaim_collateral_rejects_a_long_position() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    h.client.reclaim_collateral(&buyer, &pos_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")] // AlreadySettled
+fn reclaim_collateral_twice_is_rejected() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    // Same vault-liquidity gap noted on reclaim_collateral_returns_everything_when_otm:
+    // without this top-up the FIRST reclaim call below fails on the token
+    // contract's own insufficient-balance error, which happens to also render
+    // as "Error(Contract, #10)" — so the should_panic below would pass for the
+    // wrong reason (never even reaching the second call) instead of actually
+    // exercising AlreadySettled.
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(650_000_000));
+    h.client.reclaim_collateral(&writer, &pos_id);
+    h.client.reclaim_collateral(&writer, &pos_id);
+}
+
+// ─── update_premium ─────────────────────────────────────────────────────────
+
+#[test]
+fn update_premium_changes_price_and_iv() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    h.client.update_premium(&series_id, &(45_000_000), &(500_000_000));
+
+    let series: OptionSeries = h.client.get_series(&series_id).unwrap();
+    assert_eq!(series.premium, 45_000_000);
+    assert_eq!(series.implied_vol, 500_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // SeriesNotActive
+fn update_premium_on_a_settled_series_is_rejected() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    h.client.update_premium(&series_id, &(45_000_000), &(500_000_000));
+}
+
+// ─── views ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn get_stats_reflects_created_series_count() {
+    let h = setup();
+    make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    make_series(&h, OptionType::Put, 650_000_000, 35_000_000);
+
+    let (_, _, series_count) = h.client.get_stats();
+    assert_eq!(series_count, 2);
+}
+
+#[test]
+fn get_user_positions_is_empty_for_a_wallet_with_none() {
+    let h = setup();
+    let stranger = Address::generate(&h.env);
+    assert_eq!(h.client.get_user_positions(&stranger).len(), 0);
+}
+
+// ─── full lifecycle ─────────────────────────────────────────────────────────
+
+/// One buyer and one writer trade opposite sides of the same series, the
+/// series settles ITM for the buyer, and both sides collect what the
+/// contract's accounting says they should — a check that the individual
+/// unit tests above compose correctly, not just that each function works
+/// in isolation.
+#[test]
+fn full_lifecycle_covered_call_itm() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let writer_pos = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let buyer_pos = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let series: OptionSeries = h.client.get_series(&series_id).unwrap();
+    assert_eq!(series.open_interest, 2 * USDC_DECIMALS); // one long + one short
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000)); // 50 ITM
+
+    let buyer_before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &buyer_pos);
+    assert_eq!(balance(&h, &buyer) - buyer_before, 50_000_000);
+
+    let writer_before = balance(&h, &writer);
+    h.client.reclaim_collateral(&writer, &writer_pos);
+    assert_eq!(balance(&h, &writer) - writer_before, 650_000_000); // 700 locked - 50 paid out
+}
