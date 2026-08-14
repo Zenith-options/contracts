@@ -101,6 +101,27 @@ impl OptionsMarket {
         events::admin_transferred(&env, admin, new_admin);
     }
 
+    /// Permissionless alternative to transfer_admin: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the current admin's own signature. Same rationale as
+    /// pause_via_multisig — arguably even more important here, since a
+    /// single lost or compromised admin key otherwise has no recovery
+    /// path at all for a contract that only ever trusted one signature.
+    pub fn transfer_admin_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        new_admin: Address,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
+    }
+
     /// Admin-gated contract upgrade: swaps the WASM executable behind this
     /// contract's address to whatever `new_wasm_hash` was already uploaded
     /// via the Soroban deployer, while keeping the same contract ID and all

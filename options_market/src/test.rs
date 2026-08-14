@@ -1113,3 +1113,34 @@ fn unpause_via_multisig_rejects_when_not_yet_approved() {
     // No approvals at all for this action_id.
     h.client.unpause_via_multisig(&multisig_id, &99u64);
 }
+
+#[test]
+fn transfer_admin_via_multisig_hands_off_control_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 3u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let new_admin = Address::generate(&h.env);
+    h.client
+        .transfer_admin_via_multisig(&multisig_id, &action_id, &new_admin);
+    assert_eq!(h.client.get_admin(), new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    // Only 1 of 3.
+    multisig_client.approve(&signers[0], &4u64);
+
+    let new_admin = Address::generate(&h.env);
+    h.client
+        .transfer_admin_via_multisig(&multisig_id, &4u64, &new_admin);
+}
