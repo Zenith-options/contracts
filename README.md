@@ -27,6 +27,13 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   tag — regardless of what the vault's raw token balance happens to be
   from other tags' deposits. Not yet wired into options_market as a
   replacement for its own internal accounting; see "Known gaps" below.
+- [`multisig/`](multisig) — M-of-N approval tracking for opaque,
+  caller-defined actions, motivated by every other contract here having
+  a single `admin: Address` as its sole point of control. A fixed
+  signer set and threshold, `is_approved(action_id)` that flips true
+  once enough signers have approved — `action_id` is never interpreted
+  by this contract, only counted. Not wired into any of the other three
+  yet; see "Known gaps" below.
 
 ## Building and testing
 
@@ -51,12 +58,13 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
-price_oracle and vault have no such dependency and can each be
-built/tested with the same five commands independently, in any order.
+price_oracle, vault, and multisig have no such dependency and can each
+be built/tested with the same five commands independently, in any
+order.
 
 CI (`.github/workflows/ci.yml`) builds price_oracle's wasm first
 whenever a job is about to touch options_market, then runs the same
-four checks against every push and PR, for all three crates.
+four checks against every push and PR, for all four crates.
 
 ## Deploying
 
@@ -237,6 +245,38 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 | 4 | `ContractPaused` |
 | 5 | `NoUntaggedFunds` |
 
+## `multisig` reference
+
+Signers and threshold are fixed at `initialize` and immutable — there's
+deliberately no in-protocol way to change the signer set, so a
+compromised signer can never add another compromised signer.
+
+| Function | Description |
+|---|---|
+| `initialize(signers, threshold)` | One-time setup. Rejects a zero threshold, a threshold above the signer count, or a duplicate signer. |
+| `approve(signer, action_id)` | Records `signer`'s approval. Requires the signer's own signature, current signer-set membership, and rejects a signer voting twice on the same `action_id`. |
+| `revoke(signer, action_id)` | Withdraws `signer`'s own vote. |
+| `reset(action_id)` | Clears every signer's approval of `action_id`, so a repeat action reusing the same id starts from a clean slate. Only callable once `action_id` is already approved. |
+
+### Views
+
+`is_signer`, `get_signer_count`, `get_threshold`, `has_approved(action_id, signer)`, `get_approval_count(action_id)`, `is_approved(action_id)`.
+
+### Events
+
+`approved`, `revoked`, `reset`.
+
+### Errors
+
+| # | Error |
+|---|---|
+| 1 | `AlreadyInitialized` |
+| 2 | `InvalidThreshold` |
+| 3 | `DuplicateSigner` |
+| 4 | `NotASigner` |
+| 5 | `AlreadyApproved` |
+| 6 | `NotYetApproved` |
+
 ## Known gaps
 
 - **Cross-position accounting on cancellation, and `vault` isn't wired in
@@ -265,3 +305,13 @@ A per-tag escrow ledger for a single token, set at `initialize`.
   (zero risk to the original flow's existing test coverage) but means
   there's no enforcement that a series *must* use the cross-contract
   path just because a `price_oracle` deployment exists.
+- **`multisig` isn't wired into anything.** options_market,
+  price_oracle, and vault each still use a bare `admin: Address` — one
+  key, not M-of-N. Wiring a Multisig in would mean each contract's
+  sensitive functions (`pause`, `transfer_admin`, `set_fee_rate`,
+  `upgrade`, `withdraw`, ...) calling `is_approved(action_id)` on a
+  deployed Multisig before honoring the call, with the caller
+  responsible for picking a stable `action_id` scheme (since this
+  contract never interprets what an id means). None of that exists
+  yet — `multisig` today is a correct, tested, but entirely standalone
+  primitive.
