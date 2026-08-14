@@ -173,3 +173,56 @@ fn revoke_rejects_a_signer_who_never_approved() {
     let h = setup();
     h.client.revoke(&h.signers[0], &42);
 }
+
+// ─── reset ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn reset_clears_every_signers_approval() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+    h.client.approve(&h.signers[1], &42);
+    assert!(h.client.is_approved(&42));
+
+    h.client.reset(&42);
+
+    assert!(!h.client.has_approved(&42, &h.signers[0]));
+    assert!(!h.client.has_approved(&42, &h.signers[1]));
+    assert_eq!(h.client.get_approval_count(&42), 0);
+    assert!(!h.client.is_approved(&42));
+}
+
+#[test]
+fn action_id_can_be_approved_fresh_after_a_reset() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+    h.client.approve(&h.signers[1], &42);
+    h.client.reset(&42);
+
+    // The same id, reused for a later action, starts from a clean slate —
+    // a single signer's leftover vote can't carry over.
+    h.client.approve(&h.signers[2], &42);
+    assert_eq!(h.client.get_approval_count(&42), 1);
+    assert!(!h.client.is_approved(&42));
+}
+
+#[test]
+fn reset_does_not_affect_other_action_ids() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &1);
+    h.client.approve(&h.signers[1], &1);
+    h.client.approve(&h.signers[0], &2);
+    h.client.approve(&h.signers[1], &2);
+
+    h.client.reset(&1);
+
+    assert!(!h.client.is_approved(&1));
+    assert!(h.client.is_approved(&2));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // NotYetApproved
+fn reset_rejects_an_action_below_threshold() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42); // only 1 of 3, threshold is 2
+    h.client.reset(&42);
+}

@@ -142,4 +142,29 @@ impl Multisig {
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
         count >= threshold
     }
+
+    /// Clears every signer's approval of `action_id` and resets its count
+    /// to zero — for whoever executed the underlying action to call once
+    /// it's done, so the same votes can't linger indefinitely and be
+    /// silently reused if `action_id` is ever reused for a future action
+    /// (e.g. a recurring "pause" request reusing the same id). Only
+    /// callable once `action_id` is ALREADY approved — clearing an action
+    /// that hasn't reached threshold yet would just be a way to grief
+    /// other signers' pending votes for no reason, so this isn't open to
+    /// just anyone at just any time.
+    pub fn reset(env: Env, action_id: u64) {
+        if !Self::is_approved(env.clone(), action_id) {
+            panic_with_error!(&env, Error::NotYetApproved);
+        }
+
+        let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        for signer in signers.iter() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Approval(action_id, signer), &false);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ApprovalCount(action_id), &0u32);
+    }
 }
