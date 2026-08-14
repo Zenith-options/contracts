@@ -8,7 +8,7 @@
 
 use soroban_sdk::{
     contract, contractimpl,
-    Address, Env, Symbol, Vec, token,
+    Address, BytesN, Env, Symbol, Vec, token,
     panic_with_error,
 };
 
@@ -84,6 +84,17 @@ impl OptionsMarket {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         events::admin_transferred(&env, admin, new_admin);
+    }
+
+    /// Admin-gated contract upgrade: swaps the WASM executable behind this
+    /// contract's address to whatever `new_wasm_hash` was already uploaded
+    /// via the Soroban deployer, while keeping the same contract ID and all
+    /// existing storage. Storage layout compatibility with the new code is
+    /// the deployer's responsibility, same as any Soroban upgrade.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 
     /// Emergency stop: blocks new series creation and new trades

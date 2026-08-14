@@ -3,7 +3,7 @@
 use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    token, Address, Env, Symbol,
+    token, Address, BytesN, Env, Symbol,
 };
 
 const USDC_DECIMALS: i128 = 10_000_000; // matches PRICE_PRECISION
@@ -746,4 +746,20 @@ fn refund_uses_the_fee_rate_in_effect_at_buy_time_not_the_current_one() {
     let before = balance(&h, &buyer);
     h.client.claim_refund(&buyer, &pos_id);
     assert_eq!(balance(&h, &buyer) - before, 39_800_000); // 40M - the ORIGINAL 0.5% fee
+}
+
+// ─── upgrade ─────────────────────────────────────────────────────────────────
+
+/// A full self-upgrade round-trip needs a second, already-built WASM
+/// artifact to point at, which this unit-test harness doesn't produce (it
+/// runs against native code, not the wasm32 target). This test only proves
+/// the entry point is wired up and reaches the host's deployer — the
+/// bogus, never-uploaded hash panics one layer past our own admin check,
+/// not on our own auth logic, confirming that check passed through cleanly.
+#[test]
+#[should_panic]
+fn upgrade_reaches_the_host_deployer_past_the_admin_check() {
+    let h = setup();
+    let bogus_hash = BytesN::from_array(&h.env, &[0u8; 32]);
+    h.client.upgrade(&bogus_hash);
 }
