@@ -1412,13 +1412,18 @@ fn option_bought_event_carries_position_and_premium_data() {
         .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
 
     let events = h.env.events().all();
-    let (_, _topics, data) = events.last().unwrap();
+    let (_, topics, data) = events.last().unwrap();
     let (event_pos_id, event_series_id, contracts, total_premium) =
         <(u64, u64, i128, i128)>::try_from_val(&h.env, &data).unwrap();
     assert_eq!(event_pos_id, pos_id);
     assert_eq!(event_series_id, series_id);
     assert_eq!(contracts, USDC_DECIMALS);
     assert_eq!(total_premium, 40_000_000); // net of the 0.5% fee already deducted
+
+    // The buyer's address lives in topics, not data — an indexer
+    // filtering "events for this wallet" reads it from here.
+    let topic_buyer = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_buyer, buyer);
 }
 
 #[test]
@@ -1457,13 +1462,17 @@ fn option_written_event_carries_position_and_collateral_data() {
         .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     let events = h.env.events().all();
-    let (_, _topics, data) = events.last().unwrap();
+    let (_, topics, data) = events.last().unwrap();
     let (event_pos_id, event_series_id, contracts, _writer_premium, required_collateral) =
         <(u64, u64, i128, i128, i128)>::try_from_val(&h.env, &data).unwrap();
     assert_eq!(event_pos_id, pos_id);
     assert_eq!(event_series_id, series_id);
     assert_eq!(contracts, USDC_DECIMALS);
     assert_eq!(required_collateral, 700_000_000);
+
+    // The writer's address lives in topics, not data.
+    let topic_writer = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_writer, writer);
 }
 
 #[test]
