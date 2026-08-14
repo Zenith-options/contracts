@@ -8,11 +8,18 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   XLM, BTC, ETH, and SOL. Premium is set by the admin (computed off-chain via
   Black-Scholes); writers lock collateral, buyers pay premium, settlement
   happens at expiry against an oracle-reported price.
+- [`price_oracle/`](price_oracle) — the on-chain logic behind that
+  oracle-reported price. options_market only ever trusted a bare
+  `oracle: Address` with nothing backing it; this contract is a small
+  set of admin-authorized feeders reporting per-symbol prices, aggregated
+  as a median across whatever's still fresh.
 
 ## Building and testing
 
+Each crate is standalone (no workspace `Cargo.toml`):
+
 ```sh
-cd options_market
+cd options_market   # or price_oracle
 cargo build                                   # native build, fast iteration
 cargo test                                    # unit tests (soroban-sdk testutils)
 cargo clippy --all-targets -- -D warnings     # matches CI
@@ -21,7 +28,7 @@ cargo build --target wasm32-unknown-unknown --release   # the real deploy artifa
 ```
 
 CI (`.github/workflows/ci.yml`) runs all four of the above against every
-push and PR.
+push and PR, for both crates.
 
 ## Deploying
 
@@ -41,6 +48,19 @@ soroban contract invoke --id <contract-id> --source <admin> --network testnet --
   --oracle <oracle-address> \
   --collateral_token <usdc-sac-address> \
   --fee_recipient <fee-recipient-address>
+```
+
+`price_oracle` deploys and initializes the same way, with just an
+`--admin` argument:
+
+```sh
+soroban contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/zenith_price_oracle.wasm \
+  --source <your-identity> \
+  --network testnet
+
+soroban contract invoke --id <contract-id> --source <admin> --network testnet -- \
+  initialize --admin <admin-address>
 ```
 
 ## `options_market` reference
@@ -102,6 +122,45 @@ collected, total open interest, series count).
 | 10 | `AlreadySettled` | | 21 | `InsufficientPremiumPool` |
 | 11 | `ExerciseWindowClosed` | | 22 | `InvalidSeriesParams` |
 
+## `price_oracle` reference
+
+### Admin
+
+| Function | Description |
+|---|---|
+| `initialize(admin)` | One-time setup. Defaults `max_staleness` to 1 hour. |
+| `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
+| `add_feeder(feeder)` / `remove_feeder(feeder)` | Authorize/revoke a price reporter. Capped at `MAX_FEEDERS` (16). A removed feeder's past reports stay readable via `get_latest_report` (audit trail) but no longer count toward the aggregate. |
+| `set_max_staleness(seconds)` | How old a report can be and still count toward `get_price`. Rejects zero. |
+| `pause()` / `unpause()` | Emergency stop. Blocks `add_feeder`, `remove_feeder`, `report_price`. Does **not** block `get_price` — a pause freezes changes to the feed, it doesn't hide the last-known price. |
+
+### Feeders
+
+| Function | Description |
+|---|---|
+| `report_price(feeder, symbol, price)` | Records this feeder's own observation. Requires the feeder's signature and current authorization; rejects non-positive prices. |
+
+### Views
+
+| Function | Description |
+|---|---|
+| `get_price(symbol)` | Median across every currently-authorized feeder's report that's within `max_staleness`. `None` if nothing is fresh — callers must not treat that as "price is zero." |
+| `get_latest_report(symbol, feeder)` | One feeder's raw report, regardless of freshness or current authorization. |
+| `is_feeder`, `get_feeder_count`, `get_max_staleness`, `get_admin`, `is_paused` | |
+
+### Errors
+
+| # | Error |
+|---|---|
+| 1 | `AlreadyInitialized` |
+| 2 | `FeederAlreadyAdded` |
+| 3 | `FeederNotFound` |
+| 4 | `NotAFeeder` |
+| 5 | `InvalidPrice` |
+| 6 | `ContractPaused` |
+| 7 | `InvalidStaleness` |
+| 8 | `TooManyFeeders` |
+
 ## Known gaps
 
 - **Cross-position accounting on cancellation.** `claim_refund` on a
@@ -118,3 +177,11 @@ collected, total open interest, series count).
   `write_option`'s `InsufficientPremiumPool` check is a pool-level
   constraint, not a guarantee that any specific buyer's trade funded any
   specific writer's premium.
+- **The two contracts aren't wired together yet.** `options_market` still
+  takes settlement prices via its own `set_settlement_price`, called by
+  whatever address it was initialized with as `oracle` — it doesn't
+  actually call into `price_oracle`. Making `options_market`'s
+  `set_settlement_price` pull from a deployed `price_oracle` instance
+  (or having the address initialized as its `oracle` simply *be* a
+  `price_oracle` deployment, invoked off-chain by that contract's own
+  authorized feeder flow) is the natural next step connecting the two.
