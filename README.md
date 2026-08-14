@@ -184,6 +184,7 @@ collected, total open interest, series count).
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
 | `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
 | `add_feeder(feeder)` / `remove_feeder(feeder)` | Authorize/revoke a price reporter. Capped at `MAX_FEEDERS` (16). A removed feeder's past reports stay readable via `get_latest_report` (audit trail) but no longer count toward the aggregate. |
+| `add_feeder_via_multisig(multisig_contract, action_id, feeder)` / `remove_feeder_via_multisig(...)` | Permissionless alternatives: cross-call a deployed `multisig` and check `is_approved(action_id)` instead of requiring the admin's own signature. Still enforce `FeederAlreadyAdded`/`TooManyFeeders`/`FeederNotFound` — approval changes who can call these, not the underlying invariants. |
 | `set_max_staleness(seconds)` | How old a report can be and still count toward `get_price`. Rejects zero. |
 | `set_max_staleness_via_multisig(multisig_contract, action_id, seconds)` | Permissionless alternative: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Still rejects zero — approval changes who can call it, not what a valid staleness bound is. |
 | `pause()` / `unpause()` | Emergency stop. Blocks `add_feeder`, `remove_feeder`, `report_price`. Does **not** block `get_price` — a pause freezes changes to the feed, it doesn't hide the last-known price. |
@@ -334,15 +335,16 @@ compromised signer can never add another compromised signer.
   functions, not all of them.** On options_market:
   `pause`/`unpause`/`transfer_admin`/`set_fee_rate`/`upgrade`/`cancel_series`
   all now have a `_via_multisig` alternative. On price_oracle:
-  `pause`/`unpause`/`transfer_admin`/`set_max_staleness` do. On vault:
+  `pause`/`unpause`/`transfer_admin`/`set_max_staleness`/`add_feeder`/
+  `remove_feeder` do. On vault:
   `pause`/`unpause`/`transfer_admin`/`withdraw`/`transfer_tag`/`sweep_untagged`
   do — every vault function that moves or reassigns funds now has one.
   Every `_via_multisig` function is additive (the original admin-gated
   version is unchanged) and checks `is_approved(action_id)` on a
   deployed Multisig instead of a single signature. Every OTHER
   sensitive function — `create_series`, `update_premium` on
-  options_market; `add_feeder`/`remove_feeder` on price_oracle — still
-  goes through a bare `admin: Address`, one key, not M-of-N. A caller
-  wiring more of these in is responsible for picking its own
+  options_market — still goes through a bare `admin: Address`, one
+  key, not M-of-N. A caller wiring more of these in is responsible for
+  picking its own
   stable `action_id` scheme per function, since Multisig never
   interprets what an id means.
