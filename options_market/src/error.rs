@@ -24,4 +24,5 @@ pub enum Error {
     SeriesNotCancelled = 18,
     InvalidFeeRate = 19,
     TooManySeriesForUnderlying = 20,
+    InsufficientPremiumPool = 21,
 }

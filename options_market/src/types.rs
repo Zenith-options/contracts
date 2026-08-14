@@ -20,6 +20,7 @@ pub enum DataKey {
     Paused,
     FeeRateBps,
     SeriesCountForUnderlying(Symbol),
+    PremiumPool,
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────

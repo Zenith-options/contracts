@@ -58,6 +58,7 @@ impl OptionsMarket {
         env.storage().instance().set(&DataKey::TotalPremiumsCollected, &0i128);
         env.storage().instance().set(&DataKey::TotalOpenInterest, &0i128);
         env.storage().instance().set(&DataKey::FeeRateBps, &DEFAULT_FEE_RATE_BPS);
+        env.storage().instance().set(&DataKey::PremiumPool, &0i128);
     }
 
     /// Admin adjusts the protocol fee rate (basis points, 1 bps = 0.01%),
@@ -339,6 +340,12 @@ impl OptionsMarket {
         let total_collected: i128 = env.storage().instance().get(&DataKey::TotalPremiumsCollected).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalPremiumsCollected, &(total_collected + premium_after_fee));
 
+        // Funds the pool writers get paid out of — see write_option for why
+        // this indirection exists instead of writers drawing directly off
+        // the vault's raw token balance.
+        let pool: i128 = env.storage().instance().get(&DataKey::PremiumPool).unwrap_or(0);
+        env.storage().instance().set(&DataKey::PremiumPool, &(pool + premium_after_fee));
+
         events::option_bought(&env, buyer, pos_id, series_id, contracts, total_premium);
 
         pos_id
@@ -403,7 +410,15 @@ impl OptionsMarket {
         // Writer locks collateral
         usdc.transfer(&writer, &env.current_contract_address(), &required_collateral);
 
-        // Writer receives premium (from vault balance)
+        // Writer receives premium, drawn from the pool that buyers' premium
+        // payments fund (see buy_option) — NOT from the vault's raw token
+        // balance. Paying straight out of the vault would let a writer's
+        // own just-deposited collateral fund their "premium," which isn't
+        // a premium at all (nobody has actually paid one yet) and leaves
+        // the vault unable to return that writer's full collateral later.
+        // A write that arrives before enough buyer premium exists to cover
+        // it is correctly rejected rather than quietly settled from funds
+        // that were never earned.
         let total_premium = contracts
             .checked_mul(series.premium)
             .unwrap()
@@ -411,6 +426,12 @@ impl OptionsMarket {
             .unwrap();
         let fee = calc_fee(total_premium, fee_rate_bps(&env));
         let writer_premium = total_premium - fee;
+
+        let pool: i128 = env.storage().instance().get(&DataKey::PremiumPool).unwrap_or(0);
+        if pool < writer_premium {
+            panic_with_error!(&env, Error::InsufficientPremiumPool);
+        }
+        env.storage().instance().set(&DataKey::PremiumPool, &(pool - writer_premium));
 
         usdc.transfer(&env.current_contract_address(), &writer, &writer_premium);
 
@@ -574,6 +595,10 @@ impl OptionsMarket {
 
     pub fn get_fee_rate(env: Env) -> i128 {
         fee_rate_bps(&env)
+    }
+
+    pub fn get_premium_pool(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::PremiumPool).unwrap_or(0)
     }
 
     pub fn get_series_count_for_underlying(env: Env, underlying: Symbol) -> u32 {

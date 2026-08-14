@@ -64,6 +64,18 @@ fn make_series(h: &Harness, option_type: OptionType, strike: i128, premium: i128
     )
 }
 
+/// write_option pays a writer's premium out of the pool that buyers' own
+/// premium payments fund (see the InsufficientPremiumPool gate in
+/// write_option) — so tests that only care about the writer side still
+/// need a throwaway buyer to have funded that pool first. Buying the same
+/// `contracts` count in the same series contributes exactly the
+/// fee-adjusted amount write_option will need to pay out.
+fn fund_premium_pool(h: &Harness, series_id: u64, contracts: i128) {
+    let filler_buyer = Address::generate(&h.env);
+    mint(h, &filler_buyer, 1_000 * USDC_DECIMALS);
+    h.client.buy_option(&filler_buyer, &series_id, &contracts, &(1_000 * USDC_DECIMALS));
+}
+
 #[test]
 fn initialize_sets_admin_and_zeroed_counters() {
     let h = setup();
@@ -201,6 +213,7 @@ fn write_covered_call_locks_collateral_equal_to_notional() {
     // the series' own strike as the notional basis — this pins down that
     // documented fallback rather than assuming an oracle price exists.
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
 
     let writer = Address::generate(&h.env);
     let required = 700_000_000; // 1 contract * strike (fallback price)
@@ -221,6 +234,7 @@ fn write_covered_call_locks_collateral_equal_to_notional() {
 fn write_cash_secured_put_requires_110_percent_of_strike() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Put, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
 
     let writer = Address::generate(&h.env);
     let required = 700_000_000 * 11 / 10; // strike * contracts * 110%
@@ -240,6 +254,36 @@ fn write_option_rejects_undercollateralized_offer() {
     mint(&h, &writer, 700_000_000);
     // Offers exactly 100% of strike for a put, which needs 110%.
     h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #21)")] // InsufficientPremiumPool
+fn write_option_rejects_a_write_with_no_buyer_premium_to_draw_from() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    // No buyer has ever bought into this series, so the premium pool is
+    // empty — write_option must not pay the writer out of its own
+    // just-deposited collateral, which isn't a premium anyone paid.
+    h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+}
+
+#[test]
+fn write_option_succeeds_once_the_pool_partially_covers_it() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    assert_eq!(h.client.get_premium_pool(), 0);
+
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+    assert_eq!(h.client.get_premium_pool(), 39_800_000); // 40M premium net of the 0.5% fee
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    // The writer's premium exactly drained the pool the lone buyer funded.
+    assert_eq!(h.client.get_premium_pool(), 0);
 }
 
 // ─── settlement + exercise ──────────────────────────────────────────────────
@@ -326,6 +370,7 @@ fn exercise_before_expiry_is_rejected() {
 fn exercise_rejects_a_short_position() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
     let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
@@ -366,6 +411,7 @@ fn set_settlement_price_before_expiry_is_rejected() {
 fn reclaim_collateral_returns_locked_minus_max_loss() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
 
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
@@ -387,22 +433,16 @@ fn reclaim_collateral_returns_locked_minus_max_loss() {
 fn reclaim_collateral_returns_everything_when_otm() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Funds the premium pool so write_option below has real buyer premium
+    // to pay the writer from, instead of dipping into the writer's own
+    // just-deposited collateral (see write_option's InsufficientPremiumPool
+    // gate) — the fix for the vault-liquidity gap this test used to work
+    // around with a direct top-up mint.
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
     let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
-
-    // NOTE (real gap, not just test setup): write_option pays the writer's
-    // premium out of whatever the vault currently holds, which in this
-    // single-writer scenario is only the collateral this same call just
-    // deposited — so the vault is already short the fee-adjusted premium
-    // amount before reclaim ever runs. In production this is covered by
-    // buyer premiums already sitting in the shared vault; topping it up
-    // here stands in for "other market activity already funded it." This
-    // is worth a real fix later: the vault has no per-position accounting
-    // of which balance is actually earmarked for what, so a standalone
-    // write with no matching buyer can't always reclaim its full
-    // collateral even when nothing was paid out against it.
-    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM
@@ -431,17 +471,18 @@ fn reclaim_collateral_rejects_a_long_position() {
 fn reclaim_collateral_twice_is_rejected() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Funds the premium pool for the same reason noted on
+    // reclaim_collateral_returns_everything_when_otm — this used to need a
+    // direct top-up mint to make the FIRST reclaim below succeed for real
+    // (otherwise it fails on the token contract's own insufficient-balance
+    // error, which happens to also render as "Error(Contract, #10)", so
+    // the should_panic would pass for the wrong reason without ever
+    // reaching the second call).
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
     let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
-
-    // Same vault-liquidity gap noted on reclaim_collateral_returns_everything_when_otm:
-    // without this top-up the FIRST reclaim call below fails on the token
-    // contract's own insufficient-balance error, which happens to also render
-    // as "Error(Contract, #10)" — so the should_panic below would pass for the
-    // wrong reason (never even reaching the second call) instead of actually
-    // exercising AlreadySettled.
-    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(650_000_000));
@@ -503,13 +544,16 @@ fn full_lifecycle_covered_call_itm() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
 
-    let writer = Address::generate(&h.env);
-    mint(&h, &writer, 700_000_000);
-    let writer_pos = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
-
+    // Buyer goes first: write_option pays the writer's premium out of the
+    // pool buyers' premium payments fund, so the pool needs to hold real
+    // funds before a writer can be paid out of it.
     let buyer = Address::generate(&h.env);
     mint(&h, &buyer, 1_000 * USDC_DECIMALS);
     let buyer_pos = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let writer_pos = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     let series: OptionSeries = h.client.get_series(&series_id).unwrap();
     assert_eq!(series.open_interest, 2 * USDC_DECIMALS); // one long + one short
@@ -600,6 +644,7 @@ fn write_option_is_rejected_while_paused() {
 fn pause_does_not_block_settlement_of_existing_positions() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
     let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
@@ -608,11 +653,6 @@ fn pause_does_not_block_settlement_of_existing_positions() {
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM, no exercise needed
-
-    // Vault liquidity top-up for the same reason documented on the OTM
-    // reclaim test above — a standalone writer's full collateral reclaim
-    // exceeds what write_option itself left in the vault.
-    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
 
     let before = balance(&h, &writer);
     h.client.reclaim_collateral(&writer, &pos_id);
@@ -643,17 +683,12 @@ fn cancelled_series_refunds_buyer_premium_net_of_fee() {
 fn cancelled_series_refunds_writer_full_collateral() {
     let h = setup();
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
     let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
 
     h.client.cancel_series(&series_id);
-
-    // Same vault-liquidity gap documented on the OTM reclaim test: write_option
-    // already paid this writer's own premium out of the collateral it just
-    // deposited, so a standalone writer's full refund exceeds what's left
-    // in the vault without other market activity funding it.
-    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
 
     let before = balance(&h, &writer);
     h.client.claim_refund(&writer, &pos_id);
