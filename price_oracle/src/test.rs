@@ -353,6 +353,29 @@ fn report_price_emits_a_price_reported_event() {
 }
 
 #[test]
+fn transfer_admin_emits_an_admin_transferred_event_with_old_and_new_admin() {
+    let h = setup();
+    let new_admin = Address::generate(&h.env);
+    h.client.transfer_admin(&new_admin);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (old_admin, event_new_admin) = <(Address, Address)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(old_admin, h.admin);
+    assert_eq!(event_new_admin, new_admin);
+}
+
+#[test]
+fn set_max_staleness_emits_a_max_staleness_updated_event_with_the_new_value() {
+    let h = setup();
+    h.client.set_max_staleness(&7200);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(u64::try_from_val(&h.env, &data).unwrap(), 7200);
+}
+
+#[test]
 fn pause_and_unpause_each_emit_their_own_event() {
     let h = setup();
     let events_before = h.env.events().all().len();
