@@ -7,121 +7,29 @@
 //! Writers lock collateral; buyers pay premium. Settlement at expiry via oracle.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, contracterror,
-    Address, Env, Map, Symbol, Vec, String, token,
-    panic_with_error,
+    contract, contractimpl, panic_with_error, token, Address, BytesN, Env, Symbol, Vec,
 };
 
-// ─── Precision & Limits ──────────────────────────────────────────────────────
+#[cfg(test)]
+mod test;
 
-const PRICE_PRECISION: i128 = 10_000_000;       // 1e7
-const RATE_PRECISION:  i128 = 1_000_000_000;    // 1e9
-const MAX_SERIES_PER_UNDERLYING: u32 = 50;
-const MIN_COLLATERAL_RATIO: i128 = 1_100_000_000; // 110% over-collateralization for puts
-const SETTLEMENT_WINDOW: u64 = 86_400;           // 24h window after expiry to exercise
+mod error;
+mod events;
+mod math;
+mod multisig_client;
+mod price_oracle_client;
+mod storage;
+mod types;
 
-// ─── Storage Keys ─────────────────────────────────────────────────────────────
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
-    Admin,
-    Oracle,
-    CollateralToken,        // USDC
-    FeeRecipient,
-    Series(u64),            // series_id -> OptionSeries
-    Position(u64),          // position_id -> OptionPosition
-    UserPositions(Address), // address -> Vec<u64>
-    SeriesCounter,
-    PositionCounter,
-    UnderlyingPrice(Symbol),
-    TotalPremiumsCollected,
-    TotalOpenInterest,
-}
-
-// ─── Data Types ───────────────────────────────────────────────────────────────
-
-#[contracttype]
-#[derive(Clone, PartialEq)]
-pub enum OptionType {
-    Call,   // right to BUY at strike
-    Put,    // right to SELL at strike
-}
-
-#[contracttype]
-#[derive(Clone, PartialEq)]
-pub enum SeriesState {
-    Active,    // accepting trades
-    Expired,   // past expiry, awaiting settlement
-    Settled,   // final settlement price set
-    Cancelled, // admin cancelled
-}
-
-#[contracttype]
-#[derive(Clone, PartialEq)]
-pub enum PositionSide {
-    Long,   // bought option (paid premium)
-    Short,  // wrote option (received premium, locked collateral)
-}
-
-/// One option series = one expiry × one strike × one type × one underlying
-#[contracttype]
-#[derive(Clone)]
-pub struct OptionSeries {
-    pub series_id: u64,
-    pub underlying: Symbol,    // "XLM" | "BTC" | "ETH" | "SOL"
-    pub option_type: OptionType,
-    pub strike_price: i128,    // PRICE_PRECISION scale
-    pub expiry: u64,           // unix timestamp
-    /// Premium per contract (1 contract = 1 unit of underlying, PRICE_PRECISION scale)
-    pub premium: i128,
-    /// Implied volatility used to price (RATE_PRECISION scale, e.g. 0.45 = 450_000_000)
-    pub implied_vol: i128,
-    pub open_interest: i128,   // total contracts outstanding
-    pub state: SeriesState,
-    pub settlement_price: Option<i128>,
-    pub created_at: u64,
-}
-
-/// One user's option position in a series
-#[contracttype]
-#[derive(Clone)]
-pub struct OptionPosition {
-    pub position_id: u64,
-    pub series_id: u64,
-    pub owner: Address,
-    pub side: PositionSide,
-    pub contracts: i128,       // PRICE_PRECISION scale (1.0 = 10_000_000)
-    pub premium_paid: i128,    // total premium paid or received
-    pub collateral_locked: i128, // for writers only
-    pub is_exercised: bool,
-    pub is_settled: bool,
-    pub opened_at: u64,
-}
-
-// ─── Errors ───────────────────────────────────────────────────────────────────
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum Error {
-    AlreadyInitialized    = 1,
-    Unauthorized          = 2,
-    SeriesNotFound        = 3,
-    SeriesNotActive       = 4,
-    SeriesNotExpired      = 5,
-    PositionNotFound      = 6,
-    InsufficientPremium   = 7,
-    InsufficientCollateral= 8,
-    AlreadyExercised      = 9,
-    AlreadySettled        = 10,
-    ExerciseWindowClosed  = 11,
-    ZeroContracts         = 12,
-    PriceNotSet           = 13,
-    NotInTheMoney         = 14,
-    WrongSide             = 15,
-    ExpiryTooSoon         = 16,
-}
+use error::Error;
+use math::{
+    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_FEE_RATE_BPS, MAX_SERIES_PER_UNDERLYING,
+    MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW,
+};
+use storage::{
+    add_user_position, fee_rate_bps, next_position_id, require_active_series, require_not_paused,
+};
+use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -145,12 +53,173 @@ impl OptionsMarket {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Oracle, &oracle);
-        env.storage().instance().set(&DataKey::CollateralToken, &collateral_token);
-        env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
+        env.storage()
+            .instance()
+            .set(&DataKey::CollateralToken, &collateral_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRecipient, &fee_recipient);
         env.storage().instance().set(&DataKey::SeriesCounter, &0u64);
-        env.storage().instance().set(&DataKey::PositionCounter, &0u64);
-        env.storage().instance().set(&DataKey::TotalPremiumsCollected, &0i128);
-        env.storage().instance().set(&DataKey::TotalOpenInterest, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::PositionCounter, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalPremiumsCollected, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalOpenInterest, &0i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRateBps, &DEFAULT_FEE_RATE_BPS);
+        env.storage().instance().set(&DataKey::PremiumPool, &0i128);
+    }
+
+    /// Admin adjusts the protocol fee rate (basis points, 1 bps = 0.01%),
+    /// capped at MAX_FEE_RATE_BPS so a compromised or careless admin can't
+    /// set an absurd rate that effectively confiscates every trade.
+    pub fn set_fee_rate(env: Env, new_bps: u32) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let new_bps = new_bps as i128;
+        if new_bps > MAX_FEE_RATE_BPS {
+            panic_with_error!(&env, Error::InvalidFeeRate);
+        }
+
+        env.storage().instance().set(&DataKey::FeeRateBps, &new_bps);
+        events::fee_rate_updated(&env, new_bps);
+    }
+
+    /// Permissionless alternative to set_fee_rate: cross-calls a deployed
+    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// the admin's own signature. Same MAX_FEE_RATE_BPS cap applies —
+    /// M-of-N approval doesn't bypass the sanity check, it just replaces
+    /// whose signature satisfies the auth requirement.
+    pub fn set_fee_rate_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        new_bps: u32,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let new_bps = new_bps as i128;
+        if new_bps > MAX_FEE_RATE_BPS {
+            panic_with_error!(&env, Error::InvalidFeeRate);
+        }
+
+        env.storage().instance().set(&DataKey::FeeRateBps, &new_bps);
+        events::fee_rate_updated(&env, new_bps);
+    }
+
+    /// Admin hands off control to a new address. Requires the CURRENT admin's
+    /// signature, not the incoming one — the new admin doesn't need to do
+    /// anything to receive control.
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
+    }
+
+    /// Permissionless alternative to transfer_admin: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the current admin's own signature. Same rationale as
+    /// pause_via_multisig — arguably even more important here, since a
+    /// single lost or compromised admin key otherwise has no recovery
+    /// path at all for a contract that only ever trusted one signature.
+    pub fn transfer_admin_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        new_admin: Address,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
+    }
+
+    /// Admin-gated contract upgrade: swaps the WASM executable behind this
+    /// contract's address to whatever `new_wasm_hash` was already uploaded
+    /// via the Soroban deployer, while keeping the same contract ID and all
+    /// existing storage. Storage layout compatibility with the new code is
+    /// the deployer's responsibility, same as any Soroban upgrade.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Permissionless alternative to upgrade: cross-calls a deployed
+    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// the admin's own signature. Swapping the contract's executable is
+    /// the single most consequential action any of these contracts can
+    /// take — gating it behind M-of-N approval rather than one key is the
+    /// clearest case for this pattern in the whole codebase.
+    pub fn upgrade_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        new_wasm_hash: BytesN<32>,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    /// Emergency stop: blocks new series creation and new trades
+    /// (create_series, update_premium, buy_option, write_option). Does NOT
+    /// block exercise, set_settlement_price, or reclaim_collateral — a
+    /// pause should let existing positions wind down, not trap funds.
+    pub fn pause(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        events::paused(&env);
+    }
+
+    pub fn unpause(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        events::unpaused(&env);
+    }
+
+    /// Permissionless alternative to pause(): instead of the single
+    /// admin address asserting the pause directly, anyone can trigger it
+    /// once a deployed Multisig reports `action_id` as approved — no
+    /// require_auth() needed, since the approval itself (M-of-N signers,
+    /// checked on-chain by the Multisig) is what's actually authorizing
+    /// this, not the caller triggering it. Same `action_id`-is-opaque
+    /// contract as everywhere Multisig is used: it's this caller's job to
+    /// pick a stable id scheme, not Multisig's or options_market's to
+    /// interpret one.
+    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &true);
+        events::paused(&env);
+    }
+
+    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        events::unpaused(&env);
     }
 
     // ── Series Management (Admin) ─────────────────────────────────────────────
@@ -166,6 +235,7 @@ impl OptionsMarket {
         premium: i128,
         implied_vol: i128,
     ) -> u64 {
+        require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -173,9 +243,30 @@ impl OptionsMarket {
         if expiry <= now + 3600 {
             panic_with_error!(&env, Error::ExpiryTooSoon);
         }
+        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
+            panic_with_error!(&env, Error::InvalidSeriesParams);
+        }
 
-        let counter: u64 = env.storage().instance().get(&DataKey::SeriesCounter).unwrap();
-        let series_id = counter + 1;
+        let underlying_count_key = DataKey::SeriesCountForUnderlying(underlying.clone());
+        let underlying_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&underlying_count_key)
+            .unwrap_or(0);
+        if underlying_count >= MAX_SERIES_PER_UNDERLYING {
+            panic_with_error!(&env, Error::TooManySeriesForUnderlying);
+        }
+        env.storage().persistent().set(
+            &underlying_count_key,
+            &(underlying_count.checked_add(1).unwrap()),
+        );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SeriesCounter)
+            .unwrap();
+        let series_id = counter.checked_add(1).unwrap();
 
         let series = OptionSeries {
             series_id,
@@ -191,23 +282,105 @@ impl OptionsMarket {
             created_at: now,
         };
 
-        env.storage().persistent().set(&DataKey::Series(series_id), &series);
-        env.storage().instance().set(&DataKey::SeriesCounter, &series_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+        env.storage()
+            .instance()
+            .set(&DataKey::SeriesCounter, &series_id);
 
-        env.events().publish(
-            (Symbol::new(&env, "series_created"),),
-            (series_id, strike_price, expiry, premium),
+        events::series_created(&env, series_id, strike_price, expiry, premium);
+
+        series_id
+    }
+
+    /// Permissionless alternative to create_series: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Same validation and per-
+    /// underlying cap apply — approval changes who can list a series,
+    /// not what parameters a series may have.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_series_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        underlying: Symbol,
+        option_type: OptionType,
+        strike_price: i128,
+        expiry: u64,
+        premium: i128,
+        implied_vol: i128,
+    ) -> u64 {
+        require_not_paused(&env);
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if expiry <= now + 3600 {
+            panic_with_error!(&env, Error::ExpiryTooSoon);
+        }
+        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
+            panic_with_error!(&env, Error::InvalidSeriesParams);
+        }
+
+        let underlying_count_key = DataKey::SeriesCountForUnderlying(underlying.clone());
+        let underlying_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&underlying_count_key)
+            .unwrap_or(0);
+        if underlying_count >= MAX_SERIES_PER_UNDERLYING {
+            panic_with_error!(&env, Error::TooManySeriesForUnderlying);
+        }
+        env.storage().persistent().set(
+            &underlying_count_key,
+            &(underlying_count.checked_add(1).unwrap()),
         );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SeriesCounter)
+            .unwrap();
+        let series_id = counter.checked_add(1).unwrap();
+
+        let series = OptionSeries {
+            series_id,
+            underlying,
+            option_type,
+            strike_price,
+            expiry,
+            premium,
+            implied_vol,
+            open_interest: 0,
+            state: SeriesState::Active,
+            settlement_price: None,
+            created_at: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+        env.storage()
+            .instance()
+            .set(&DataKey::SeriesCounter, &series_id);
+
+        events::series_created(&env, series_id, strike_price, expiry, premium);
 
         series_id
     }
 
     /// Admin updates premium (e.g. after volatility changes)
     pub fn update_premium(env: Env, series_id: u64, new_premium: i128, new_implied_vol: i128) {
+        require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
-        let mut series: OptionSeries = env.storage().persistent()
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
             .get(&DataKey::Series(series_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
 
@@ -217,12 +390,175 @@ impl OptionsMarket {
 
         series.premium = new_premium;
         series.implied_vol = new_implied_vol;
-        env.storage().persistent().set(&DataKey::Series(series_id), &series);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
 
-        env.events().publish(
-            (Symbol::new(&env, "premium_updated"), series_id),
-            (new_premium, new_implied_vol),
-        );
+        events::premium_updated(&env, series_id, new_premium, new_implied_vol);
+    }
+
+    /// Permissionless alternative to update_premium: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Same rationale as
+    /// create_series_via_multisig.
+    pub fn update_premium_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        series_id: u64,
+        new_premium: i128,
+        new_implied_vol: i128,
+    ) {
+        require_not_paused(&env);
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Active {
+            panic_with_error!(&env, Error::SeriesNotActive);
+        }
+
+        series.premium = new_premium;
+        series.implied_vol = new_implied_vol;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+
+        events::premium_updated(&env, series_id, new_premium, new_implied_vol);
+    }
+
+    /// Admin cancels an Active series (e.g. mispriced, or the underlying
+    /// feed is compromised). Existing position holders then pull their own
+    /// refund via claim_refund rather than the admin pushing funds to
+    /// everyone in one call — Soroban charges for the resources a call
+    /// touches, and an unbounded push-refund would scale badly with the
+    /// number of open positions.
+    pub fn cancel_series(env: Env, series_id: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Active {
+            panic_with_error!(&env, Error::SeriesNotActive);
+        }
+
+        series.state = SeriesState::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+
+        events::series_cancelled(&env, series_id);
+    }
+
+    /// Permissionless alternative to cancel_series: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Cancelling a series is
+    /// disruptive to every open position in it, so gating it behind M-of-N
+    /// approval (rather than a single key) is at least as warranted here
+    /// as for pause.
+    pub fn cancel_series_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        series_id: u64,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Active {
+            panic_with_error!(&env, Error::SeriesNotActive);
+        }
+
+        series.state = SeriesState::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+
+        events::series_cancelled(&env, series_id);
+    }
+
+    /// A position holder in a Cancelled series reclaims what they put in:
+    /// buyers get their premium back, writers get their collateral back.
+    pub fn claim_refund(env: Env, owner: Address, position_id: u64) {
+        owner.require_auth();
+
+        let mut position: OptionPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+
+        if position.owner != owner {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if position.is_settled {
+            panic_with_error!(&env, Error::AlreadySettled);
+        }
+
+        let series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(position.series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Cancelled {
+            panic_with_error!(&env, Error::SeriesNotCancelled);
+        }
+
+        // Longs only ever had premium_paid (gross, including the protocol
+        // fee) sitting in the vault for a moment before the fee's cut was
+        // sent to fee_recipient — so refunding the full gross amount here
+        // would draw down other positions' vault balances. Refund net of
+        // the fee actually deducted at buy time (fee_paid, not a
+        // recomputation off the CURRENT fee rate, which the admin may have
+        // changed since this position was opened). The fee itself isn't
+        // clawed back from fee_recipient — cancellation is an admin
+        // decision, not a token-contract-level guarantee we can enforce
+        // retroactively.
+        let refund = match position.side {
+            PositionSide::Long => position
+                .premium_paid
+                .checked_sub(position.fee_paid)
+                .unwrap(),
+            PositionSide::Short => position.collateral_locked,
+        };
+
+        if refund > 0 {
+            let collateral_token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::CollateralToken)
+                .unwrap();
+            let usdc = token::Client::new(&env, &collateral_token);
+            usdc.transfer(&env.current_contract_address(), &owner, &refund);
+        }
+
+        position.is_settled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(position_id), &position);
+
+        events::refund_claimed(&env, owner, position_id, refund);
     }
 
     // ── Buying Options (Long) ─────────────────────────────────────────────────
@@ -237,13 +573,14 @@ impl OptionsMarket {
         contracts: i128,
         max_premium: i128,
     ) -> u64 {
+        require_not_paused(&env);
         buyer.require_auth();
 
         if contracts <= 0 {
             panic_with_error!(&env, Error::ZeroContracts);
         }
 
-        let mut series: OptionSeries = Self::require_active_series(&env, series_id);
+        let mut series: OptionSeries = require_active_series(&env, series_id);
 
         let total_premium = contracts
             .checked_mul(series.premium)
@@ -256,11 +593,15 @@ impl OptionsMarket {
         }
 
         // Collect premium
-        let collateral_token: Address = env.storage().instance().get(&DataKey::CollateralToken).unwrap();
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
         let usdc = token::Client::new(&env, &collateral_token);
 
-        // Protocol fee: 0.5% of premium
-        let fee = total_premium * 5 / 1000;
+        // Protocol fee
+        let fee = calc_fee(total_premium, fee_rate_bps(&env));
         let premium_after_fee = total_premium - fee;
 
         // Premium goes to vault (covers writer payouts on exercise)
@@ -268,12 +609,16 @@ impl OptionsMarket {
 
         // Fee to protocol
         if fee > 0 {
-            let fee_recipient: Address = env.storage().instance().get(&DataKey::FeeRecipient).unwrap();
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .unwrap();
             usdc.transfer(&env.current_contract_address(), &fee_recipient, &fee);
         }
 
         // Create position
-        let pos_id = Self::next_position_id(&env);
+        let pos_id = next_position_id(&env);
         let position = OptionPosition {
             position_id: pos_id,
             series_id,
@@ -281,26 +626,48 @@ impl OptionsMarket {
             side: PositionSide::Long,
             contracts,
             premium_paid: total_premium,
+            fee_paid: fee,
             collateral_locked: 0,
             is_exercised: false,
             is_settled: false,
             opened_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&DataKey::Position(pos_id), &position);
-        Self::add_user_position(&env, &buyer, pos_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(pos_id), &position);
+        add_user_position(&env, &buyer, pos_id);
 
         // Update OI
-        series.open_interest += contracts;
-        env.storage().persistent().set(&DataKey::Series(series_id), &series);
+        series.open_interest = series.open_interest.checked_add(contracts).unwrap();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
 
-        let total_collected: i128 = env.storage().instance().get(&DataKey::TotalPremiumsCollected).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalPremiumsCollected, &(total_collected + premium_after_fee));
-
-        env.events().publish(
-            (Symbol::new(&env, "option_bought"), buyer),
-            (pos_id, series_id, contracts, total_premium),
+        let total_collected: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalPremiumsCollected)
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::TotalPremiumsCollected,
+            &(total_collected.checked_add(premium_after_fee).unwrap()),
         );
+
+        // Funds the pool writers get paid out of — see write_option for why
+        // this indirection exists instead of writers drawing directly off
+        // the vault's raw token balance.
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PremiumPool)
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::PremiumPool,
+            &(pool.checked_add(premium_after_fee).unwrap()),
+        );
+
+        events::option_bought(&env, buyer, pos_id, series_id, contracts, total_premium);
 
         pos_id
     }
@@ -317,19 +684,22 @@ impl OptionsMarket {
         contracts: i128,
         collateral_amount: i128,
     ) -> u64 {
+        require_not_paused(&env);
         writer.require_auth();
 
         if contracts <= 0 {
             panic_with_error!(&env, Error::ZeroContracts);
         }
 
-        let mut series: OptionSeries = Self::require_active_series(&env, series_id);
+        let mut series: OptionSeries = require_active_series(&env, series_id);
 
         // Required collateral depends on option type
         let required_collateral = match series.option_type {
             // Covered call: lock collateral equal to notional (underlying * contracts)
             OptionType::Call => {
-                let underlying_price: i128 = env.storage().persistent()
+                let underlying_price: i128 = env
+                    .storage()
+                    .persistent()
                     .get(&DataKey::UnderlyingPrice(series.underlying.clone()))
                     .unwrap_or(series.strike_price);
                 contracts
@@ -357,24 +727,53 @@ impl OptionsMarket {
             panic_with_error!(&env, Error::InsufficientCollateral);
         }
 
-        let collateral_token: Address = env.storage().instance().get(&DataKey::CollateralToken).unwrap();
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
         let usdc = token::Client::new(&env, &collateral_token);
 
         // Writer locks collateral
-        usdc.transfer(&writer, &env.current_contract_address(), &required_collateral);
+        usdc.transfer(
+            &writer,
+            &env.current_contract_address(),
+            &required_collateral,
+        );
 
-        // Writer receives premium (from vault balance)
+        // Writer receives premium, drawn from the pool that buyers' premium
+        // payments fund (see buy_option) — NOT from the vault's raw token
+        // balance. Paying straight out of the vault would let a writer's
+        // own just-deposited collateral fund their "premium," which isn't
+        // a premium at all (nobody has actually paid one yet) and leaves
+        // the vault unable to return that writer's full collateral later.
+        // A write that arrives before enough buyer premium exists to cover
+        // it is correctly rejected rather than quietly settled from funds
+        // that were never earned.
         let total_premium = contracts
             .checked_mul(series.premium)
             .unwrap()
             .checked_div(PRICE_PRECISION)
             .unwrap();
-        let fee = total_premium * 5 / 1000;
+        let fee = calc_fee(total_premium, fee_rate_bps(&env));
         let writer_premium = total_premium - fee;
+
+        let pool: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PremiumPool)
+            .unwrap_or(0);
+        if pool < writer_premium {
+            panic_with_error!(&env, Error::InsufficientPremiumPool);
+        }
+        env.storage().instance().set(
+            &DataKey::PremiumPool,
+            &(pool.checked_sub(writer_premium).unwrap()),
+        );
 
         usdc.transfer(&env.current_contract_address(), &writer, &writer_premium);
 
-        let pos_id = Self::next_position_id(&env);
+        let pos_id = next_position_id(&env);
         let position = OptionPosition {
             position_id: pos_id,
             series_id,
@@ -382,21 +781,31 @@ impl OptionsMarket {
             side: PositionSide::Short,
             contracts,
             premium_paid: writer_premium,
+            fee_paid: 0,
             collateral_locked: required_collateral,
             is_exercised: false,
             is_settled: false,
             opened_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&DataKey::Position(pos_id), &position);
-        Self::add_user_position(&env, &writer, pos_id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(pos_id), &position);
+        add_user_position(&env, &writer, pos_id);
 
-        series.open_interest += contracts;
-        env.storage().persistent().set(&DataKey::Series(series_id), &series);
+        series.open_interest = series.open_interest.checked_add(contracts).unwrap();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
 
-        env.events().publish(
-            (Symbol::new(&env, "option_written"), writer),
-            (pos_id, series_id, contracts, writer_premium, required_collateral),
+        events::option_written(
+            &env,
+            writer,
+            pos_id,
+            series_id,
+            contracts,
+            writer_premium,
+            required_collateral,
         );
 
         pos_id
@@ -409,7 +818,9 @@ impl OptionsMarket {
     pub fn exercise(env: Env, owner: Address, position_id: u64) {
         owner.require_auth();
 
-        let mut position: OptionPosition = env.storage().persistent()
+        let mut position: OptionPosition = env
+            .storage()
+            .persistent()
             .get(&DataKey::Position(position_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
 
@@ -423,7 +834,9 @@ impl OptionsMarket {
             panic_with_error!(&env, Error::AlreadyExercised);
         }
 
-        let series: OptionSeries = env.storage().persistent()
+        let series: OptionSeries = env
+            .storage()
+            .persistent()
             .get(&DataKey::Series(position.series_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
 
@@ -437,28 +850,37 @@ impl OptionsMarket {
             panic_with_error!(&env, Error::ExerciseWindowClosed);
         }
 
-        let settlement_price = series.settlement_price
+        let settlement_price = series
+            .settlement_price
             .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
 
         // Determine payout
-        let payout = Self::calc_payout(&series.option_type, series.strike_price, settlement_price, position.contracts);
+        let payout = calc_payout(
+            &series.option_type,
+            series.strike_price,
+            settlement_price,
+            position.contracts,
+        );
 
         if payout <= 0 {
             panic_with_error!(&env, Error::NotInTheMoney);
         }
 
         // Pay out to option holder
-        let collateral_token: Address = env.storage().instance().get(&DataKey::CollateralToken).unwrap();
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
         let usdc = token::Client::new(&env, &collateral_token);
         usdc.transfer(&env.current_contract_address(), &owner, &payout);
 
         position.is_exercised = true;
-        env.storage().persistent().set(&DataKey::Position(position_id), &position);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(position_id), &position);
 
-        env.events().publish(
-            (Symbol::new(&env, "option_exercised"), owner),
-            (position_id, settlement_price, payout),
-        );
+        events::option_exercised(&env, owner, position_id, settlement_price, payout);
     }
 
     /// Oracle sets the settlement price for a series
@@ -466,7 +888,9 @@ impl OptionsMarket {
         let oracle: Address = env.storage().instance().get(&DataKey::Oracle).unwrap();
         oracle.require_auth();
 
-        let mut series: OptionSeries = env.storage().persistent()
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
             .get(&DataKey::Series(series_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
 
@@ -477,20 +901,59 @@ impl OptionsMarket {
 
         series.settlement_price = Some(price);
         series.state = SeriesState::Settled;
-        env.storage().persistent().set(&DataKey::Series(series_id), &series);
-        env.storage().persistent().set(&DataKey::UnderlyingPrice(series.underlying.clone()), &price);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UnderlyingPrice(series.underlying.clone()), &price);
 
-        env.events().publish(
-            (Symbol::new(&env, "settlement_price_set"), series_id),
-            price,
-        );
+        events::settlement_price_set(&env, series_id, price);
+    }
+
+    /// Permissionless alternative to set_settlement_price: instead of a
+    /// trusted `oracle` address asserting a price, anyone can settle a
+    /// series once it's expired by pointing at a live price_oracle
+    /// contract deployment and letting IT supply the price via a
+    /// cross-contract call. No require_auth needed — the price itself is
+    /// already backed by that contract's own feeder-authenticated
+    /// aggregate, so there's nothing left for a caller to vouch for.
+    pub fn set_settlement_price_from_oracle(env: Env, series_id: u64, oracle_contract: Address) {
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        let now = env.ledger().timestamp();
+        if now < series.expiry {
+            panic_with_error!(&env, Error::SeriesNotExpired);
+        }
+
+        let oracle_client = price_oracle_client::Client::new(&env, &oracle_contract);
+        let price: i128 = oracle_client
+            .get_price(&series.underlying)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
+
+        series.settlement_price = Some(price);
+        series.state = SeriesState::Settled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UnderlyingPrice(series.underlying.clone()), &price);
+
+        events::settlement_price_set(&env, series_id, price);
     }
 
     /// Writers reclaim unused collateral after settlement
     pub fn reclaim_collateral(env: Env, writer: Address, position_id: u64) {
         writer.require_auth();
 
-        let mut position: OptionPosition = env.storage().persistent()
+        let mut position: OptionPosition = env
+            .storage()
+            .persistent()
             .get(&DataKey::Position(position_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
 
@@ -504,7 +967,9 @@ impl OptionsMarket {
             panic_with_error!(&env, Error::AlreadySettled);
         }
 
-        let series: OptionSeries = env.storage().persistent()
+        let series: OptionSeries = env
+            .storage()
+            .persistent()
             .get(&DataKey::Series(position.series_id))
             .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
 
@@ -512,97 +977,111 @@ impl OptionsMarket {
             panic_with_error!(&env, Error::SeriesNotExpired);
         }
 
-        let settlement_price = series.settlement_price.unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
+        let settlement_price = series
+            .settlement_price
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
 
         // Compute how much of collateral was consumed by exercised long positions
-        let max_loss = Self::calc_payout(&series.option_type, series.strike_price, settlement_price, position.contracts);
-        let reclaim = (position.collateral_locked - max_loss).max(0);
+        let max_loss = calc_payout(
+            &series.option_type,
+            series.strike_price,
+            settlement_price,
+            position.contracts,
+        );
+        let reclaim = position
+            .collateral_locked
+            .checked_sub(max_loss)
+            .unwrap()
+            .max(0);
 
         if reclaim > 0 {
-            let collateral_token: Address = env.storage().instance().get(&DataKey::CollateralToken).unwrap();
+            let collateral_token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::CollateralToken)
+                .unwrap();
             let usdc = token::Client::new(&env, &collateral_token);
             usdc.transfer(&env.current_contract_address(), &writer, &reclaim);
         }
 
         position.is_settled = true;
-        env.storage().persistent().set(&DataKey::Position(position_id), &position);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(position_id), &position);
 
-        env.events().publish(
-            (Symbol::new(&env, "collateral_reclaimed"), writer),
-            (position_id, reclaim),
-        );
+        events::collateral_reclaimed(&env, writer, position_id, reclaim);
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
+
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    pub fn get_fee_rate(env: Env) -> i128 {
+        fee_rate_bps(&env)
+    }
+
+    pub fn get_premium_pool(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PremiumPool)
+            .unwrap_or(0)
+    }
+
+    pub fn get_series_count_for_underlying(env: Env, underlying: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SeriesCountForUnderlying(underlying))
+            .unwrap_or(0)
+    }
 
     pub fn get_series(env: Env, series_id: u64) -> Option<OptionSeries> {
         env.storage().persistent().get(&DataKey::Series(series_id))
     }
 
     pub fn get_position(env: Env, position_id: u64) -> Option<OptionPosition> {
-        env.storage().persistent().get(&DataKey::Position(position_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
     }
 
     pub fn get_user_positions(env: Env, user: Address) -> Vec<u64> {
-        env.storage().persistent()
+        env.storage()
+            .persistent()
             .get(&DataKey::UserPositions(user))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn get_underlying_price(env: Env, underlying: Symbol) -> Option<i128> {
-        env.storage().persistent().get(&DataKey::UnderlyingPrice(underlying))
+        env.storage()
+            .persistent()
+            .get(&DataKey::UnderlyingPrice(underlying))
     }
 
     pub fn get_stats(env: Env) -> (i128, i128, u64) {
-        let premiums: i128 = env.storage().instance().get(&DataKey::TotalPremiumsCollected).unwrap_or(0);
-        let oi: i128 = env.storage().instance().get(&DataKey::TotalOpenInterest).unwrap_or(0);
-        let series_count: u64 = env.storage().instance().get(&DataKey::SeriesCounter).unwrap_or(0);
+        let premiums: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalPremiumsCollected)
+            .unwrap_or(0);
+        let oi: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalOpenInterest)
+            .unwrap_or(0);
+        let series_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SeriesCounter)
+            .unwrap_or(0);
         (premiums, oi, series_count)
-    }
-
-    // ── Internal Helpers ──────────────────────────────────────────────────────
-
-    fn require_active_series(env: &Env, series_id: u64) -> OptionSeries {
-        let series: OptionSeries = env.storage().persistent()
-            .get(&DataKey::Series(series_id))
-            .unwrap_or_else(|| panic_with_error!(env, Error::SeriesNotFound));
-        if series.state != SeriesState::Active {
-            panic_with_error!(env, Error::SeriesNotActive);
-        }
-        if env.ledger().timestamp() >= series.expiry {
-            panic_with_error!(env, Error::SeriesNotActive);
-        }
-        series
-    }
-
-    /// Cash payout at settlement:
-    /// Call: max(0, settlement - strike) × contracts / PRICE_PRECISION
-    /// Put:  max(0, strike - settlement) × contracts / PRICE_PRECISION
-    fn calc_payout(option_type: &OptionType, strike: i128, settlement: i128, contracts: i128) -> i128 {
-        let intrinsic = match option_type {
-            OptionType::Call => (settlement - strike).max(0),
-            OptionType::Put  => (strike - settlement).max(0),
-        };
-        contracts
-            .checked_mul(intrinsic)
-            .unwrap()
-            .checked_div(PRICE_PRECISION)
-            .unwrap()
-    }
-
-    fn next_position_id(env: &Env) -> u64 {
-        let counter: u64 = env.storage().instance().get(&DataKey::PositionCounter).unwrap_or(0);
-        let next = counter + 1;
-        env.storage().instance().set(&DataKey::PositionCounter, &next);
-        next
-    }
-
-    fn add_user_position(env: &Env, user: &Address, position_id: u64) {
-        let key = DataKey::UserPositions(user.clone());
-        let mut positions: Vec<u64> = env.storage().persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        positions.push_back(position_id);
-        env.storage().persistent().set(&key, &positions);
     }
 }

@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# options_market cross-contract-calls both price_oracle and multisig via
+# soroban-sdk's contractimport! against their compiled wasm (not a normal
+# source dependency, to avoid linking their own contract functions into
+# options_market's wasm and colliding on shared names like
+# pause/transfer_admin). That means BOTH wasm files have to exist before
+# options_market can even be *compiled*, native target included — every
+# job below installs wasm32-unknown-unknown and builds price_oracle's and
+# multisig's wasm first when it's about to touch options_market.
+#
+# price_oracle and vault each also now cross-call multisig the same way
+# (for pause_via_multisig/unpause_via_multisig/transfer_admin_via_multisig),
+# so both need multisig's wasm built first too — two more independent
+# build-order edges, both satisfied by the same pre-build step.
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [options_market, price_oracle, vault, multisig]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: price_oracle
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - run: cargo build --all-targets
+        working-directory: ${{ matrix.crate }}
+      - run: cargo test
+        working-directory: ${{ matrix.crate }}
+
+  clippy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [options_market, price_oracle, vault, multisig]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: price_oracle
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: ${{ matrix.crate }}
+
+  fmt:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [options_market, price_oracle, vault, multisig]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+        working-directory: ${{ matrix.crate }}
+
+  wasm:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [options_market, price_oracle, vault, multisig]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: price_oracle
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: ${{ matrix.crate }}
