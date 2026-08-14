@@ -8,6 +8,14 @@ pub const SETTLEMENT_WINDOW: u64 = 86_400; // 24h window after expiry to exercis
 pub const DEFAULT_FEE_RATE_BPS: i128 = 50; // 0.5%
 pub const MAX_FEE_RATE_BPS: i128 = 1_000; // 10% hard ceiling, even for the admin
 
+/// Caps how many series can ever be listed for a given underlying, so a
+/// single symbol can't accumulate unbounded storage entries over the
+/// contract's lifetime. This counts every series ever created, not
+/// currently-active ones — cancelling or letting a series expire doesn't
+/// free up room, since nothing about storage usage shrinks when that
+/// happens either.
+pub const MAX_SERIES_PER_UNDERLYING: u32 = 50;
+
 /// Protocol fee on an amount, given a rate in basis points (1 bps = 0.01%).
 pub fn calc_fee(amount: i128, fee_rate_bps: i128) -> i128 {
     amount.checked_mul(fee_rate_bps).unwrap().checked_div(10_000).unwrap()

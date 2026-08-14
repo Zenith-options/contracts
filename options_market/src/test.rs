@@ -763,3 +763,45 @@ fn upgrade_reaches_the_host_deployer_past_the_admin_check() {
     let bogus_hash = BytesN::from_array(&h.env, &[0u8; 32]);
     h.client.upgrade(&bogus_hash);
 }
+
+// ─── per-underlying series cap ──────────────────────────────────────────────
+
+#[test]
+fn create_series_tracks_the_count_per_underlying() {
+    let h = setup();
+    for _ in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    }
+    assert_eq!(h.client.get_series_count_for_underlying(&Symbol::new(&h.env, "XLM")), 50);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #20)")] // TooManySeriesForUnderlying
+fn create_series_rejects_the_51st_series_for_the_same_underlying() {
+    let h = setup();
+    for _ in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    }
+    make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+}
+
+#[test]
+fn series_cap_is_tracked_independently_per_underlying() {
+    let h = setup();
+    for _ in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    }
+
+    // XLM is now at the cap, but a different underlying should be unaffected.
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let btc_series = h.client.create_series(
+        &Symbol::new(&h.env, "BTC"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000i128,
+    );
+    assert!(h.client.get_series(&btc_series).is_some());
+    assert_eq!(h.client.get_series_count_for_underlying(&Symbol::new(&h.env, "BTC")), 1);
+}

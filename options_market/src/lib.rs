@@ -23,8 +23,8 @@ mod types;
 
 use error::Error;
 use math::{
-    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_FEE_RATE_BPS, MIN_COLLATERAL_RATIO,
-    PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW,
+    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_FEE_RATE_BPS, MAX_SERIES_PER_UNDERLYING,
+    MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW,
 };
 use storage::{add_user_position, fee_rate_bps, next_position_id, require_active_series, require_not_paused};
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
@@ -136,6 +136,13 @@ impl OptionsMarket {
         if expiry <= now + 3600 {
             panic_with_error!(&env, Error::ExpiryTooSoon);
         }
+
+        let underlying_count_key = DataKey::SeriesCountForUnderlying(underlying.clone());
+        let underlying_count: u32 = env.storage().persistent().get(&underlying_count_key).unwrap_or(0);
+        if underlying_count >= MAX_SERIES_PER_UNDERLYING {
+            panic_with_error!(&env, Error::TooManySeriesForUnderlying);
+        }
+        env.storage().persistent().set(&underlying_count_key, &(underlying_count + 1));
 
         let counter: u64 = env.storage().instance().get(&DataKey::SeriesCounter).unwrap();
         let series_id = counter + 1;
@@ -567,6 +574,13 @@ impl OptionsMarket {
 
     pub fn get_fee_rate(env: Env) -> i128 {
         fee_rate_bps(&env)
+    }
+
+    pub fn get_series_count_for_underlying(env: Env, underlying: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SeriesCountForUnderlying(underlying))
+            .unwrap_or(0)
     }
 
     pub fn get_series(env: Env, series_id: u64) -> Option<OptionSeries> {

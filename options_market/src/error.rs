@@ -23,4 +23,5 @@ pub enum Error {
     ContractPaused = 17,
     SeriesNotCancelled = 18,
     InvalidFeeRate = 19,
+    TooManySeriesForUnderlying = 20,
 }

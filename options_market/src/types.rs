@@ -19,6 +19,7 @@ pub enum DataKey {
     TotalOpenInterest,
     Paused,
     FeeRateBps,
+    SeriesCountForUnderlying(Symbol),
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
