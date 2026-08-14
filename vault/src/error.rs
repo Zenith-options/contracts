@@ -9,4 +9,5 @@ pub enum Error {
     InsufficientEscrowBalance = 3,
     ContractPaused = 4,
     NoUntaggedFunds = 5,
+    Unauthorized = 6,
 }
