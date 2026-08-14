@@ -1261,3 +1261,117 @@ fn upgrade_via_multisig_rejects_when_not_yet_approved() {
     h.client
         .upgrade_via_multisig(&multisig_id, &99u64, &bogus_hash);
 }
+
+// ─── cross-contract: create_series_via_multisig ────────────────────────────
+
+#[test]
+fn create_series_via_multisig_lists_a_series_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 9u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let series_id = h.client.create_series_via_multisig(
+        &multisig_id,
+        &action_id,
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000,
+    );
+
+    let series: OptionSeries = h.client.get_series(&series_id).unwrap();
+    assert_eq!(series.strike_price, 700_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn create_series_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, _signers) = setup_multisig(&h);
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+
+    h.client.create_series_via_multisig(
+        &multisig_id,
+        &99u64,
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000,
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")] // InvalidSeriesParams
+fn create_series_via_multisig_still_validates_params_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 10u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    // Approval authorizes WHO can call this, not a non-positive strike.
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    h.client.create_series_via_multisig(
+        &multisig_id,
+        &action_id,
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &0,
+        &expiry,
+        &40_000_000,
+        &450_000_000,
+    );
+}
+
+// ─── cross-contract: update_premium_via_multisig ───────────────────────────
+
+#[test]
+fn update_premium_via_multisig_updates_once_approved() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 11u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client.update_premium_via_multisig(
+        &multisig_id,
+        &action_id,
+        &series_id,
+        &45_000_000,
+        &500_000_000,
+    );
+
+    let series: OptionSeries = h.client.get_series(&series_id).unwrap();
+    assert_eq!(series.premium, 45_000_000);
+    assert_eq!(series.implied_vol, 500_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn update_premium_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    h.client.update_premium_via_multisig(
+        &multisig_id,
+        &99u64,
+        &series_id,
+        &45_000_000,
+        &500_000_000,
+    );
+}
