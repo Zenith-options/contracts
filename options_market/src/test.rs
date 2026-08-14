@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
-use soroban_sdk::{testutils::Address as _, token, Address, Env, Symbol};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token, Address, Env, Symbol,
+};
 
 const USDC_DECIMALS: i128 = 10_000_000; // matches PRICE_PRECISION
 
@@ -237,4 +240,122 @@ fn write_option_rejects_undercollateralized_offer() {
     mint(&h, &writer, 700_000_000);
     // Offers exactly 100% of strike for a put, which needs 110%.
     h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+}
+
+// ─── settlement + exercise ──────────────────────────────────────────────────
+
+fn advance_past_expiry(h: &Harness, series_id: u64) {
+    let series: OptionSeries = h.client.get_series(&series_id).unwrap();
+    h.env.ledger().set_timestamp(series.expiry + 1);
+}
+
+#[test]
+fn exercise_itm_call_pays_out_the_intrinsic_value() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    // Settlement price above strike -> call finishes in the money.
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+
+    // Fund the contract's own vault so it can actually pay the intrinsic
+    // value out — in this test nothing else deposited into it first.
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &pos_id);
+    // Intrinsic = (750 - 700) * 1 contract = 50.
+    assert_eq!(balance(&h, &buyer) - before, 50_000_000);
+
+    let position = h.client.get_position(&pos_id).unwrap();
+    assert!(position.is_exercised);
+}
+
+#[test]
+fn exercise_itm_put_pays_out_the_intrinsic_value() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Put, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    // Settlement price below strike -> put finishes in the money.
+    h.client.set_settlement_price(&series_id, &(650_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &pos_id);
+    // Intrinsic = (700 - 650) * 1 contract = 50.
+    assert_eq!(balance(&h, &buyer) - before, 50_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")] // NotInTheMoney
+fn exercise_otm_call_is_rejected() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    // Settlement below strike -> call is worthless.
+    h.client.set_settlement_price(&series_id, &(650_000_000));
+    h.client.exercise(&buyer, &pos_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")] // SeriesNotExpired
+fn exercise_before_expiry_is_rejected() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    h.client.exercise(&buyer, &pos_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")] // WrongSide
+fn exercise_rejects_a_short_position() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    h.client.exercise(&writer, &pos_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // AlreadyExercised
+fn exercise_twice_is_rejected() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    h.client.exercise(&buyer, &pos_id);
+    h.client.exercise(&buyer, &pos_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")] // SeriesNotExpired
+fn set_settlement_price_before_expiry_is_rejected() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
 }
