@@ -21,4 +21,5 @@ pub enum Error {
     WrongSide = 15,
     ExpiryTooSoon = 16,
     ContractPaused = 17,
+    SeriesNotCancelled = 18,
 }

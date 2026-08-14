@@ -65,3 +65,11 @@ pub fn paused(env: &Env) {
 pub fn unpaused(env: &Env) {
     env.events().publish((Symbol::new(env, "unpaused"),), ());
 }
+
+pub fn series_cancelled(env: &Env, series_id: u64) {
+    env.events().publish((Symbol::new(env, "series_cancelled"),), series_id);
+}
+
+pub fn refund_claimed(env: &Env, owner: Address, position_id: u64, amount: i128) {
+    env.events().publish((Symbol::new(env, "refund_claimed"), owner), (position_id, amount));
+}

@@ -152,6 +152,81 @@ impl OptionsMarket {
         events::premium_updated(&env, series_id, new_premium, new_implied_vol);
     }
 
+    /// Admin cancels an Active series (e.g. mispriced, or the underlying
+    /// feed is compromised). Existing position holders then pull their own
+    /// refund via claim_refund rather than the admin pushing funds to
+    /// everyone in one call — Soroban charges for the resources a call
+    /// touches, and an unbounded push-refund would scale badly with the
+    /// number of open positions.
+    pub fn cancel_series(env: Env, series_id: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let mut series: OptionSeries = env.storage().persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Active {
+            panic_with_error!(&env, Error::SeriesNotActive);
+        }
+
+        series.state = SeriesState::Cancelled;
+        env.storage().persistent().set(&DataKey::Series(series_id), &series);
+
+        events::series_cancelled(&env, series_id);
+    }
+
+    /// A position holder in a Cancelled series reclaims what they put in:
+    /// buyers get their premium back, writers get their collateral back.
+    pub fn claim_refund(env: Env, owner: Address, position_id: u64) {
+        owner.require_auth();
+
+        let mut position: OptionPosition = env.storage().persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+
+        if position.owner != owner {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if position.is_settled {
+            panic_with_error!(&env, Error::AlreadySettled);
+        }
+
+        let series: OptionSeries = env.storage().persistent()
+            .get(&DataKey::Series(position.series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Cancelled {
+            panic_with_error!(&env, Error::SeriesNotCancelled);
+        }
+
+        // Longs only ever had premium_paid (gross, including the protocol
+        // fee) sitting in the vault for a moment before the fee's cut was
+        // sent to fee_recipient — so refunding the full gross amount here
+        // would draw down other positions' vault balances. Refund net of
+        // that same fee instead; the fee itself isn't clawed back from
+        // fee_recipient, since a cancellation is an admin decision, not a
+        // token-contract-level guarantee we can enforce retroactively.
+        let refund = match position.side {
+            PositionSide::Long => {
+                let fee = position.premium_paid * 5 / 1000;
+                position.premium_paid - fee
+            }
+            PositionSide::Short => position.collateral_locked,
+        };
+
+        if refund > 0 {
+            let collateral_token: Address = env.storage().instance().get(&DataKey::CollateralToken).unwrap();
+            let usdc = token::Client::new(&env, &collateral_token);
+            usdc.transfer(&env.current_contract_address(), &owner, &refund);
+        }
+
+        position.is_settled = true;
+        env.storage().persistent().set(&DataKey::Position(position_id), &position);
+
+        events::refund_claimed(&env, owner, position_id, refund);
+    }
+
     // ── Buying Options (Long) ─────────────────────────────────────────────────
 
     /// Buy `contracts` options in a series (pay premium in USDC)

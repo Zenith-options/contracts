@@ -618,3 +618,79 @@ fn pause_does_not_block_settlement_of_existing_positions() {
     h.client.reclaim_collateral(&writer, &pos_id);
     assert_eq!(balance(&h, &writer) - before, 700_000_000);
 }
+
+// ─── cancel_series / claim_refund ───────────────────────────────────────────
+
+#[test]
+fn cancelled_series_refunds_buyer_premium_net_of_fee() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.client.cancel_series(&series_id);
+
+    let before = balance(&h, &buyer);
+    h.client.claim_refund(&buyer, &pos_id);
+    // 40_000_000 premium, 0.5% fee already sent to fee_recipient at buy
+    // time, so only the net 39_800_000 is refundable from the vault.
+    assert_eq!(balance(&h, &buyer) - before, 39_800_000);
+}
+
+#[test]
+fn cancelled_series_refunds_writer_full_collateral() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    h.client.cancel_series(&series_id);
+
+    // Same vault-liquidity gap documented on the OTM reclaim test: write_option
+    // already paid this writer's own premium out of the collateral it just
+    // deposited, so a standalone writer's full refund exceeds what's left
+    // in the vault without other market activity funding it.
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &writer);
+    h.client.claim_refund(&writer, &pos_id);
+    assert_eq!(balance(&h, &writer) - before, 700_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")] // SeriesNotCancelled
+fn claim_refund_rejects_a_still_active_series() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.client.claim_refund(&buyer, &pos_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")] // AlreadySettled
+fn claim_refund_twice_is_rejected() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.client.cancel_series(&series_id);
+    h.client.claim_refund(&buyer, &pos_id);
+    h.client.claim_refund(&buyer, &pos_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // SeriesNotActive
+fn cancel_series_rejects_an_already_cancelled_series() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    h.client.cancel_series(&series_id);
+    h.client.cancel_series(&series_id);
+}
