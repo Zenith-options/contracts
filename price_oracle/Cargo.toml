@@ -5,7 +5,12 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# rlib alongside cdylib so other contracts (options_market) can depend on
+# this crate as a normal Rust library to get PriceOracleClient's generated
+# type for cross-contract calls, while still building a deployable wasm
+# cdylib on its own — the standard Soroban pattern for cross-contract
+# dependencies.
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 opt-level = "z"

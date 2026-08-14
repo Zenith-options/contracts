@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
+use price_oracle::{PriceOracle, PriceOracleClient};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token, Address, BytesN, Env, Symbol,
@@ -961,4 +962,72 @@ fn series_cap_is_tracked_independently_per_underlying() {
             .get_series_count_for_underlying(&Symbol::new(&h.env, "BTC")),
         1
     );
+}
+
+// ─── cross-contract: set_settlement_price_from_oracle ──────────────────────
+
+/// Deploys a real price_oracle contract in the SAME Env as the options
+/// market under test (not a mock) — this is the actual second contract
+/// options_market cross-calls, registered the same way the collateral
+/// token is.
+fn setup_price_oracle(h: &Harness) -> Address {
+    let admin = Address::generate(&h.env);
+    let contract_id = h.env.register_contract(None, PriceOracle);
+    let client = PriceOracleClient::new(&h.env, &contract_id);
+    client.initialize(&admin);
+    contract_id
+}
+
+fn report_price(h: &Harness, oracle_id: &Address, underlying: &Symbol, price: i128) {
+    let client = PriceOracleClient::new(&h.env, oracle_id);
+    let feeder = Address::generate(&h.env);
+    client.add_feeder(&feeder);
+    client.report_price(&feeder, underlying, &price);
+}
+
+#[test]
+fn set_settlement_price_from_oracle_reads_the_live_oracle_price() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let oracle_id = setup_price_oracle(&h);
+
+    advance_past_expiry(&h, series_id);
+    // Feeder reports fresh right at settlement time — reporting it before
+    // the 30-day jump to expiry would leave it stale under price_oracle's
+    // own 1-hour default max_staleness, same as a real feeder would need
+    // to keep reporting all the way up to settlement rather than once at
+    // series creation.
+    report_price(&h, &oracle_id, &Symbol::new(&h.env, "XLM"), 750_000_000);
+
+    h.client
+        .set_settlement_price_from_oracle(&series_id, &oracle_id);
+
+    let series: OptionSeries = h.client.get_series(&series_id).unwrap();
+    assert_eq!(series.settlement_price, Some(750_000_000));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")] // SeriesNotExpired
+fn set_settlement_price_from_oracle_rejects_before_expiry() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let oracle_id = setup_price_oracle(&h);
+    report_price(&h, &oracle_id, &Symbol::new(&h.env, "XLM"), 750_000_000);
+
+    h.client
+        .set_settlement_price_from_oracle(&series_id, &oracle_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")] // PriceNotSet
+fn set_settlement_price_from_oracle_rejects_a_stale_or_missing_oracle_price() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // No feeder ever reports anything for this underlying.
+    let oracle_id = setup_price_oracle(&h);
+
+    advance_past_expiry(&h, series_id);
+    h.client
+        .set_settlement_price_from_oracle(&series_id, &oracle_id);
 }

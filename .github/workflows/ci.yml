@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
 
+# options_market cross-contract-calls price_oracle via soroban-sdk's
+# contractimport! against price_oracle's compiled wasm (not a normal
+# source dependency, to avoid linking price_oracle's own contract
+# functions into options_market's wasm and colliding on shared names like
+# pause/transfer_admin). That means price_oracle's wasm has to exist
+# before options_market can even be *compiled*, native target included —
+# every job below installs wasm32-unknown-unknown and builds price_oracle's
+# wasm first when it's about to touch options_market.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -14,7 +22,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: price_oracle
       - run: cargo build --all-targets
         working-directory: ${{ matrix.crate }}
       - run: cargo test
@@ -30,7 +43,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: price_oracle
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: ${{ matrix.crate }}
 
@@ -58,5 +75,8 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: price_oracle
       - run: cargo build --target wasm32-unknown-unknown --release
         working-directory: ${{ matrix.crate }}

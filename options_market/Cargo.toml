@@ -21,6 +21,12 @@ soroban-sdk = { version = "21.0.0" }
 
 [dev-dependencies]
 soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+# Dev/test-only: registers a REAL price_oracle contract instance inside the
+# test Env for cross-contract tests. Never linked into the production wasm
+# (see src/price_oracle_client.rs for how production code calls the other
+# contract instead — via contractimport! against its compiled wasm, not by
+# depending on and linking its actual implementation).
+price_oracle = { package = "zenith-price-oracle", path = "../price_oracle", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

@@ -1736,6 +1736,14 @@ name = "zenith-options-market"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "zenith-price-oracle",
+]
+
+[[package]]
+name = "zenith-price-oracle"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]

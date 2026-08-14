@@ -16,6 +16,7 @@ mod test;
 mod error;
 mod events;
 mod math;
+mod price_oracle_client;
 mod storage;
 mod types;
 
@@ -654,6 +655,42 @@ impl OptionsMarket {
         if now < series.expiry {
             panic_with_error!(&env, Error::SeriesNotExpired);
         }
+
+        series.settlement_price = Some(price);
+        series.state = SeriesState::Settled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UnderlyingPrice(series.underlying.clone()), &price);
+
+        events::settlement_price_set(&env, series_id, price);
+    }
+
+    /// Permissionless alternative to set_settlement_price: instead of a
+    /// trusted `oracle` address asserting a price, anyone can settle a
+    /// series once it's expired by pointing at a live price_oracle
+    /// contract deployment and letting IT supply the price via a
+    /// cross-contract call. No require_auth needed — the price itself is
+    /// already backed by that contract's own feeder-authenticated
+    /// aggregate, so there's nothing left for a caller to vouch for.
+    pub fn set_settlement_price_from_oracle(env: Env, series_id: u64, oracle_contract: Address) {
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        let now = env.ledger().timestamp();
+        if now < series.expiry {
+            panic_with_error!(&env, Error::SeriesNotExpired);
+        }
+
+        let oracle_client = price_oracle_client::Client::new(&env, &oracle_contract);
+        let price: i128 = oracle_client
+            .get_price(&series.underlying)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
 
         series.settlement_price = Some(price);
         series.state = SeriesState::Settled;

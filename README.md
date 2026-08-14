@@ -9,17 +9,31 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   Black-Scholes); writers lock collateral, buyers pay premium, settlement
   happens at expiry against an oracle-reported price.
 - [`price_oracle/`](price_oracle) — the on-chain logic behind that
-  oracle-reported price. options_market only ever trusted a bare
-  `oracle: Address` with nothing backing it; this contract is a small
-  set of admin-authorized feeders reporting per-symbol prices, aggregated
-  as a median across whatever's still fresh.
+  oracle-reported price. options_market previously only ever trusted a
+  bare `oracle: Address` with nothing backing it; this contract is a
+  small set of admin-authorized feeders reporting per-symbol prices,
+  aggregated as a median across whatever's still fresh.
+  `options_market::set_settlement_price_from_oracle` cross-calls a live
+  price_oracle deployment to settle a series permissionlessly, as an
+  alternative to the original `set_settlement_price`'s trusted-oracle-
+  address flow.
 
 ## Building and testing
 
-Each crate is standalone (no workspace `Cargo.toml`):
+Each crate is standalone (no workspace `Cargo.toml`), but **build order
+matters**: options_market cross-calls price_oracle via soroban-sdk's
+`contractimport!` against price_oracle's *compiled wasm* (not a normal
+source dependency — that would link price_oracle's own contract
+functions into options_market's wasm and collide with options_market's
+functions of the same name, like `pause`/`transfer_admin`). That means
+price_oracle's wasm has to exist before options_market can be compiled
+at all, even natively:
 
 ```sh
-cd options_market   # or price_oracle
+cd price_oracle
+cargo build --target wasm32-unknown-unknown --release   # do this FIRST
+
+cd ../options_market   # now this crate can build/test/etc.
 cargo build                                   # native build, fast iteration
 cargo test                                    # unit tests (soroban-sdk testutils)
 cargo clippy --all-targets -- -D warnings     # matches CI
@@ -27,8 +41,12 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
-CI (`.github/workflows/ci.yml`) runs all four of the above against every
-push and PR, for both crates.
+price_oracle itself has no such dependency and can be built/tested with
+the same five commands independently, in any order.
+
+CI (`.github/workflows/ci.yml`) builds price_oracle's wasm first
+whenever a job is about to touch options_market, then runs the same
+four checks against every push and PR, for both crates.
 
 ## Deploying
 
@@ -87,7 +105,8 @@ documented per field.
 
 | Function | Description |
 |---|---|
-| `set_settlement_price(series_id, price)` | Records the settlement price after expiry and flips the series to `Settled`. |
+| `set_settlement_price(series_id, price)` | The trusted-oracle-address flow: whatever address was set as `oracle` at `initialize` asserts a price directly. Records it and flips the series to `Settled`. |
+| `set_settlement_price_from_oracle(series_id, oracle_contract)` | The permissionless alternative: anyone can settle an expired series by pointing at a live `price_oracle` deployment and letting it supply the price via a cross-contract call. No signature required — the price is already backed by that contract's own feeder-authenticated aggregate. |
 
 ### Traders
 
@@ -177,11 +196,10 @@ collected, total open interest, series count).
   `write_option`'s `InsufficientPremiumPool` check is a pool-level
   constraint, not a guarantee that any specific buyer's trade funded any
   specific writer's premium.
-- **The two contracts aren't wired together yet.** `options_market` still
-  takes settlement prices via its own `set_settlement_price`, called by
-  whatever address it was initialized with as `oracle` — it doesn't
-  actually call into `price_oracle`. Making `options_market`'s
-  `set_settlement_price` pull from a deployed `price_oracle` instance
-  (or having the address initialized as its `oracle` simply *be* a
-  `price_oracle` deployment, invoked off-chain by that contract's own
-  authorized feeder flow) is the natural next step connecting the two.
+- **`set_settlement_price_from_oracle` is additive, not a replacement.**
+  The original trusted-oracle-address flow (`set_settlement_price`)
+  still exists unchanged — a series can be settled either way, and
+  nothing stops mixing both across different series. That's intentional
+  (zero risk to the original flow's existing test coverage) but means
+  there's no enforcement that a series *must* use the cross-contract
+  path just because a `price_oracle` deployment exists.
