@@ -210,6 +210,7 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 | `pause()` / `unpause()` | Emergency stop. Blocks **both** `deposit` and `withdraw` — unlike options_market's pause (which leaves settlement paths open), there's no "existing position needs an exit" concern independent of the vault itself. |
 | `withdraw(tag, to, amount)` | Pays `amount` of `tag`'s escrowed balance to `to`. Panics with `InsufficientEscrowBalance` if `tag` doesn't have that much earmarked, regardless of the vault's total token balance. Admin-gated — in the intended integration, `admin` is set to a calling contract's own address, so a contract-to-contract call satisfies the auth check through the call itself. |
 | `sweep_untagged(to)` | Recovers tokens that landed on the vault directly, bypassing `deposit` (e.g. a stray transfer). Computes the actual token balance minus `get_total_escrowed`'s ledger sum and transfers exactly that difference; panics with `NoUntaggedFunds` if there's nothing to recover. |
+| `transfer_tag(from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement at all — meant for the roll_position case (close + reopen in one breath, collateral doesn't need to leave and come back). `TotalEscrowed` is unaffected. |
 
 ### Depositors
 
@@ -224,7 +225,7 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 ### Events
 
 `admin_transferred`, `paused`, `unpaused`, `deposited`, `withdrawn`,
-`swept_untagged`.
+`swept_untagged`, `tag_transferred`.
 
 ### Errors
 
