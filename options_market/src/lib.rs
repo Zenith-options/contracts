@@ -294,6 +294,84 @@ impl OptionsMarket {
         series_id
     }
 
+    /// Permissionless alternative to create_series: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Same validation and per-
+    /// underlying cap apply — approval changes who can list a series,
+    /// not what parameters a series may have.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_series_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        underlying: Symbol,
+        option_type: OptionType,
+        strike_price: i128,
+        expiry: u64,
+        premium: i128,
+        implied_vol: i128,
+    ) -> u64 {
+        require_not_paused(&env);
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if expiry <= now + 3600 {
+            panic_with_error!(&env, Error::ExpiryTooSoon);
+        }
+        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
+            panic_with_error!(&env, Error::InvalidSeriesParams);
+        }
+
+        let underlying_count_key = DataKey::SeriesCountForUnderlying(underlying.clone());
+        let underlying_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&underlying_count_key)
+            .unwrap_or(0);
+        if underlying_count >= MAX_SERIES_PER_UNDERLYING {
+            panic_with_error!(&env, Error::TooManySeriesForUnderlying);
+        }
+        env.storage().persistent().set(
+            &underlying_count_key,
+            &(underlying_count.checked_add(1).unwrap()),
+        );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SeriesCounter)
+            .unwrap();
+        let series_id = counter.checked_add(1).unwrap();
+
+        let series = OptionSeries {
+            series_id,
+            underlying,
+            option_type,
+            strike_price,
+            expiry,
+            premium,
+            implied_vol,
+            open_interest: 0,
+            state: SeriesState::Active,
+            settlement_price: None,
+            created_at: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+        env.storage()
+            .instance()
+            .set(&DataKey::SeriesCounter, &series_id);
+
+        events::series_created(&env, series_id, strike_price, expiry, premium);
+
+        series_id
+    }
+
     /// Admin updates premium (e.g. after volatility changes)
     pub fn update_premium(env: Env, series_id: u64, new_premium: i128, new_implied_vol: i128) {
         require_not_paused(&env);
