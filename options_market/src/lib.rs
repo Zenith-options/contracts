@@ -16,17 +16,12 @@ use soroban_sdk::{
 mod test;
 
 mod error;
+mod math;
 mod types;
 
 use error::Error;
+use math::{calc_payout, MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW};
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
-
-// ─── Precision & Limits ──────────────────────────────────────────────────────
-
-const PRICE_PRECISION: i128 = 10_000_000;       // 1e7
-const RATE_PRECISION:  i128 = 1_000_000_000;    // 1e9
-const MIN_COLLATERAL_RATIO: i128 = 1_100_000_000; // 110% over-collateralization for puts
-const SETTLEMENT_WINDOW: u64 = 86_400;           // 24h window after expiry to exercise
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -346,7 +341,7 @@ impl OptionsMarket {
             .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
 
         // Determine payout
-        let payout = Self::calc_payout(&series.option_type, series.strike_price, settlement_price, position.contracts);
+        let payout = calc_payout(&series.option_type, series.strike_price, settlement_price, position.contracts);
 
         if payout <= 0 {
             panic_with_error!(&env, Error::NotInTheMoney);
@@ -420,7 +415,7 @@ impl OptionsMarket {
         let settlement_price = series.settlement_price.unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
 
         // Compute how much of collateral was consumed by exercised long positions
-        let max_loss = Self::calc_payout(&series.option_type, series.strike_price, settlement_price, position.contracts);
+        let max_loss = calc_payout(&series.option_type, series.strike_price, settlement_price, position.contracts);
         let reclaim = (position.collateral_locked - max_loss).max(0);
 
         if reclaim > 0 {
@@ -478,21 +473,6 @@ impl OptionsMarket {
             panic_with_error!(env, Error::SeriesNotActive);
         }
         series
-    }
-
-    /// Cash payout at settlement:
-    /// Call: max(0, settlement - strike) × contracts / PRICE_PRECISION
-    /// Put:  max(0, strike - settlement) × contracts / PRICE_PRECISION
-    fn calc_payout(option_type: &OptionType, strike: i128, settlement: i128, contracts: i128) -> i128 {
-        let intrinsic = match option_type {
-            OptionType::Call => (settlement - strike).max(0),
-            OptionType::Put  => (strike - settlement).max(0),
-        };
-        contracts
-            .checked_mul(intrinsic)
-            .unwrap()
-            .checked_div(PRICE_PRECISION)
-            .unwrap()
     }
 
     fn next_position_id(env: &Env) -> u64 {
