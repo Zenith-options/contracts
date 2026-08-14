@@ -17,6 +17,7 @@ use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env}
 mod test;
 
 mod error;
+mod events;
 mod types;
 
 use error::Error;
@@ -59,6 +60,7 @@ impl Vault {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
     }
 
     /// Emergency stop: blocks deposit and withdraw. Both sides, unlike
@@ -71,12 +73,14 @@ impl Vault {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
+        events::paused(&env);
     }
 
     pub fn unpause(env: Env) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        events::unpaused(&env);
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -118,6 +122,8 @@ impl Vault {
         env.storage()
             .instance()
             .set(&DataKey::TotalEscrowed, &total.checked_add(amount).unwrap());
+
+        events::deposited(&env, from, tag, amount);
     }
 
     /// Pays `amount` of `tag`'s escrowed balance out to `to`, debiting the
@@ -166,6 +172,8 @@ impl Vault {
             &to,
             &amount,
         );
+
+        events::withdrawn(&env, to, tag, amount);
     }
 
     pub fn balance_of(env: Env, tag: u64) -> i128 {

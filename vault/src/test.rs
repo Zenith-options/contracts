@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::{Vault, VaultClient};
-use soroban_sdk::{testutils::Address as _, token, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _},
+    token, Address, Env, TryFromVal,
+};
 
 struct Harness<'a> {
     env: Env,
@@ -220,4 +223,34 @@ fn withdraw_is_rejected_while_paused() {
 
     h.client.pause();
     h.client.withdraw(&7, &depositor, &100);
+}
+
+// ─── events ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn deposit_emits_a_deposited_event_with_the_amount_as_data() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+
+    h.client.deposit(&depositor, &7, &400);
+
+    let events = h.env.events().all();
+    let (contract_id, _topics, data) = events.last().unwrap();
+    assert_eq!(contract_id, h.client.address);
+    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 400);
+}
+
+#[test]
+fn withdraw_emits_a_withdrawn_event_with_the_amount_as_data() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &400);
+
+    h.client.withdraw(&7, &depositor, &150);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 150);
 }
