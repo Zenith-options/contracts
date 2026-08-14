@@ -1443,3 +1443,116 @@ fn fee_rate_updated_event_carries_the_new_rate() {
     let (_, _topics, data) = events.last().unwrap();
     assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 250);
 }
+
+#[test]
+fn option_written_event_carries_position_and_collateral_data() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (event_pos_id, event_series_id, contracts, _writer_premium, required_collateral) =
+        <(u64, u64, i128, i128, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(event_pos_id, pos_id);
+    assert_eq!(event_series_id, series_id);
+    assert_eq!(contracts, USDC_DECIMALS);
+    assert_eq!(required_collateral, 700_000_000);
+}
+
+#[test]
+fn option_exercised_event_carries_settlement_price_and_payout() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    // Fund the contract's own vault so it can actually pay the intrinsic
+    // value out — nothing else deposited into it first.
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+    h.client.exercise(&buyer, &pos_id);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (event_pos_id, settlement_price, payout) =
+        <(u64, i128, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(event_pos_id, pos_id);
+    assert_eq!(settlement_price, 750_000_000);
+    assert_eq!(payout, 50_000_000); // 50 intrinsic * 1 contract
+}
+
+#[test]
+fn series_cancelled_event_carries_the_series_id() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    h.client.cancel_series(&series_id);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(u64::try_from_val(&h.env, &data).unwrap(), series_id);
+}
+
+#[test]
+fn refund_claimed_event_carries_position_and_amount() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    h.client.cancel_series(&series_id);
+
+    h.client.claim_refund(&buyer, &pos_id);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (event_pos_id, amount) = <(u64, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(event_pos_id, pos_id);
+    assert_eq!(amount, 39_800_000); // premium net of the 0.5% fee
+}
+
+#[test]
+fn settlement_price_set_event_carries_the_price() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 750_000_000);
+}
+
+#[test]
+fn collateral_reclaimed_event_carries_position_and_amount() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM for the call
+    h.client.reclaim_collateral(&writer, &pos_id);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (event_pos_id, reclaim) = <(u64, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(event_pos_id, pos_id);
+    assert_eq!(reclaim, 700_000_000); // full collateral back, OTM means no payout owed
+}
