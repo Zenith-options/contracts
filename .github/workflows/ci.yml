@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle]
+        crate: [options_market, price_oracle, vault]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle]
+        crate: [options_market, price_oracle, vault]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle]
+        crate: [options_market, price_oracle, vault]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -68,7 +68,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle]
+        crate: [options_market, price_oracle, vault]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
