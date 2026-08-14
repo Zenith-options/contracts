@@ -491,3 +491,78 @@ fn set_max_staleness_via_multisig_still_rejects_zero_once_approved() {
     h.client
         .set_max_staleness_via_multisig(&multisig_id, &action_id, &0);
 }
+
+// ─── cross-contract: add_feeder_via_multisig / remove_feeder_via_multisig ──
+
+#[test]
+fn add_feeder_via_multisig_authorizes_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 6u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let feeder = Address::generate(&h.env);
+    h.client
+        .add_feeder_via_multisig(&multisig_id, &action_id, &feeder);
+    assert!(h.client.is_feeder(&feeder));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // Unauthorized
+fn add_feeder_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, _signers) = setup_multisig(&h);
+    let feeder = Address::generate(&h.env);
+
+    h.client
+        .add_feeder_via_multisig(&multisig_id, &99u64, &feeder);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // FeederAlreadyAdded
+fn add_feeder_via_multisig_still_rejects_a_duplicate_once_approved() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 7u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client
+        .add_feeder_via_multisig(&multisig_id, &action_id, &feeder);
+}
+
+#[test]
+fn remove_feeder_via_multisig_revokes_once_approved() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 8u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client
+        .remove_feeder_via_multisig(&multisig_id, &action_id, &feeder);
+    assert!(!h.client.is_feeder(&feeder));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // Unauthorized
+fn remove_feeder_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    h.client
+        .remove_feeder_via_multisig(&multisig_id, &99u64, &feeder);
+}
