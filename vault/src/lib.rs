@@ -395,4 +395,38 @@ impl Vault {
         events::swept_untagged(&env, to, untagged);
         untagged
     }
+
+    /// Permissionless alternative to sweep_untagged: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Same rationale as
+    /// withdraw_via_multisig.
+    pub fn sweep_untagged_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        to: Address,
+    ) -> i128 {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token_address);
+        let actual_balance = token_client.balance(&env.current_contract_address());
+        let total_escrowed: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalEscrowed)
+            .unwrap();
+
+        let untagged = actual_balance.checked_sub(total_escrowed).unwrap();
+        if untagged <= 0 {
+            panic_with_error!(&env, Error::NoUntaggedFunds);
+        }
+
+        token_client.transfer(&env.current_contract_address(), &to, &untagged);
+        events::swept_untagged(&env, to, untagged);
+        untagged
+    }
 }
