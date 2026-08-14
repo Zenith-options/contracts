@@ -22,4 +22,5 @@ pub enum Error {
     ExpiryTooSoon = 16,
     ContractPaused = 17,
     SeriesNotCancelled = 18,
+    InvalidFeeRate = 19,
 }

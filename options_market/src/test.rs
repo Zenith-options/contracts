@@ -694,3 +694,56 @@ fn cancel_series_rejects_an_already_cancelled_series() {
     h.client.cancel_series(&series_id);
     h.client.cancel_series(&series_id);
 }
+
+// ─── fee rate ────────────────────────────────────────────────────────────────
+
+#[test]
+fn fee_rate_defaults_to_fifty_bps_and_is_configurable() {
+    let h = setup();
+    assert_eq!(h.client.get_fee_rate(), 50);
+
+    h.client.set_fee_rate(&100); // 1%
+    assert_eq!(h.client.get_fee_rate(), 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")] // InvalidFeeRate
+fn set_fee_rate_rejects_above_the_10_percent_ceiling() {
+    let h = setup();
+    h.client.set_fee_rate(&1_001);
+}
+
+#[test]
+fn buy_option_applies_the_currently_configured_fee_rate() {
+    let h = setup();
+    h.client.set_fee_rate(&100); // 1% instead of the default 0.5%
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let position = h.client.get_position(&pos_id).unwrap();
+    assert_eq!(position.fee_paid, 400_000); // 1% of 40_000_000
+}
+
+#[test]
+fn refund_uses_the_fee_rate_in_effect_at_buy_time_not_the_current_one() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    // Bought while the fee rate was still the default 0.5% (fee_paid = 200_000).
+    let pos_id = h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    // Admin raises the rate afterward — this must NOT retroactively change
+    // what this position refunds, since the position already stored the
+    // fee it actually paid.
+    h.client.set_fee_rate(&500); // 5%
+    h.client.cancel_series(&series_id);
+
+    let before = balance(&h, &buyer);
+    h.client.claim_refund(&buyer, &pos_id);
+    assert_eq!(balance(&h, &buyer) - before, 39_800_000); // 40M - the ORIGINAL 0.5% fee
+}

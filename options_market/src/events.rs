@@ -73,3 +73,7 @@ pub fn series_cancelled(env: &Env, series_id: u64) {
 pub fn refund_claimed(env: &Env, owner: Address, position_id: u64, amount: i128) {
     env.events().publish((Symbol::new(env, "refund_claimed"), owner), (position_id, amount));
 }
+
+pub fn fee_rate_updated(env: &Env, new_bps: i128) {
+    env.events().publish((Symbol::new(env, "fee_rate_updated"),), new_bps);
+}

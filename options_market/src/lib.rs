@@ -22,8 +22,11 @@ mod storage;
 mod types;
 
 use error::Error;
-use math::{calc_payout, MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW};
-use storage::{add_user_position, next_position_id, require_active_series, require_not_paused};
+use math::{
+    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_FEE_RATE_BPS, MIN_COLLATERAL_RATIO,
+    PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW,
+};
+use storage::{add_user_position, fee_rate_bps, next_position_id, require_active_series, require_not_paused};
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -54,6 +57,23 @@ impl OptionsMarket {
         env.storage().instance().set(&DataKey::PositionCounter, &0u64);
         env.storage().instance().set(&DataKey::TotalPremiumsCollected, &0i128);
         env.storage().instance().set(&DataKey::TotalOpenInterest, &0i128);
+        env.storage().instance().set(&DataKey::FeeRateBps, &DEFAULT_FEE_RATE_BPS);
+    }
+
+    /// Admin adjusts the protocol fee rate (basis points, 1 bps = 0.01%),
+    /// capped at MAX_FEE_RATE_BPS so a compromised or careless admin can't
+    /// set an absurd rate that effectively confiscates every trade.
+    pub fn set_fee_rate(env: Env, new_bps: u32) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let new_bps = new_bps as i128;
+        if new_bps > MAX_FEE_RATE_BPS {
+            panic_with_error!(&env, Error::InvalidFeeRate);
+        }
+
+        env.storage().instance().set(&DataKey::FeeRateBps, &new_bps);
+        events::fee_rate_updated(&env, new_bps);
     }
 
     /// Admin hands off control to a new address. Requires the CURRENT admin's
@@ -204,14 +224,14 @@ impl OptionsMarket {
         // fee) sitting in the vault for a moment before the fee's cut was
         // sent to fee_recipient — so refunding the full gross amount here
         // would draw down other positions' vault balances. Refund net of
-        // that same fee instead; the fee itself isn't clawed back from
-        // fee_recipient, since a cancellation is an admin decision, not a
-        // token-contract-level guarantee we can enforce retroactively.
+        // the fee actually deducted at buy time (fee_paid, not a
+        // recomputation off the CURRENT fee rate, which the admin may have
+        // changed since this position was opened). The fee itself isn't
+        // clawed back from fee_recipient — cancellation is an admin
+        // decision, not a token-contract-level guarantee we can enforce
+        // retroactively.
         let refund = match position.side {
-            PositionSide::Long => {
-                let fee = position.premium_paid * 5 / 1000;
-                position.premium_paid - fee
-            }
+            PositionSide::Long => position.premium_paid - position.fee_paid,
             PositionSide::Short => position.collateral_locked,
         };
 
@@ -262,8 +282,8 @@ impl OptionsMarket {
         let collateral_token: Address = env.storage().instance().get(&DataKey::CollateralToken).unwrap();
         let usdc = token::Client::new(&env, &collateral_token);
 
-        // Protocol fee: 0.5% of premium
-        let fee = total_premium * 5 / 1000;
+        // Protocol fee
+        let fee = calc_fee(total_premium, fee_rate_bps(&env));
         let premium_after_fee = total_premium - fee;
 
         // Premium goes to vault (covers writer payouts on exercise)
@@ -284,6 +304,7 @@ impl OptionsMarket {
             side: PositionSide::Long,
             contracts,
             premium_paid: total_premium,
+            fee_paid: fee,
             collateral_locked: 0,
             is_exercised: false,
             is_settled: false,
@@ -370,7 +391,7 @@ impl OptionsMarket {
             .unwrap()
             .checked_div(PRICE_PRECISION)
             .unwrap();
-        let fee = total_premium * 5 / 1000;
+        let fee = calc_fee(total_premium, fee_rate_bps(&env));
         let writer_premium = total_premium - fee;
 
         usdc.transfer(&env.current_contract_address(), &writer, &writer_premium);
@@ -383,6 +404,7 @@ impl OptionsMarket {
             side: PositionSide::Short,
             contracts,
             premium_paid: writer_premium,
+            fee_paid: 0,
             collateral_locked: required_collateral,
             is_exercised: false,
             is_settled: false,
@@ -530,6 +552,10 @@ impl OptionsMarket {
 
     pub fn is_paused(env: Env) -> bool {
         env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
+    }
+
+    pub fn get_fee_rate(env: Env) -> i128 {
+        fee_rate_bps(&env)
     }
 
     pub fn get_series(env: Env, series_id: u64) -> Option<OptionSeries> {

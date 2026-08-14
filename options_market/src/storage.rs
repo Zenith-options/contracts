@@ -3,6 +3,13 @@ use soroban_sdk::{panic_with_error, Address, Env, Vec};
 use crate::error::Error;
 use crate::types::{DataKey, OptionSeries, SeriesState};
 
+pub fn fee_rate_bps(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::FeeRateBps)
+        .unwrap_or(crate::math::DEFAULT_FEE_RATE_BPS)
+}
+
 pub fn require_not_paused(env: &Env) {
     let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
     if paused {
