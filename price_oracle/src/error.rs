@@ -9,8 +9,7 @@ pub enum Error {
     FeederNotFound = 3,
     NotAFeeder = 4,
     InvalidPrice = 5,
-    NoFreshPrice = 6,
-    ContractPaused = 7,
-    InvalidStaleness = 8,
-    TooManyFeeders = 9,
+    ContractPaused = 6,
+    InvalidStaleness = 7,
+    TooManyFeeders = 8,
 }

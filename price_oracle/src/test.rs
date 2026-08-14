@@ -105,7 +105,8 @@ fn report_price_stores_the_feeders_report() {
 fn report_price_rejects_an_unauthorized_reporter() {
     let h = setup();
     let stranger = Address::generate(&h.env);
-    h.client.report_price(&stranger, &Symbol::new(&h.env, "XLM"), &1_200_000);
+    h.client
+        .report_price(&stranger, &Symbol::new(&h.env, "XLM"), &1_200_000);
 }
 
 #[test]
@@ -114,7 +115,8 @@ fn report_price_rejects_a_non_positive_price() {
     let h = setup();
     let feeder = Address::generate(&h.env);
     h.client.add_feeder(&feeder);
-    h.client.report_price(&feeder, &Symbol::new(&h.env, "XLM"), &0);
+    h.client
+        .report_price(&feeder, &Symbol::new(&h.env, "XLM"), &0);
 }
 
 #[test]
@@ -124,12 +126,14 @@ fn report_price_rejects_a_revoked_feeder() {
     h.client.add_feeder(&feeder);
     h.client.remove_feeder(&feeder);
 
-    let result = h.client.try_report_price(&feeder, &Symbol::new(&h.env, "XLM"), &1_200_000);
+    let result = h
+        .client
+        .try_report_price(&feeder, &Symbol::new(&h.env, "XLM"), &1_200_000);
     assert!(result.is_err());
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #9)")] // TooManyFeeders
+#[should_panic(expected = "Error(Contract, #8)")] // TooManyFeeders
 fn add_feeder_rejects_beyond_the_cap() {
     let h = setup();
     for _ in 0..16 {
@@ -144,7 +148,10 @@ fn get_latest_report_is_none_before_any_report() {
     let h = setup();
     let feeder = Address::generate(&h.env);
     h.client.add_feeder(&feeder);
-    assert!(h.client.get_latest_report(&Symbol::new(&h.env, "XLM"), &feeder).is_none());
+    assert!(h
+        .client
+        .get_latest_report(&Symbol::new(&h.env, "XLM"), &feeder)
+        .is_none());
 }
 
 // ─── get_price aggregation ───────────────────────────────────────────────────
@@ -189,7 +196,9 @@ fn get_price_ignores_a_stale_report() {
     h.client.add_feeder(&stale_feeder);
     h.client.report_price(&stale_feeder, &xlm, &999_999_999); // way off, but will go stale
 
-    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + h.client.get_max_staleness() + 1);
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + h.client.get_max_staleness() + 1);
 
     let fresh_feeder = Address::generate(&h.env);
     h.client.add_feeder(&fresh_feeder);
@@ -228,8 +237,71 @@ fn max_staleness_defaults_to_one_hour_and_is_configurable() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")] // InvalidStaleness
+#[should_panic(expected = "Error(Contract, #7)")] // InvalidStaleness
 fn set_max_staleness_rejects_zero() {
     let h = setup();
     h.client.set_max_staleness(&0);
+}
+
+// ─── transfer_admin ─────────────────────────────────────────────────────────
+
+#[test]
+fn transfer_admin_hands_off_control() {
+    let h = setup();
+    assert_eq!(h.client.get_admin(), h.admin);
+
+    let new_admin = Address::generate(&h.env);
+    h.client.transfer_admin(&new_admin);
+    assert_eq!(h.client.get_admin(), new_admin);
+
+    // Admin-gated calls still work, now authorized against the new admin.
+    h.client.add_feeder(&Address::generate(&h.env));
+}
+
+// ─── pause / unpause ────────────────────────────────────────────────────────
+
+#[test]
+fn pause_blocks_mutations_unpause_restores_them() {
+    let h = setup();
+    assert!(!h.client.is_paused());
+
+    h.client.pause();
+    assert!(h.client.is_paused());
+
+    h.client.unpause();
+    assert!(!h.client.is_paused());
+    h.client.add_feeder(&Address::generate(&h.env));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // ContractPaused
+fn add_feeder_is_rejected_while_paused() {
+    let h = setup();
+    h.client.pause();
+    h.client.add_feeder(&Address::generate(&h.env));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // ContractPaused
+fn report_price_is_rejected_while_paused() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    h.client.pause();
+    h.client
+        .report_price(&feeder, &Symbol::new(&h.env, "XLM"), &1_200_000);
+}
+
+/// A pause must not hide the last-known price from callers still reading
+/// it — get_price stays live even while mutations are frozen.
+#[test]
+fn pause_does_not_block_get_price() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    let xlm = Symbol::new(&h.env, "XLM");
+    h.client.report_price(&feeder, &xlm, &1_200_000);
+
+    h.client.pause();
+    assert_eq!(h.client.get_price(&xlm).unwrap(), 1_200_000);
 }
