@@ -339,6 +339,18 @@ fn add_feeder_emits_a_feeder_added_event() {
 }
 
 #[test]
+fn remove_feeder_emits_a_feeder_removed_event() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    h.client.remove_feeder(&feeder);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(Address::try_from_val(&h.env, &data).unwrap(), feeder);
+}
+
+#[test]
 fn report_price_emits_a_price_reported_event() {
     let h = setup();
     let feeder = Address::generate(&h.env);
