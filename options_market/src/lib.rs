@@ -16,6 +16,7 @@ use soroban_sdk::{
 mod test;
 
 mod error;
+mod events;
 mod math;
 mod storage;
 mod types;
@@ -96,10 +97,7 @@ impl OptionsMarket {
         env.storage().persistent().set(&DataKey::Series(series_id), &series);
         env.storage().instance().set(&DataKey::SeriesCounter, &series_id);
 
-        env.events().publish(
-            (Symbol::new(&env, "series_created"),),
-            (series_id, strike_price, expiry, premium),
-        );
+        events::series_created(&env, series_id, strike_price, expiry, premium);
 
         series_id
     }
@@ -121,10 +119,7 @@ impl OptionsMarket {
         series.implied_vol = new_implied_vol;
         env.storage().persistent().set(&DataKey::Series(series_id), &series);
 
-        env.events().publish(
-            (Symbol::new(&env, "premium_updated"), series_id),
-            (new_premium, new_implied_vol),
-        );
+        events::premium_updated(&env, series_id, new_premium, new_implied_vol);
     }
 
     // ── Buying Options (Long) ─────────────────────────────────────────────────
@@ -199,10 +194,7 @@ impl OptionsMarket {
         let total_collected: i128 = env.storage().instance().get(&DataKey::TotalPremiumsCollected).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalPremiumsCollected, &(total_collected + premium_after_fee));
 
-        env.events().publish(
-            (Symbol::new(&env, "option_bought"), buyer),
-            (pos_id, series_id, contracts, total_premium),
-        );
+        events::option_bought(&env, buyer, pos_id, series_id, contracts, total_premium);
 
         pos_id
     }
@@ -296,10 +288,7 @@ impl OptionsMarket {
         series.open_interest += contracts;
         env.storage().persistent().set(&DataKey::Series(series_id), &series);
 
-        env.events().publish(
-            (Symbol::new(&env, "option_written"), writer),
-            (pos_id, series_id, contracts, writer_premium, required_collateral),
-        );
+        events::option_written(&env, writer, pos_id, series_id, contracts, writer_premium, required_collateral);
 
         pos_id
     }
@@ -357,10 +346,7 @@ impl OptionsMarket {
         position.is_exercised = true;
         env.storage().persistent().set(&DataKey::Position(position_id), &position);
 
-        env.events().publish(
-            (Symbol::new(&env, "option_exercised"), owner),
-            (position_id, settlement_price, payout),
-        );
+        events::option_exercised(&env, owner, position_id, settlement_price, payout);
     }
 
     /// Oracle sets the settlement price for a series
@@ -382,10 +368,7 @@ impl OptionsMarket {
         env.storage().persistent().set(&DataKey::Series(series_id), &series);
         env.storage().persistent().set(&DataKey::UnderlyingPrice(series.underlying.clone()), &price);
 
-        env.events().publish(
-            (Symbol::new(&env, "settlement_price_set"), series_id),
-            price,
-        );
+        events::settlement_price_set(&env, series_id, price);
     }
 
     /// Writers reclaim unused collateral after settlement
@@ -429,10 +412,7 @@ impl OptionsMarket {
         position.is_settled = true;
         env.storage().persistent().set(&DataKey::Position(position_id), &position);
 
-        env.events().publish(
-            (Symbol::new(&env, "collateral_reclaimed"), writer),
-            (position_id, reclaim),
-        );
+        events::collateral_reclaimed(&env, writer, position_id, reclaim);
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────

@@ -1,0 +1,55 @@
+use soroban_sdk::{Address, Env, Symbol};
+
+pub fn series_created(env: &Env, series_id: u64, strike_price: i128, expiry: u64, premium: i128) {
+    env.events().publish(
+        (Symbol::new(env, "series_created"),),
+        (series_id, strike_price, expiry, premium),
+    );
+}
+
+pub fn premium_updated(env: &Env, series_id: u64, new_premium: i128, new_implied_vol: i128) {
+    env.events().publish(
+        (Symbol::new(env, "premium_updated"), series_id),
+        (new_premium, new_implied_vol),
+    );
+}
+
+pub fn option_bought(env: &Env, buyer: Address, pos_id: u64, series_id: u64, contracts: i128, total_premium: i128) {
+    env.events().publish(
+        (Symbol::new(env, "option_bought"), buyer),
+        (pos_id, series_id, contracts, total_premium),
+    );
+}
+
+pub fn option_written(
+    env: &Env,
+    writer: Address,
+    pos_id: u64,
+    series_id: u64,
+    contracts: i128,
+    writer_premium: i128,
+    required_collateral: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "option_written"), writer),
+        (pos_id, series_id, contracts, writer_premium, required_collateral),
+    );
+}
+
+pub fn option_exercised(env: &Env, owner: Address, position_id: u64, settlement_price: i128, payout: i128) {
+    env.events().publish(
+        (Symbol::new(env, "option_exercised"), owner),
+        (position_id, settlement_price, payout),
+    );
+}
+
+pub fn settlement_price_set(env: &Env, series_id: u64, price: i128) {
+    env.events().publish((Symbol::new(env, "settlement_price_set"), series_id), price);
+}
+
+pub fn collateral_reclaimed(env: &Env, writer: Address, position_id: u64, reclaim: i128) {
+    env.events().publish(
+        (Symbol::new(env, "collateral_reclaimed"), writer),
+        (position_id, reclaim),
+    );
+}
