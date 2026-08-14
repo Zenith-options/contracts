@@ -356,8 +356,12 @@ fn sweep_untagged_emits_a_swept_untagged_event() {
     h.client.sweep_untagged(&rescuer);
 
     let events = h.env.events().all();
-    let (_, _topics, data) = events.last().unwrap();
+    let (_, topics, data) = events.last().unwrap();
     assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 250);
+
+    // to lives in topics, not data.
+    let topic_to = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_to, rescuer);
 }
 
 // ─── transfer_tag ───────────────────────────────────────────────────────────
@@ -425,8 +429,14 @@ fn transfer_tag_emits_a_tag_transferred_event() {
     h.client.transfer_tag(&1, &2, &150);
 
     let events = h.env.events().all();
-    let (_, _topics, data) = events.last().unwrap();
+    let (_, topics, data) = events.last().unwrap();
     assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 150);
+
+    // from_tag and to_tag live in topics, not data.
+    let topic_from_tag = u64::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    let topic_to_tag = u64::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
+    assert_eq!(topic_from_tag, 1);
+    assert_eq!(topic_to_tag, 2);
 }
 
 // ─── cross-contract: pause_via_multisig / transfer_admin_via_multisig ─────
