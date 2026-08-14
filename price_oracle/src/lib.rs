@@ -7,7 +7,7 @@
 //! admin-authorized feeders report prices per symbol, and the aggregate
 //! (median across fresh reports) is what callers read.
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
@@ -71,5 +71,27 @@ impl PriceOracle {
     pub fn get_feeder_count(env: Env) -> u32 {
         let feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
         feeders.len()
+    }
+
+    /// A feeder reports the current price for `symbol`. Only records this
+    /// feeder's own report — see the aggregation step (still to come) for
+    /// how per-feeder reports become the single price callers read.
+    pub fn report_price(env: Env, feeder: Address, symbol: Symbol, price: i128) {
+        feeder.require_auth();
+
+        let feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
+        if !feeders.contains(&feeder) {
+            panic_with_error!(&env, Error::NotAFeeder);
+        }
+        if price <= 0 {
+            panic_with_error!(&env, Error::InvalidPrice);
+        }
+
+        let now = env.ledger().timestamp();
+        env.storage().persistent().set(&DataKey::PriceReport(symbol, feeder), &(price, now));
+    }
+
+    pub fn get_latest_report(env: Env, symbol: Symbol, feeder: Address) -> Option<(i128, u64)> {
+        env.storage().persistent().get(&DataKey::PriceReport(symbol, feeder))
     }
 }

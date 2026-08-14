@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::{PriceOracle, PriceOracleClient};
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
 
 struct Harness<'a> {
     env: Env,
@@ -79,4 +79,56 @@ fn is_feeder_is_false_for_an_unauthorized_address() {
     let h = setup();
     let stranger = Address::generate(&h.env);
     assert!(!h.client.is_feeder(&stranger));
+}
+
+// ─── report_price ────────────────────────────────────────────────────────────
+
+#[test]
+fn report_price_stores_the_feeders_report() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+
+    let xlm = Symbol::new(&h.env, "XLM");
+    h.client.report_price(&feeder, &xlm, &1_200_000);
+
+    let (price, timestamp) = h.client.get_latest_report(&xlm, &feeder).unwrap();
+    assert_eq!(price, 1_200_000);
+    assert_eq!(timestamp, h.env.ledger().timestamp());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // NotAFeeder
+fn report_price_rejects_an_unauthorized_reporter() {
+    let h = setup();
+    let stranger = Address::generate(&h.env);
+    h.client.report_price(&stranger, &Symbol::new(&h.env, "XLM"), &1_200_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")] // InvalidPrice
+fn report_price_rejects_a_non_positive_price() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    h.client.report_price(&feeder, &Symbol::new(&h.env, "XLM"), &0);
+}
+
+#[test]
+fn report_price_rejects_a_revoked_feeder() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    h.client.remove_feeder(&feeder);
+
+    let result = h.client.try_report_price(&feeder, &Symbol::new(&h.env, "XLM"), &1_200_000);
+    assert!(result.is_err());
+}
+
+#[test]
+fn get_latest_report_is_none_before_any_report() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    assert!(h.client.get_latest_report(&Symbol::new(&h.env, "XLM"), &feeder).is_none());
 }
