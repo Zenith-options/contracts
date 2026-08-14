@@ -17,17 +17,27 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   price_oracle deployment to settle a series permissionlessly, as an
   alternative to the original `set_settlement_price`'s trusted-oracle-
   address flow.
+- [`vault/`](vault) — a per-tag escrow ledger for a single token,
+  motivated by a gap discovered while testing options_market: that
+  contract holds every writer's collateral and every buyer's premium in
+  one undifferentiated balance, with no accounting of which balance is
+  actually earmarked for which position. `deposit`/`withdraw` here are
+  scoped to a caller-defined `tag` (e.g. a position_id), so a withdrawal
+  can never draw down more than was specifically deposited under that
+  tag — regardless of what the vault's raw token balance happens to be
+  from other tags' deposits. Not yet wired into options_market as a
+  replacement for its own internal accounting; see "Known gaps" below.
 
 ## Building and testing
 
 Each crate is standalone (no workspace `Cargo.toml`), but **build order
-matters**: options_market cross-calls price_oracle via soroban-sdk's
-`contractimport!` against price_oracle's *compiled wasm* (not a normal
-source dependency — that would link price_oracle's own contract
-functions into options_market's wasm and collide with options_market's
-functions of the same name, like `pause`/`transfer_admin`). That means
-price_oracle's wasm has to exist before options_market can be compiled
-at all, even natively:
+matters for options_market**: it cross-calls price_oracle via
+soroban-sdk's `contractimport!` against price_oracle's *compiled wasm*
+(not a normal source dependency — that would link price_oracle's own
+contract functions into options_market's wasm and collide with
+options_market's functions of the same name, like
+`pause`/`transfer_admin`). That means price_oracle's wasm has to exist
+before options_market can be compiled at all, even natively:
 
 ```sh
 cd price_oracle
@@ -41,12 +51,12 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
-price_oracle itself has no such dependency and can be built/tested with
-the same five commands independently, in any order.
+price_oracle and vault have no such dependency and can each be
+built/tested with the same five commands independently, in any order.
 
 CI (`.github/workflows/ci.yml`) builds price_oracle's wasm first
 whenever a job is about to touch options_market, then runs the same
-four checks against every push and PR, for both crates.
+four checks against every push and PR, for all three crates.
 
 ## Deploying
 
@@ -187,16 +197,60 @@ function to track what changed.
 | 7 | `InvalidStaleness` |
 | 8 | `TooManyFeeders` |
 
+## `vault` reference
+
+A per-tag escrow ledger for a single token, set at `initialize`.
+
+### Admin
+
+| Function | Description |
+|---|---|
+| `initialize(admin, token)` | One-time setup. |
+| `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
+| `pause()` / `unpause()` | Emergency stop. Blocks **both** `deposit` and `withdraw` — unlike options_market's pause (which leaves settlement paths open), there's no "existing position needs an exit" concern independent of the vault itself. |
+| `withdraw(tag, to, amount)` | Pays `amount` of `tag`'s escrowed balance to `to`. Panics with `InsufficientEscrowBalance` if `tag` doesn't have that much earmarked, regardless of the vault's total token balance. Admin-gated — in the intended integration, `admin` is set to a calling contract's own address, so a contract-to-contract call satisfies the auth check through the call itself. |
+| `sweep_untagged(to)` | Recovers tokens that landed on the vault directly, bypassing `deposit` (e.g. a stray transfer). Computes the actual token balance minus `get_total_escrowed`'s ledger sum and transfers exactly that difference; panics with `NoUntaggedFunds` if there's nothing to recover. |
+
+### Depositors
+
+| Function | Description |
+|---|---|
+| `deposit(from, tag, amount)` | Pulls `amount` from `from` and credits `tag`'s ledger. Requires `from`'s own signature. |
+
+### Views
+
+`balance_of(tag)`, `get_total_escrowed`, `get_admin`, `get_token`, `is_paused`.
+
+### Events
+
+`admin_transferred`, `paused`, `unpaused`, `deposited`, `withdrawn`,
+`swept_untagged`.
+
+### Errors
+
+| # | Error |
+|---|---|
+| 1 | `AlreadyInitialized` |
+| 2 | `InvalidAmount` |
+| 3 | `InsufficientEscrowBalance` |
+| 4 | `ContractPaused` |
+| 5 | `NoUntaggedFunds` |
+
 ## Known gaps
 
-- **Cross-position accounting on cancellation.** `claim_refund` on a
-  Cancelled series is correct for any *single* claim, but a writer's
-  collateral refund and a buyer's premium refund draw from the same
-  undifferentiated vault balance — claiming both after the same
-  cancellation can still collectively overdraw in edge cases, since there's
-  no per-position ledger of which balance is earmarked for what. The
-  `PremiumPool` fix resolved the analogous gap for `write_option` itself;
-  a full per-position vault ledger would be the equivalent fix here.
+- **Cross-position accounting on cancellation, and `vault` isn't wired in
+  yet.** `claim_refund` on a Cancelled series is correct for any *single*
+  claim, but a writer's collateral refund and a buyer's premium refund
+  draw from the same undifferentiated vault balance — claiming both
+  after the same cancellation can still collectively overdraw in edge
+  cases, since there's no per-position ledger of which balance is
+  earmarked for what. The `vault` crate is exactly that missing
+  ledger (per-tag deposit/withdraw, tag = position_id), built for this
+  reason, but options_market doesn't call into it yet — it would need to
+  route collateral/premium through `vault::deposit`/`vault::withdraw`
+  instead of transferring the token directly, which is a real
+  behavior/data-model change to code with 55 existing tests, not
+  something to do casually alongside adding the vault itself.
 - **No order matching.** This is a pooled market, not an order book —
   writers and buyers don't get matched 1:1, they share a common vault and
   premium pool per series. That's a design choice, not a bug, but it means
