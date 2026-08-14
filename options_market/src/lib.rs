@@ -12,6 +12,9 @@ use soroban_sdk::{
     panic_with_error,
 };
 
+#[cfg(test)]
+mod test;
+
 // ─── Precision & Limits ──────────────────────────────────────────────────────
 
 const PRICE_PRECISION: i128 = 10_000_000;       // 1e7
