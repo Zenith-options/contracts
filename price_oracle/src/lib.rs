@@ -244,6 +244,33 @@ impl PriceOracle {
         }
     }
 
+    /// Permissionless alternative to remove_feeder: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Same rationale as
+    /// add_feeder_via_multisig.
+    pub fn remove_feeder_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        feeder: Address,
+    ) {
+        require_not_paused(&env);
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
+        match feeders.first_index_of(&feeder) {
+            Some(i) => {
+                feeders.remove(i).unwrap();
+                env.storage().instance().set(&DataKey::Feeders, &feeders);
+                events::feeder_removed(&env, feeder);
+            }
+            None => panic_with_error!(&env, Error::FeederNotFound),
+        }
+    }
+
     pub fn is_feeder(env: Env, address: Address) -> bool {
         let feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
         feeders.contains(&address)
