@@ -124,12 +124,15 @@ documented per field.
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
 | `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
 | `set_fee_rate(new_bps)` | Sets the protocol fee (basis points). Capped at `MAX_FEE_RATE_BPS` (1000 = 10%). |
+| `set_fee_rate_via_multisig(multisig_contract, action_id, new_bps)` | Permissionless alternative to `set_fee_rate`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Still enforces `MAX_FEE_RATE_BPS` — approval changes who can call it, not what rate is valid. |
 | `pause()` / `unpause()` | Emergency stop. Blocks `create_series`, `update_premium`, `buy_option`, `write_option`. Does **not** block `exercise`, `set_settlement_price`, or `reclaim_collateral` — a pause winds existing positions down, it doesn't trap funds. |
 | `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `upgrade(new_wasm_hash)` | Swaps the contract's executable via Soroban's deployer, keeping the same address, ID, and storage. |
+| `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
 | `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out. Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. |
 | `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. |
 | `cancel_series(series_id)` | Cancels an Active series. Position holders then call `claim_refund` individually — the admin doesn't push funds to everyone in one call, since that would scale badly against Soroban's per-call resource limits. |
+| `cancel_series_via_multisig(multisig_contract, action_id, series_id)` | Permissionless alternative to `cancel_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Cancelling disrupts every open position in a series, so gating it behind M-of-N is at least as warranted as pause. |
 
 ### Oracle
 
@@ -323,16 +326,18 @@ compromised signer can never add another compromised signer.
   (zero risk to the original flow's existing test coverage) but means
   there's no enforcement that a series *must* use the cross-contract
   path just because a `price_oracle` deployment exists.
-- **`multisig` is wired into options_market's, price_oracle's, and
-  vault's pause/unpause/transfer_admin, and nothing else.**
-  `pause_via_multisig`/`unpause_via_multisig`/`transfer_admin_via_multisig`
-  are all additive on all three contracts (the original admin-gated
-  versions are unchanged) and check `is_approved(action_id)` on a
-  deployed Multisig instead of a single signature. Every OTHER
-  sensitive function — `set_fee_rate`, `upgrade`, `cancel_series` on
-  options_market; `add_feeder`/`remove_feeder`/`set_max_staleness` on
-  price_oracle; `withdraw`/`transfer_tag`/`sweep_untagged` on vault —
-  still goes through a bare `admin: Address`, one key, not M-of-N. A
-  caller wiring more of these in is responsible for picking its own
+- **`multisig` is wired into a subset of each contract's admin-gated
+  functions, not all of them.** On options_market:
+  `pause`/`unpause`/`transfer_admin`/`set_fee_rate`/`upgrade`/`cancel_series`
+  all now have a `_via_multisig` alternative. On price_oracle and
+  vault: `pause`/`unpause`/`transfer_admin` do. Every `_via_multisig`
+  function is additive (the original admin-gated version is unchanged)
+  and checks `is_approved(action_id)` on a deployed Multisig instead of
+  a single signature. Every OTHER sensitive function — `create_series`,
+  `update_premium` on options_market; `add_feeder`/`remove_feeder`/
+  `set_max_staleness` on price_oracle; `withdraw`/`transfer_tag`/
+  `sweep_untagged` on vault — still goes through a bare
+  `admin: Address`, one key, not M-of-N. A caller wiring more of these
+  in is responsible for picking its own
   stable `action_id` scheme per function, since Multisig never
   interprets what an id means.
