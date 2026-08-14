@@ -167,6 +167,13 @@ collected, total open interest, series count).
 | `get_latest_report(symbol, feeder)` | One feeder's raw report, regardless of freshness or current authorization. |
 | `is_feeder`, `get_feeder_count`, `get_max_staleness`, `get_admin`, `is_paused` | |
 
+### Events
+
+`admin_transferred`, `paused`, `unpaused`, `max_staleness_updated`,
+`feeder_added`, `feeder_removed`, `price_reported` — one per state
+change, so an off-chain indexer doesn't have to poll every view
+function to track what changed.
+
 ### Errors
 
 | # | Error |
