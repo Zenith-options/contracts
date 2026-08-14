@@ -27,6 +27,7 @@ use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Vec};
 mod test;
 
 mod error;
+mod events;
 mod types;
 
 use error::Error;
@@ -82,7 +83,7 @@ impl Multisig {
             panic_with_error!(&env, Error::NotASigner);
         }
 
-        let approval_key = DataKey::Approval(action_id, signer);
+        let approval_key = DataKey::Approval(action_id, signer.clone());
         if env
             .storage()
             .persistent()
@@ -98,6 +99,7 @@ impl Multisig {
         env.storage()
             .persistent()
             .set(&count_key, &count.checked_add(1).unwrap());
+        events::approved(&env, signer, action_id);
     }
 
     /// Withdraws `signer`'s own approval of `action_id` — e.g. they
@@ -105,7 +107,7 @@ impl Multisig {
     pub fn revoke(env: Env, signer: Address, action_id: u64) {
         signer.require_auth();
 
-        let approval_key = DataKey::Approval(action_id, signer);
+        let approval_key = DataKey::Approval(action_id, signer.clone());
         if !env
             .storage()
             .persistent()
@@ -121,6 +123,7 @@ impl Multisig {
         env.storage()
             .persistent()
             .set(&count_key, &count.saturating_sub(1));
+        events::revoked(&env, signer, action_id);
     }
 
     pub fn has_approved(env: Env, action_id: u64, signer: Address) -> bool {
@@ -166,5 +169,6 @@ impl Multisig {
         env.storage()
             .persistent()
             .set(&DataKey::ApprovalCount(action_id), &0u32);
+        events::reset(&env, action_id);
     }
 }

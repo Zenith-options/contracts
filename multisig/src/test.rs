@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::{Multisig, MultisigClient};
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _},
+    vec, Address, Env, TryFromVal,
+};
 
 struct Harness<'a> {
     env: Env,
@@ -225,4 +228,39 @@ fn reset_rejects_an_action_below_threshold() {
     let h = setup();
     h.client.approve(&h.signers[0], &42); // only 1 of 3, threshold is 2
     h.client.reset(&42);
+}
+
+// ─── events ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn approve_emits_an_approved_event() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+
+    let events = h.env.events().all();
+    let (contract_id, _topics, _data) = events.last().unwrap();
+    assert_eq!(contract_id, h.client.address);
+}
+
+#[test]
+fn revoke_emits_a_revoked_event() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+    h.client.revoke(&h.signers[0], &42);
+
+    let events = h.env.events().all();
+    let (contract_id, _topics, _data) = events.last().unwrap();
+    assert_eq!(contract_id, h.client.address);
+}
+
+#[test]
+fn reset_emits_a_reset_event_with_the_action_id_as_data() {
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+    h.client.approve(&h.signers[1], &42);
+    h.client.reset(&42);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(u64::try_from_val(&h.env, &data).unwrap(), 42);
 }
