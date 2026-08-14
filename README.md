@@ -238,8 +238,11 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 | `pause()` / `unpause()` | Emergency stop. Blocks **both** `deposit` and `withdraw` — unlike options_market's pause (which leaves settlement paths open), there's no "existing position needs an exit" concern independent of the vault itself. |
 | `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `withdraw(tag, to, amount)` | Pays `amount` of `tag`'s escrowed balance to `to`. Panics with `InsufficientEscrowBalance` if `tag` doesn't have that much earmarked, regardless of the vault's total token balance. Admin-gated — in the intended integration, `admin` is set to a calling contract's own address, so a contract-to-contract call satisfies the auth check through the call itself. |
+| `withdraw_via_multisig(multisig_contract, action_id, tag, to, amount)` | Permissionless alternative to `withdraw`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Meant for manual recovery/migration when the calling contract itself can't produce that signature. Still enforces `InsufficientEscrowBalance`. |
 | `sweep_untagged(to)` | Recovers tokens that landed on the vault directly, bypassing `deposit` (e.g. a stray transfer). Computes the actual token balance minus `get_total_escrowed`'s ledger sum and transfers exactly that difference; panics with `NoUntaggedFunds` if there's nothing to recover. |
+| `sweep_untagged_via_multisig(multisig_contract, action_id, to)` | Permissionless alternative to `sweep_untagged`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
 | `transfer_tag(from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement at all — meant for the roll_position case (close + reopen in one breath, collateral doesn't need to leave and come back). `TotalEscrowed` is unaffected. |
+| `transfer_tag_via_multisig(multisig_contract, action_id, from_tag, to_tag, amount)` | Permissionless alternative to `transfer_tag`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
 
 ### Depositors
 
@@ -332,13 +335,14 @@ compromised signer can never add another compromised signer.
   `pause`/`unpause`/`transfer_admin`/`set_fee_rate`/`upgrade`/`cancel_series`
   all now have a `_via_multisig` alternative. On price_oracle:
   `pause`/`unpause`/`transfer_admin`/`set_max_staleness` do. On vault:
-  `pause`/`unpause`/`transfer_admin` do. Every `_via_multisig` function
-  is additive (the original admin-gated version is unchanged) and
-  checks `is_approved(action_id)` on a deployed Multisig instead of a
-  single signature. Every OTHER sensitive function — `create_series`,
-  `update_premium` on options_market; `add_feeder`/`remove_feeder` on
-  price_oracle; `withdraw`/`transfer_tag`/`sweep_untagged` on vault —
-  still goes through a bare `admin: Address`, one key, not M-of-N. A
-  caller wiring more of these in is responsible for picking its own
+  `pause`/`unpause`/`transfer_admin`/`withdraw`/`transfer_tag`/`sweep_untagged`
+  do — every vault function that moves or reassigns funds now has one.
+  Every `_via_multisig` function is additive (the original admin-gated
+  version is unchanged) and checks `is_approved(action_id)` on a
+  deployed Multisig instead of a single signature. Every OTHER
+  sensitive function — `create_series`, `update_premium` on
+  options_market; `add_feeder`/`remove_feeder` on price_oracle — still
+  goes through a bare `admin: Address`, one key, not M-of-N. A caller
+  wiring more of these in is responsible for picking its own
   stable `action_id` scheme per function, since Multisig never
   interprets what an id means.
