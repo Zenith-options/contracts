@@ -8,17 +8,23 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [options_market, price_oracle]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-targets
-        working-directory: options_market
+        working-directory: ${{ matrix.crate }}
       - run: cargo test
-        working-directory: options_market
+        working-directory: ${{ matrix.crate }}
 
   clippy:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [options_market, price_oracle]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,20 +32,26 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
-        working-directory: options_market
+        working-directory: ${{ matrix.crate }}
 
   fmt:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [options_market, price_oracle]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --check
-        working-directory: options_market
+        working-directory: ${{ matrix.crate }}
 
   wasm:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        crate: [options_market, price_oracle]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,4 +59,4 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --target wasm32-unknown-unknown --release
-        working-directory: options_market
+        working-directory: ${{ matrix.crate }}
