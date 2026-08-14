@@ -44,3 +44,81 @@ pub fn calc_payout(
         .checked_div(PRICE_PRECISION)
         .unwrap()
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn calc_fee_computes_bps_of_amount() {
+        assert_eq!(calc_fee(40_000_000, 50), 200_000); // 0.5% of 40M
+        assert_eq!(calc_fee(40_000_000, 100), 400_000); // 1% of 40M
+    }
+
+    #[test]
+    fn calc_fee_of_zero_bps_is_zero() {
+        assert_eq!(calc_fee(40_000_000, 0), 0);
+    }
+
+    #[test]
+    fn calc_fee_truncates_towards_zero_on_a_non_exact_division() {
+        // 999 * 50 / 10_000 = 4.995, integer division truncates to 4 —
+        // callers must not assume this rounds to the nearest bps.
+        assert_eq!(calc_fee(999, 50), 4);
+    }
+
+    #[test]
+    fn calc_payout_call_is_zero_at_the_money() {
+        assert_eq!(
+            calc_payout(&OptionType::Call, 700_000_000, 700_000_000, PRICE_PRECISION),
+            0
+        );
+    }
+
+    #[test]
+    fn calc_payout_call_is_zero_out_of_the_money() {
+        assert_eq!(
+            calc_payout(&OptionType::Call, 700_000_000, 650_000_000, PRICE_PRECISION),
+            0
+        );
+    }
+
+    #[test]
+    fn calc_payout_call_pays_the_intrinsic_value_in_the_money() {
+        // Strike 700, settlement 750 -> 50 of intrinsic value, 1 contract.
+        assert_eq!(
+            calc_payout(&OptionType::Call, 700_000_000, 750_000_000, PRICE_PRECISION),
+            50_000_000
+        );
+    }
+
+    #[test]
+    fn calc_payout_put_is_zero_out_of_the_money() {
+        assert_eq!(
+            calc_payout(&OptionType::Put, 700_000_000, 750_000_000, PRICE_PRECISION),
+            0
+        );
+    }
+
+    #[test]
+    fn calc_payout_put_pays_the_intrinsic_value_in_the_money() {
+        // Strike 700, settlement 650 -> 50 of intrinsic value, 1 contract.
+        assert_eq!(
+            calc_payout(&OptionType::Put, 700_000_000, 650_000_000, PRICE_PRECISION),
+            50_000_000
+        );
+    }
+
+    #[test]
+    fn calc_payout_scales_linearly_with_contracts() {
+        let one_contract =
+            calc_payout(&OptionType::Call, 700_000_000, 750_000_000, PRICE_PRECISION);
+        let three_contracts = calc_payout(
+            &OptionType::Call,
+            700_000_000,
+            750_000_000,
+            3 * PRICE_PRECISION,
+        );
+        assert_eq!(three_contracts, one_contract * 3);
+    }
+}
