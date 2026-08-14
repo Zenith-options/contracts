@@ -216,6 +216,59 @@ impl Vault {
         events::withdrawn(&env, to, tag, amount);
     }
 
+    /// Permissionless alternative to withdraw: cross-calls a deployed
+    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// the admin's own signature. Useful for a manual-recovery or
+    /// migration path where the intended calling contract itself can't
+    /// produce the admin's signature (e.g. it's being replaced), so an
+    /// M-of-N-approved payout is the only way to move funds out. Same
+    /// InsufficientEscrowBalance cap applies — approval changes who can
+    /// call this, not how much any tag is entitled to.
+    pub fn withdraw_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        tag: u64,
+        to: Address,
+        amount: i128,
+    ) {
+        require_not_paused(&env);
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InvalidAmount);
+        }
+
+        let key = DataKey::Escrow(tag);
+        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if balance < amount {
+            panic_with_error!(&env, Error::InsufficientEscrowBalance);
+        }
+        env.storage()
+            .persistent()
+            .set(&key, &balance.checked_sub(amount).unwrap());
+
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalEscrowed)
+            .unwrap();
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalEscrowed, &total.checked_sub(amount).unwrap());
+
+        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        token::Client::new(&env, &token_address).transfer(
+            &env.current_contract_address(),
+            &to,
+            &amount,
+        );
+
+        events::withdrawn(&env, to, tag, amount);
+    }
+
     /// Moves `amount` of escrow from `from_tag` to `to_tag` without any
     /// token movement at all — a pure ledger reassignment. Meant for
     /// exactly the case options_market's roll_position represents: a
