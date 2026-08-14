@@ -4,8 +4,8 @@ use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, Positi
 use multisig::{Multisig, MultisigClient};
 use price_oracle::{PriceOracle, PriceOracleClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, Address, BytesN, Env, Symbol,
+    testutils::{Address as _, Events as _, Ledger},
+    token, Address, BytesN, Env, Symbol, TryFromVal,
 };
 
 const USDC_DECIMALS: i128 = 10_000_000; // matches PRICE_PRECISION
@@ -1374,4 +1374,72 @@ fn update_premium_via_multisig_rejects_when_not_yet_approved() {
         &45_000_000,
         &500_000_000,
     );
+}
+
+// ─── event data content ────────────────────────────────────────────────────
+//
+// Every state-changing function here publishes an event specifically so an
+// off-chain indexer doesn't have to poll every view function (see the
+// README) — but nothing previously checked that any event's DATA actually
+// decodes to what a real indexer would expect, only that events fire at
+// all (or, for a couple of vault/price_oracle events, a single scalar).
+// These pin down the exact tuple shape for options_market's richer events.
+
+#[test]
+fn series_created_event_carries_the_series_fields() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (event_series_id, strike, expiry, premium) =
+        <(u64, i128, u64, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(event_series_id, series_id);
+    assert_eq!(strike, 700_000_000);
+    assert_eq!(premium, 40_000_000);
+    assert!(expiry > h.env.ledger().timestamp());
+}
+
+#[test]
+fn option_bought_event_carries_position_and_premium_data() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (event_pos_id, event_series_id, contracts, total_premium) =
+        <(u64, u64, i128, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(event_pos_id, pos_id);
+    assert_eq!(event_series_id, series_id);
+    assert_eq!(contracts, USDC_DECIMALS);
+    assert_eq!(total_premium, 40_000_000); // net of the 0.5% fee already deducted
+}
+
+#[test]
+fn admin_transferred_event_carries_old_and_new_admin() {
+    let h = setup();
+    let new_admin = Address::generate(&h.env);
+    h.client.transfer_admin(&new_admin);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    let (old_admin, event_new_admin) = <(Address, Address)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(old_admin, h.admin);
+    assert_eq!(event_new_admin, new_admin);
+}
+
+#[test]
+fn fee_rate_updated_event_carries_the_new_rate() {
+    let h = setup();
+    h.client.set_fee_rate(&250);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 250);
 }
