@@ -17,8 +17,10 @@ mod math;
 mod types;
 
 use error::Error;
-use math::MAX_FEEDERS;
+use math::{median, MAX_FEEDERS};
 use types::DataKey;
+
+const DEFAULT_MAX_STALENESS: u64 = 3600; // 1 hour
 
 #[contract]
 pub struct PriceOracle;
@@ -32,6 +34,22 @@ impl PriceOracle {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Feeders, &Vec::<Address>::new(&env));
+        env.storage().instance().set(&DataKey::MaxStaleness, &DEFAULT_MAX_STALENESS);
+    }
+
+    /// Admin adjusts how old a feeder's report can be and still count
+    /// toward get_price's aggregate.
+    pub fn set_max_staleness(env: Env, seconds: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if seconds == 0 {
+            panic_with_error!(&env, Error::InvalidStaleness);
+        }
+        env.storage().instance().set(&DataKey::MaxStaleness, &seconds);
+    }
+
+    pub fn get_max_staleness(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::MaxStaleness).unwrap()
     }
 
     /// Admin authorizes a new price feeder. Feeders are the only addresses
@@ -98,5 +116,34 @@ impl PriceOracle {
 
     pub fn get_latest_report(env: Env, symbol: Symbol, feeder: Address) -> Option<(i128, u64)> {
         env.storage().persistent().get(&DataKey::PriceReport(symbol, feeder))
+    }
+
+    /// The aggregate price for `symbol`: the median across every
+    /// CURRENTLY authorized feeder's report that isn't older than
+    /// max_staleness. Returns None if no feeder has a fresh report —
+    /// callers must not treat that the same as "price is zero."
+    pub fn get_price(env: Env, symbol: Symbol) -> Option<i128> {
+        let feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
+        let max_staleness: u64 = env.storage().instance().get(&DataKey::MaxStaleness).unwrap();
+        let now = env.ledger().timestamp();
+
+        let mut buffer = [0i128; MAX_FEEDERS as usize];
+        let mut count = 0usize;
+        for feeder in feeders.iter() {
+            let report: Option<(i128, u64)> =
+                env.storage().persistent().get(&DataKey::PriceReport(symbol.clone(), feeder));
+            if let Some((price, reported_at)) = report {
+                if now.checked_sub(reported_at).unwrap_or(u64::MAX) <= max_staleness {
+                    buffer[count] = price;
+                    count += 1;
+                }
+            }
+        }
+
+        if count == 0 {
+            None
+        } else {
+            Some(median(&mut buffer, count))
+        }
     }
 }

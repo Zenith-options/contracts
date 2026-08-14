@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::{PriceOracle, PriceOracleClient};
-use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, Symbol,
+};
 
 struct Harness<'a> {
     env: Env,
@@ -142,4 +145,91 @@ fn get_latest_report_is_none_before_any_report() {
     let feeder = Address::generate(&h.env);
     h.client.add_feeder(&feeder);
     assert!(h.client.get_latest_report(&Symbol::new(&h.env, "XLM"), &feeder).is_none());
+}
+
+// ─── get_price aggregation ───────────────────────────────────────────────────
+
+#[test]
+fn get_price_is_none_with_no_feeders() {
+    let h = setup();
+    assert!(h.client.get_price(&Symbol::new(&h.env, "XLM")).is_none());
+}
+
+#[test]
+fn get_price_matches_the_single_feeders_report() {
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    let xlm = Symbol::new(&h.env, "XLM");
+    h.client.report_price(&feeder, &xlm, &1_200_000);
+
+    assert_eq!(h.client.get_price(&xlm).unwrap(), 1_200_000);
+}
+
+#[test]
+fn get_price_is_the_median_across_several_feeders() {
+    let h = setup();
+    let xlm = Symbol::new(&h.env, "XLM");
+    let prices = [1_000_000i128, 1_100_000, 1_050_000];
+    for price in prices {
+        let feeder = Address::generate(&h.env);
+        h.client.add_feeder(&feeder);
+        h.client.report_price(&feeder, &xlm, &price);
+    }
+
+    assert_eq!(h.client.get_price(&xlm).unwrap(), 1_050_000);
+}
+
+#[test]
+fn get_price_ignores_a_stale_report() {
+    let h = setup();
+    let xlm = Symbol::new(&h.env, "XLM");
+
+    let stale_feeder = Address::generate(&h.env);
+    h.client.add_feeder(&stale_feeder);
+    h.client.report_price(&stale_feeder, &xlm, &999_999_999); // way off, but will go stale
+
+    h.env.ledger().set_timestamp(h.env.ledger().timestamp() + h.client.get_max_staleness() + 1);
+
+    let fresh_feeder = Address::generate(&h.env);
+    h.client.add_feeder(&fresh_feeder);
+    h.client.report_price(&fresh_feeder, &xlm, &1_200_000);
+
+    // Only the fresh feeder's report counts — the stale one is excluded
+    // entirely rather than dragging the median toward its outlier value.
+    assert_eq!(h.client.get_price(&xlm).unwrap(), 1_200_000);
+}
+
+#[test]
+fn get_price_ignores_a_revoked_feeders_old_report() {
+    let h = setup();
+    let xlm = Symbol::new(&h.env, "XLM");
+
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    h.client.report_price(&feeder, &xlm, &1_200_000);
+    h.client.remove_feeder(&feeder);
+
+    // Their report is still in storage (audit trail), but a revoked feeder
+    // no longer counts toward the aggregate.
+    assert!(h.client.get_latest_report(&xlm, &feeder).is_some());
+    assert!(h.client.get_price(&xlm).is_none());
+}
+
+// ─── max_staleness ───────────────────────────────────────────────────────────
+
+#[test]
+fn max_staleness_defaults_to_one_hour_and_is_configurable() {
+    let h = setup();
+    assert_eq!(h.client.get_max_staleness(), 3600);
+
+    h.client.set_max_staleness(&7200);
+    assert_eq!(h.client.get_max_staleness(), 7200);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")] // InvalidStaleness
+fn set_max_staleness_rejects_zero() {
+    let h = setup();
+    h.client.set_max_staleness(&0);
 }
