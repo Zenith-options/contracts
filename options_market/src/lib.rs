@@ -17,10 +17,12 @@ mod test;
 
 mod error;
 mod math;
+mod storage;
 mod types;
 
 use error::Error;
 use math::{calc_payout, MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW};
+use storage::{add_user_position, next_position_id, require_active_series};
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -143,7 +145,7 @@ impl OptionsMarket {
             panic_with_error!(&env, Error::ZeroContracts);
         }
 
-        let mut series: OptionSeries = Self::require_active_series(&env, series_id);
+        let mut series: OptionSeries = require_active_series(&env, series_id);
 
         let total_premium = contracts
             .checked_mul(series.premium)
@@ -173,7 +175,7 @@ impl OptionsMarket {
         }
 
         // Create position
-        let pos_id = Self::next_position_id(&env);
+        let pos_id = next_position_id(&env);
         let position = OptionPosition {
             position_id: pos_id,
             series_id,
@@ -188,7 +190,7 @@ impl OptionsMarket {
         };
 
         env.storage().persistent().set(&DataKey::Position(pos_id), &position);
-        Self::add_user_position(&env, &buyer, pos_id);
+        add_user_position(&env, &buyer, pos_id);
 
         // Update OI
         series.open_interest += contracts;
@@ -223,7 +225,7 @@ impl OptionsMarket {
             panic_with_error!(&env, Error::ZeroContracts);
         }
 
-        let mut series: OptionSeries = Self::require_active_series(&env, series_id);
+        let mut series: OptionSeries = require_active_series(&env, series_id);
 
         // Required collateral depends on option type
         let required_collateral = match series.option_type {
@@ -274,7 +276,7 @@ impl OptionsMarket {
 
         usdc.transfer(&env.current_contract_address(), &writer, &writer_premium);
 
-        let pos_id = Self::next_position_id(&env);
+        let pos_id = next_position_id(&env);
         let position = OptionPosition {
             position_id: pos_id,
             series_id,
@@ -289,7 +291,7 @@ impl OptionsMarket {
         };
 
         env.storage().persistent().set(&DataKey::Position(pos_id), &position);
-        Self::add_user_position(&env, &writer, pos_id);
+        add_user_position(&env, &writer, pos_id);
 
         series.open_interest += contracts;
         env.storage().persistent().set(&DataKey::Series(series_id), &series);
@@ -460,34 +462,4 @@ impl OptionsMarket {
         (premiums, oi, series_count)
     }
 
-    // ── Internal Helpers ──────────────────────────────────────────────────────
-
-    fn require_active_series(env: &Env, series_id: u64) -> OptionSeries {
-        let series: OptionSeries = env.storage().persistent()
-            .get(&DataKey::Series(series_id))
-            .unwrap_or_else(|| panic_with_error!(env, Error::SeriesNotFound));
-        if series.state != SeriesState::Active {
-            panic_with_error!(env, Error::SeriesNotActive);
-        }
-        if env.ledger().timestamp() >= series.expiry {
-            panic_with_error!(env, Error::SeriesNotActive);
-        }
-        series
-    }
-
-    fn next_position_id(env: &Env) -> u64 {
-        let counter: u64 = env.storage().instance().get(&DataKey::PositionCounter).unwrap_or(0);
-        let next = counter + 1;
-        env.storage().instance().set(&DataKey::PositionCounter, &next);
-        next
-    }
-
-    fn add_user_position(env: &Env, user: &Address, position_id: u64) {
-        let key = DataKey::UserPositions(user.clone());
-        let mut positions: Vec<u64> = env.storage().persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        positions.push_back(position_id);
-        env.storage().persistent().set(&key, &positions);
-    }
 }
