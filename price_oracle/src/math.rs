@@ -22,7 +22,10 @@ pub fn median(values: &mut [i128; MAX_FEEDERS as usize], count: usize) -> i128 {
     if count % 2 == 1 {
         values[count / 2]
     } else {
-        (values[count / 2 - 1] + values[count / 2]) / 2
+        values[count / 2 - 1]
+            .checked_add(values[count / 2])
+            .unwrap()
+            / 2
     }
 }
 
@@ -68,5 +71,25 @@ mod test {
         // manipulated report of 1_000_000 shouldn't move this far from 20.
         let (mut b, n) = buf(&[18, 19, 20, 21, 1_000_000]);
         assert_eq!(median(&mut b, n), 20);
+    }
+
+    #[test]
+    fn every_feeder_agreeing_is_unaffected_by_sorting() {
+        let (mut b, n) = buf(&[500_000; MAX_FEEDERS as usize]);
+        assert_eq!(median(&mut b, n), 500_000);
+    }
+
+    #[test]
+    fn a_full_buffer_of_max_feeders_is_handled() {
+        // MAX_FEEDERS (16, even) descending, to exercise both the sort and
+        // the even-count averaging branch at the actual capacity this
+        // function is sized for.
+        let mut values = [0i128; MAX_FEEDERS as usize];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = MAX_FEEDERS as i128 - i as i128;
+        }
+        let (mut b, n) = buf(&values);
+        // Sorted 1..=16, even count -> average of the two middle (8, 9).
+        assert_eq!(median(&mut b, n), 8);
     }
 }
