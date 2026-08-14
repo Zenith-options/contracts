@@ -20,4 +20,5 @@ pub enum Error {
     NotInTheMoney = 14,
     WrongSide = 15,
     ExpiryTooSoon = 16,
+    ContractPaused = 17,
 }

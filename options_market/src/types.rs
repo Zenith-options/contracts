@@ -17,6 +17,7 @@ pub enum DataKey {
     UnderlyingPrice(Symbol),
     TotalPremiumsCollected,
     TotalOpenInterest,
+    Paused,
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────

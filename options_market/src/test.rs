@@ -543,3 +543,78 @@ fn transfer_admin_hands_off_control() {
     let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
     assert!(h.client.get_series(&series_id).is_some());
 }
+
+// ─── pause / unpause ────────────────────────────────────────────────────────
+
+#[test]
+fn pause_blocks_new_trades_unpause_restores_them() {
+    let h = setup();
+    assert!(!h.client.is_paused());
+
+    h.client.pause();
+    assert!(h.client.is_paused());
+
+    h.client.unpause();
+    assert!(!h.client.is_paused());
+
+    // After unpausing, trading works again.
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    assert!(h.client.get_series(&series_id).is_some());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")] // ContractPaused
+fn create_series_is_rejected_while_paused() {
+    let h = setup();
+    h.client.pause();
+    make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")] // ContractPaused
+fn buy_option_is_rejected_while_paused() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    h.client.pause();
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    h.client.buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")] // ContractPaused
+fn write_option_is_rejected_while_paused() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    h.client.pause();
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+}
+
+/// A pause must not trap funds already at risk: an existing writer can still
+/// exercise/reclaim through settlement while the contract is paused.
+#[test]
+fn pause_does_not_block_settlement_of_existing_positions() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h.client.write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    h.client.pause();
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM, no exercise needed
+
+    // Vault liquidity top-up for the same reason documented on the OTM
+    // reclaim test above — a standalone writer's full collateral reclaim
+    // exceeds what write_option itself left in the vault.
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &writer);
+    h.client.reclaim_collateral(&writer, &pos_id);
+    assert_eq!(balance(&h, &writer) - before, 700_000_000);
+}

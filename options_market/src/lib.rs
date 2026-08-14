@@ -23,7 +23,7 @@ mod types;
 
 use error::Error;
 use math::{calc_payout, MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW};
-use storage::{add_user_position, next_position_id, require_active_series};
+use storage::{add_user_position, next_position_id, require_active_series, require_not_paused};
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -66,6 +66,24 @@ impl OptionsMarket {
         events::admin_transferred(&env, admin, new_admin);
     }
 
+    /// Emergency stop: blocks new series creation and new trades
+    /// (create_series, update_premium, buy_option, write_option). Does NOT
+    /// block exercise, set_settlement_price, or reclaim_collateral — a
+    /// pause should let existing positions wind down, not trap funds.
+    pub fn pause(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        events::paused(&env);
+    }
+
+    pub fn unpause(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        events::unpaused(&env);
+    }
+
     // ── Series Management (Admin) ─────────────────────────────────────────────
 
     /// Admin lists a new option series (strike + expiry + type)
@@ -79,6 +97,7 @@ impl OptionsMarket {
         premium: i128,
         implied_vol: i128,
     ) -> u64 {
+        require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -114,6 +133,7 @@ impl OptionsMarket {
 
     /// Admin updates premium (e.g. after volatility changes)
     pub fn update_premium(env: Env, series_id: u64, new_premium: i128, new_implied_vol: i128) {
+        require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -144,6 +164,7 @@ impl OptionsMarket {
         contracts: i128,
         max_premium: i128,
     ) -> u64 {
+        require_not_paused(&env);
         buyer.require_auth();
 
         if contracts <= 0 {
@@ -221,6 +242,7 @@ impl OptionsMarket {
         contracts: i128,
         collateral_amount: i128,
     ) -> u64 {
+        require_not_paused(&env);
         writer.require_auth();
 
         if contracts <= 0 {
@@ -429,6 +451,10 @@ impl OptionsMarket {
 
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
     }
 
     pub fn get_series(env: Env, series_id: u64) -> Option<OptionSeries> {
