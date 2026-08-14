@@ -76,6 +76,13 @@ first whenever a job is about to touch options_market, price_oracle,
 or vault, then runs the same four checks against every push and PR,
 for all four crates.
 
+Every event any of these four contracts publishes has a test that
+decodes its actual payload via `TryFromVal` (topics and data), not
+just a test that confirms an event fired — the intent being that
+anything an off-chain indexer would need to parse out of an event is
+pinned down by a test, so a change to a tuple's field order or type
+shows up as a test failure rather than as a silently broken indexer.
+
 ## Deploying
 
 ```sh
