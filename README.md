@@ -333,19 +333,19 @@ compromised signer can never add another compromised signer.
   (zero risk to the original flow's existing test coverage) but means
   there's no enforcement that a series *must* use the cross-contract
   path just because a `price_oracle` deployment exists.
-- **Every admin-gated function on options_market now has a
-  `_via_multisig` alternative** (`pause`, `unpause`, `transfer_admin`,
-  `set_fee_rate`, `upgrade`, `cancel_series`, `create_series`,
-  `update_premium`). price_oracle and vault are wired for their own
-  most sensitive functions but not exhaustively: price_oracle covers
-  `pause`/`unpause`/`transfer_admin`/`set_max_staleness`/`add_feeder`/
-  `remove_feeder`; vault covers `pause`/`unpause`/`transfer_admin`/
-  `withdraw`/`transfer_tag`/`sweep_untagged` (every vault function that
-  moves or reassigns funds). Every `_via_multisig` function is additive
+- **Every admin-gated function on options_market, price_oracle, and
+  vault now has a `_via_multisig` alternative — except `initialize`.**
+  options_market: `pause`, `unpause`, `transfer_admin`, `set_fee_rate`,
+  `upgrade`, `cancel_series`, `create_series`, `update_premium`.
+  price_oracle: `pause`, `unpause`, `transfer_admin`,
+  `set_max_staleness`, `add_feeder`, `remove_feeder`. vault: `pause`,
+  `unpause`, `transfer_admin`, `withdraw`, `transfer_tag`,
+  `sweep_untagged`. `initialize` can't have one by construction — there
+  is no admin, and therefore no Multisig deployment trusted by this
+  contract, until it runs. Every `_via_multisig` function is additive
   (the original admin-gated version is unchanged) and checks
   `is_approved(action_id)` on a deployed Multisig instead of a single
   signature, with the same validation the original enforces — approval
   only changes who can call a function, never what a valid call to it
-  looks like. A caller wiring more of these in is responsible for
-  picking its own stable `action_id` scheme per function, since
-  Multisig never interprets what an id means.
+  looks like. Callers still choose their own stable `action_id` scheme
+  per function, since Multisig never interprets what an id means.
