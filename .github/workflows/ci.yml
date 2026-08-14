@@ -13,6 +13,10 @@ on:
 # options_market can even be *compiled*, native target included — every
 # job below installs wasm32-unknown-unknown and builds price_oracle's and
 # multisig's wasm first when it's about to touch options_market.
+#
+# price_oracle itself also now cross-calls multisig the same way (for
+# pause_via_multisig/transfer_admin_via_multisig), so it needs multisig's
+# wasm built first too — a second, independent build-order edge.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -29,6 +33,9 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
       - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - if: matrix.crate == 'price_oracle'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
       - run: cargo build --all-targets
@@ -52,6 +59,9 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
       - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - if: matrix.crate == 'price_oracle'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
       - run: cargo clippy --all-targets -- -D warnings
@@ -85,6 +95,9 @@ jobs:
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
       - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
+      - if: matrix.crate == 'price_oracle'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
       - run: cargo build --target wasm32-unknown-unknown --release
