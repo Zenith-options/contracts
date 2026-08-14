@@ -56,6 +56,16 @@ impl OptionsMarket {
         env.storage().instance().set(&DataKey::TotalOpenInterest, &0i128);
     }
 
+    /// Admin hands off control to a new address. Requires the CURRENT admin's
+    /// signature, not the incoming one — the new admin doesn't need to do
+    /// anything to receive control.
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
+    }
+
     // ── Series Management (Admin) ─────────────────────────────────────────────
 
     /// Admin lists a new option series (strike + expiry + type)
@@ -416,6 +426,10 @@ impl OptionsMarket {
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
+
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
 
     pub fn get_series(env: Env, series_id: u64) -> Option<OptionSeries> {
         env.storage().persistent().get(&DataKey::Series(series_id))

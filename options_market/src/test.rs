@@ -525,3 +525,21 @@ fn full_lifecycle_covered_call_itm() {
     h.client.reclaim_collateral(&writer, &writer_pos);
     assert_eq!(balance(&h, &writer) - writer_before, 650_000_000); // 700 locked - 50 paid out
 }
+
+// ─── transfer_admin ─────────────────────────────────────────────────────────
+
+#[test]
+fn transfer_admin_hands_off_control() {
+    let h = setup();
+    assert_eq!(h.client.get_admin(), h.admin);
+
+    let new_admin = Address::generate(&h.env);
+    h.client.transfer_admin(&new_admin);
+    assert_eq!(h.client.get_admin(), new_admin);
+
+    // create_series still works, now authorized against the NEW admin
+    // (mock_all_auths lets the call through regardless of who signed, but
+    // the stored admin address driving that check has genuinely moved).
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    assert!(h.client.get_series(&series_id).is_some());
+}
