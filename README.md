@@ -32,31 +32,31 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   a single `admin: Address` as its sole point of control. A fixed
   signer set and threshold, `is_approved(action_id)` that flips true
   once enough signers have approved — `action_id` is never interpreted
-  by this contract, only counted. Both `options_market` and
-  `price_oracle` cross-call a live Multisig deployment as a
-  permissionless alternative to their own admin-gated
+  by this contract, only counted. `options_market`, `price_oracle`, and
+  `vault` each cross-call a live Multisig deployment as a permissionless
+  alternative to their own admin-gated
   `pause`/`unpause`/`transfer_admin`; see "Known gaps" below for what's
   still admin-only.
 
 ## Building and testing
 
 Each crate is standalone (no workspace `Cargo.toml`), but **build order
-matters for both options_market and price_oracle**: both cross-call
-other contracts via soroban-sdk's `contractimport!` against their
-*compiled wasm* (not a normal source dependency — that would link the
-other contract's own functions into the caller's wasm and collide with
-functions of the same name, like `pause`/`transfer_admin`).
+matters for options_market, price_oracle, and vault**: all three
+cross-call other contracts via soroban-sdk's `contractimport!` against
+their *compiled wasm* (not a normal source dependency — that would
+link the other contract's own functions into the caller's wasm and
+collide with functions of the same name, like `pause`/`transfer_admin`).
 options_market depends on BOTH price_oracle's and multisig's wasm;
-price_oracle depends on multisig's wasm too. That means the dependency
-wasm has to exist before the dependent crate can be compiled at all,
-even natively:
+price_oracle and vault each depend on multisig's wasm. That means the
+dependency wasm has to exist before the dependent crate can be
+compiled at all, even natively:
 
 ```sh
 cd multisig
-cargo build --target wasm32-unknown-unknown --release   # do this FIRST — both price_oracle and options_market need it
+cargo build --target wasm32-unknown-unknown --release   # do this FIRST — price_oracle, vault, and options_market all need it
 
 cd ../price_oracle
-cargo build --target wasm32-unknown-unknown --release   # do this SECOND — options_market needs it, and price_oracle itself now needs multisig's wasm to already exist
+cargo build --target wasm32-unknown-unknown --release   # do this SECOND — options_market needs it, and price_oracle itself needs multisig's wasm to already exist
 
 cd ../options_market   # now this crate can build/test/etc.
 cargo build                                   # native build, fast iteration
@@ -66,15 +66,15 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
-vault and multisig have no such dependency themselves and can be
-built/tested with the same five commands independently, in any order.
-price_oracle only needs multisig's wasm built first — it has no other
-dependency of its own.
+`vault` follows the same pattern as `price_oracle` — it only needs
+multisig's wasm built first, no other dependency of its own. `multisig`
+itself has no dependency on anything else and can be built/tested
+independently, in any order relative to the others.
 
 CI (`.github/workflows/ci.yml`) builds the required dependency wasm(s)
-first whenever a job is about to touch options_market or price_oracle,
-then runs the same four checks against every push and PR, for all four
-crates.
+first whenever a job is about to touch options_market, price_oracle,
+or vault, then runs the same four checks against every push and PR,
+for all four crates.
 
 ## Deploying
 
@@ -230,7 +230,9 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 |---|---|
 | `initialize(admin, token)` | One-time setup. |
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
+| `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
 | `pause()` / `unpause()` | Emergency stop. Blocks **both** `deposit` and `withdraw` — unlike options_market's pause (which leaves settlement paths open), there's no "existing position needs an exit" concern independent of the vault itself. |
+| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `withdraw(tag, to, amount)` | Pays `amount` of `tag`'s escrowed balance to `to`. Panics with `InsufficientEscrowBalance` if `tag` doesn't have that much earmarked, regardless of the vault's total token balance. Admin-gated — in the intended integration, `admin` is set to a calling contract's own address, so a contract-to-contract call satisfies the auth check through the call itself. |
 | `sweep_untagged(to)` | Recovers tokens that landed on the vault directly, bypassing `deposit` (e.g. a stray transfer). Computes the actual token balance minus `get_total_escrowed`'s ledger sum and transfers exactly that difference; panics with `NoUntaggedFunds` if there's nothing to recover. |
 | `transfer_tag(from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement at all — meant for the roll_position case (close + reopen in one breath, collateral doesn't need to leave and come back). `TotalEscrowed` is unaffected. |
@@ -259,6 +261,7 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 | 3 | `InsufficientEscrowBalance` |
 | 4 | `ContractPaused` |
 | 5 | `NoUntaggedFunds` |
+| 6 | `Unauthorized` |
 
 ## `multisig` reference
 
@@ -320,15 +323,16 @@ compromised signer can never add another compromised signer.
   (zero risk to the original flow's existing test coverage) but means
   there's no enforcement that a series *must* use the cross-contract
   path just because a `price_oracle` deployment exists.
-- **`multisig` is wired into options_market's and price_oracle's
-  pause/unpause/transfer_admin, and nothing else.**
+- **`multisig` is wired into options_market's, price_oracle's, and
+  vault's pause/unpause/transfer_admin, and nothing else.**
   `pause_via_multisig`/`unpause_via_multisig`/`transfer_admin_via_multisig`
-  are all additive on both contracts (the original admin-gated versions
-  are unchanged) and check `is_approved(action_id)` on a deployed
-  Multisig instead of a single signature. Every OTHER sensitive
-  function — `set_fee_rate`, `upgrade`, `cancel_series`,
-  `add_feeder`/`remove_feeder`/`set_max_staleness` on price_oracle; all
-  of `vault`'s admin-gated calls — still goes through a bare
-  `admin: Address`, one key, not M-of-N. A caller wiring more of these
-  in is responsible for picking its own stable `action_id` scheme per
-  function, since Multisig never interprets what an id means.
+  are all additive on all three contracts (the original admin-gated
+  versions are unchanged) and check `is_approved(action_id)` on a
+  deployed Multisig instead of a single signature. Every OTHER
+  sensitive function — `set_fee_rate`, `upgrade`, `cancel_series` on
+  options_market; `add_feeder`/`remove_feeder`/`set_max_staleness` on
+  price_oracle; `withdraw`/`transfer_tag`/`sweep_untagged` on vault —
+  still goes through a bare `admin: Address`, one key, not M-of-N. A
+  caller wiring more of these in is responsible for picking its own
+  stable `action_id` scheme per function, since Multisig never
+  interprets what an id means.
