@@ -360,8 +360,16 @@ fn report_price_emits_a_price_reported_event() {
     h.client.report_price(&feeder, &xlm, &1_200_000);
 
     let events = h.env.events().all();
-    let (_, _topics, data) = events.last().unwrap();
+    let (_, topics, data) = events.last().unwrap();
     assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 1_200_000);
+
+    // feeder and symbol live in topics, not data — an indexer filtering
+    // "reports from this feeder" or "reports for this symbol" reads
+    // them from here.
+    let topic_feeder = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    let topic_symbol = Symbol::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
+    assert_eq!(topic_feeder, feeder);
+    assert_eq!(topic_symbol, xlm);
 }
 
 #[test]

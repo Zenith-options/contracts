@@ -30,15 +30,12 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
       - if: matrix.crate == 'options_market'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
-      - if: matrix.crate == 'options_market'
-        run: cargo build --target wasm32-unknown-unknown --release
-        working-directory: multisig
-      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
-        run: cargo build --target wasm32-unknown-unknown --release
-        working-directory: multisig
       - run: cargo build --all-targets
         working-directory: ${{ matrix.crate }}
       - run: cargo test
@@ -56,15 +53,12 @@ jobs:
           components: clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
       - if: matrix.crate == 'options_market'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
-      - if: matrix.crate == 'options_market'
-        run: cargo build --target wasm32-unknown-unknown --release
-        working-directory: multisig
-      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
-        run: cargo build --target wasm32-unknown-unknown --release
-        working-directory: multisig
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: ${{ matrix.crate }}
 
@@ -92,14 +86,11 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: multisig
       - if: matrix.crate == 'options_market'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
-      - if: matrix.crate == 'options_market'
-        run: cargo build --target wasm32-unknown-unknown --release
-        working-directory: multisig
-      - if: matrix.crate == 'price_oracle' || matrix.crate == 'vault'
-        run: cargo build --target wasm32-unknown-unknown --release
-        working-directory: multisig
       - run: cargo build --target wasm32-unknown-unknown --release
         working-directory: ${{ matrix.crate }}

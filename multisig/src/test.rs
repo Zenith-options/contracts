@@ -243,6 +243,24 @@ fn approve_emits_an_approved_event() {
 }
 
 #[test]
+fn approved_event_topics_carry_the_signer_and_action_id() {
+    // approve()'s entire payload lives in its topics — data is just ()
+    // — so unlike most other events here, checking contract_id alone
+    // proves nothing about WHICH signer or action_id was actually
+    // recorded. Decodes topics[1] (signer) and topics[2] (action_id)
+    // directly.
+    let h = setup();
+    h.client.approve(&h.signers[0], &42);
+
+    let events = h.env.events().all();
+    let (_, topics, _data) = events.last().unwrap();
+    let signer = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    let action_id = u64::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
+    assert_eq!(signer, h.signers[0]);
+    assert_eq!(action_id, 42);
+}
+
+#[test]
 fn revoke_emits_a_revoked_event() {
     let h = setup();
     h.client.approve(&h.signers[0], &42);
@@ -251,6 +269,20 @@ fn revoke_emits_a_revoked_event() {
     let events = h.env.events().all();
     let (contract_id, _topics, _data) = events.last().unwrap();
     assert_eq!(contract_id, h.client.address);
+}
+
+#[test]
+fn revoked_event_topics_carry_the_signer_and_action_id() {
+    let h = setup();
+    h.client.approve(&h.signers[1], &7);
+    h.client.revoke(&h.signers[1], &7);
+
+    let events = h.env.events().all();
+    let (_, topics, _data) = events.last().unwrap();
+    let signer = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    let action_id = u64::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
+    assert_eq!(signer, h.signers[1]);
+    assert_eq!(action_id, 7);
 }
 
 #[test]
