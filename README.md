@@ -32,23 +32,29 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   a single `admin: Address` as its sole point of control. A fixed
   signer set and threshold, `is_approved(action_id)` that flips true
   once enough signers have approved — `action_id` is never interpreted
-  by this contract, only counted. Not wired into any of the other three
-  yet; see "Known gaps" below.
+  by this contract, only counted. `options_market::pause_via_multisig`/
+  `unpause_via_multisig` cross-call a live Multisig deployment as a
+  permissionless alternative to the original admin-gated
+  `pause`/`unpause` — the only place this is wired in so far; see
+  "Known gaps" below.
 
 ## Building and testing
 
 Each crate is standalone (no workspace `Cargo.toml`), but **build order
-matters for options_market**: it cross-calls price_oracle via
-soroban-sdk's `contractimport!` against price_oracle's *compiled wasm*
-(not a normal source dependency — that would link price_oracle's own
+matters for options_market**: it cross-calls BOTH price_oracle and
+multisig via soroban-sdk's `contractimport!` against their *compiled
+wasm* (not a normal source dependency — that would link their own
 contract functions into options_market's wasm and collide with
 options_market's functions of the same name, like
-`pause`/`transfer_admin`). That means price_oracle's wasm has to exist
+`pause`/`transfer_admin`). That means both wasm files have to exist
 before options_market can be compiled at all, even natively:
 
 ```sh
 cd price_oracle
 cargo build --target wasm32-unknown-unknown --release   # do this FIRST
+
+cd ../multisig
+cargo build --target wasm32-unknown-unknown --release   # and this, also FIRST
 
 cd ../options_market   # now this crate can build/test/etc.
 cargo build                                   # native build, fast iteration
@@ -58,11 +64,11 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
-price_oracle, vault, and multisig have no such dependency and can each
-be built/tested with the same five commands independently, in any
-order.
+price_oracle, vault, and multisig have no such dependency THEMSELVES
+and can each be built/tested with the same five commands independently,
+in any order.
 
-CI (`.github/workflows/ci.yml`) builds price_oracle's wasm first
+CI (`.github/workflows/ci.yml`) builds both dependency wasms first
 whenever a job is about to touch options_market, then runs the same
 four checks against every push and PR, for all four crates.
 
@@ -114,6 +120,7 @@ documented per field.
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
 | `set_fee_rate(new_bps)` | Sets the protocol fee (basis points). Capped at `MAX_FEE_RATE_BPS` (1000 = 10%). |
 | `pause()` / `unpause()` | Emergency stop. Blocks `create_series`, `update_premium`, `buy_option`, `write_option`. Does **not** block `exercise`, `set_settlement_price`, or `reclaim_collateral` — a pause winds existing positions down, it doesn't trap funds. |
+| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `upgrade(new_wasm_hash)` | Swaps the contract's executable via Soroban's deployer, keeping the same address, ID, and storage. |
 | `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out. Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. |
 | `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. |
@@ -305,13 +312,14 @@ compromised signer can never add another compromised signer.
   (zero risk to the original flow's existing test coverage) but means
   there's no enforcement that a series *must* use the cross-contract
   path just because a `price_oracle` deployment exists.
-- **`multisig` isn't wired into anything.** options_market,
-  price_oracle, and vault each still use a bare `admin: Address` — one
-  key, not M-of-N. Wiring a Multisig in would mean each contract's
-  sensitive functions (`pause`, `transfer_admin`, `set_fee_rate`,
-  `upgrade`, `withdraw`, ...) calling `is_approved(action_id)` on a
-  deployed Multisig before honoring the call, with the caller
-  responsible for picking a stable `action_id` scheme (since this
-  contract never interprets what an id means). None of that exists
-  yet — `multisig` today is a correct, tested, but entirely standalone
-  primitive.
+- **`multisig` is wired into exactly one thing so far:
+  options_market's pause.** `pause_via_multisig`/`unpause_via_multisig`
+  are additive (the original admin-gated `pause`/`unpause` are
+  unchanged) and check `is_approved(action_id)` on a deployed Multisig
+  instead of a single signature. Every OTHER sensitive function across
+  all four contracts — `transfer_admin`, `set_fee_rate`, `upgrade`,
+  `withdraw`, price_oracle's and vault's own admin-gated calls — still
+  goes through a bare `admin: Address`, one key, not M-of-N. A caller
+  wiring more of these in is responsible for picking its own stable
+  `action_id` scheme per function, since Multisig never interprets what
+  an id means.
