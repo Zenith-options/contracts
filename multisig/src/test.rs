@@ -2,7 +2,7 @@
 
 use crate::{Multisig, MultisigClient};
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     vec, Address, Env, TryFromVal,
 };
 
@@ -31,6 +31,7 @@ fn setup<'a>() -> Harness<'a> {
             signers[2].clone(),
         ],
         &2,
+        &0, // no approval expiry
     );
 
     Harness {
@@ -56,7 +57,8 @@ fn initialize_sets_signers_and_threshold() {
 #[should_panic(expected = "Error(Contract, #1)")] // AlreadyInitialized
 fn initialize_twice_panics() {
     let h = setup();
-    h.client.initialize(&vec![&h.env, h.signers[0].clone()], &1);
+    h.client
+        .initialize(&vec![&h.env, h.signers[0].clone()], &1, &0);
 }
 
 #[test]
@@ -67,7 +69,7 @@ fn initialize_rejects_a_zero_threshold() {
     let signers = vec![&env, Address::generate(&env)];
     let contract_id = env.register_contract(None, Multisig);
     let client = MultisigClient::new(&env, &contract_id);
-    client.initialize(&signers, &0);
+    client.initialize(&signers, &0, &0);
 }
 
 #[test]
@@ -78,7 +80,7 @@ fn initialize_rejects_a_threshold_above_the_signer_count() {
     let signers = vec![&env, Address::generate(&env), Address::generate(&env)];
     let contract_id = env.register_contract(None, Multisig);
     let client = MultisigClient::new(&env, &contract_id);
-    client.initialize(&signers, &3);
+    client.initialize(&signers, &3, &0);
 }
 
 #[test]
@@ -90,7 +92,7 @@ fn initialize_rejects_a_duplicate_signer() {
     let signers = vec![&env, signer.clone(), signer];
     let contract_id = env.register_contract(None, Multisig);
     let client = MultisigClient::new(&env, &contract_id);
-    client.initialize(&signers, &1);
+    client.initialize(&signers, &1, &0);
 }
 
 // ─── approve / revoke / is_approved ────────────────────────────────────────
@@ -175,6 +177,119 @@ fn a_revoked_signer_can_approve_again() {
 fn revoke_rejects_a_signer_who_never_approved() {
     let h = setup();
     h.client.revoke(&h.signers[0], &42);
+}
+
+// ─── approval expiry ────────────────────────────────────────────────────────
+
+fn setup_with_ttl<'a>(ttl: u64) -> Harness<'a> {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let signers = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let contract_id = env.register_contract(None, Multisig);
+    let client = MultisigClient::new(&env, &contract_id);
+    client.initialize(
+        &vec![
+            &env,
+            signers[0].clone(),
+            signers[1].clone(),
+            signers[2].clone(),
+        ],
+        &2,
+        &ttl,
+    );
+
+    Harness {
+        env,
+        client,
+        signers,
+    }
+}
+
+#[test]
+fn zero_ttl_means_approvals_never_expire() {
+    let h = setup_with_ttl(0);
+    h.client.approve(&h.signers[0], &42);
+
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + 1_000_000_000);
+    assert!(h.client.has_approved(&42, &h.signers[0]));
+    assert_eq!(h.client.get_approval_count(&42), 1);
+}
+
+#[test]
+fn approval_older_than_ttl_stops_counting() {
+    let h = setup_with_ttl(3600);
+    h.client.approve(&h.signers[0], &42);
+    assert!(h.client.has_approved(&42, &h.signers[0]));
+
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + 3601);
+    assert!(!h.client.has_approved(&42, &h.signers[0]));
+    assert_eq!(h.client.get_approval_count(&42), 0);
+}
+
+#[test]
+fn is_approved_drops_once_enough_approvals_expire() {
+    let h = setup_with_ttl(3600);
+    h.client.approve(&h.signers[0], &42);
+    h.client.approve(&h.signers[1], &42);
+    assert!(h.client.is_approved(&42));
+
+    // signers[1] approves again later, refreshing only its own timestamp.
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + 1800);
+    h.client.revoke(&h.signers[1], &42);
+    h.client.approve(&h.signers[1], &42);
+
+    // Advance past signers[0]'s original approval but not signers[1]'s
+    // refreshed one.
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + 1900);
+    assert!(!h.client.has_approved(&42, &h.signers[0]));
+    assert!(h.client.has_approved(&42, &h.signers[1]));
+    assert_eq!(h.client.get_approval_count(&42), 1);
+    assert!(!h.client.is_approved(&42));
+}
+
+#[test]
+fn a_signer_can_reapprove_after_their_own_approval_expires() {
+    let h = setup_with_ttl(3600);
+    h.client.approve(&h.signers[0], &42);
+
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + 3601);
+    // Expired, not merely revoked — re-approving must not panic with
+    // AlreadyApproved.
+    h.client.approve(&h.signers[0], &42);
+    assert!(h.client.has_approved(&42, &h.signers[0]));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // NotYetApproved
+fn revoke_rejects_an_already_expired_approval() {
+    let h = setup_with_ttl(3600);
+    h.client.approve(&h.signers[0], &42);
+
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + 3601);
+    h.client.revoke(&h.signers[0], &42);
+}
+
+#[test]
+fn get_approval_ttl_returns_the_configured_value() {
+    let h = setup_with_ttl(7200);
+    assert_eq!(h.client.get_approval_ttl(), 7200);
 }
 
 // ─── reset ──────────────────────────────────────────────────────────────────
@@ -324,6 +439,7 @@ fn initialize_does_not_require_any_signers_authorization() {
             signers[2].clone(),
         ],
         &2,
+        &0,
     );
     assert_eq!(client.get_signer_count(), 3);
 }
@@ -350,6 +466,7 @@ fn approve_without_any_authorization_panics() {
             signers[2].clone(),
         ],
         &2,
+        &0,
     );
 
     client.approve(&signers[0], &42);

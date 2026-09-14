@@ -261,6 +261,79 @@ fn set_max_staleness_rejects_zero() {
     h.client.set_max_staleness(&0);
 }
 
+// ─── min_reports quorum ──────────────────────────────────────────────────────
+
+#[test]
+fn min_reports_defaults_to_one_and_is_configurable() {
+    let h = setup();
+    assert_eq!(h.client.get_min_reports(), 1);
+
+    h.client.set_min_reports(&3);
+    assert_eq!(h.client.get_min_reports(), 3);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")] // InvalidMinReports
+fn set_min_reports_rejects_zero() {
+    let h = setup();
+    h.client.set_min_reports(&0);
+}
+
+#[test]
+fn get_price_is_none_when_fresh_feeders_fall_short_of_the_quorum() {
+    let h = setup();
+    h.client.set_min_reports(&2);
+
+    let xlm = Symbol::new(&h.env, "XLM");
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    h.client.report_price(&feeder, &xlm, &1_200_000);
+
+    // Only 1 fresh report but the quorum requires 2 — get_price must not
+    // fall back to trusting that single feeder's price as the aggregate.
+    assert!(h.client.get_price(&xlm).is_none());
+}
+
+#[test]
+fn get_price_returns_once_the_quorum_is_met() {
+    let h = setup();
+    h.client.set_min_reports(&2);
+
+    let xlm = Symbol::new(&h.env, "XLM");
+    let feeder_a = Address::generate(&h.env);
+    let feeder_b = Address::generate(&h.env);
+    h.client.add_feeder(&feeder_a);
+    h.client.add_feeder(&feeder_b);
+    h.client.report_price(&feeder_a, &xlm, &1_000_000);
+    assert!(h.client.get_price(&xlm).is_none());
+
+    h.client.report_price(&feeder_b, &xlm, &1_100_000);
+    assert!(h.client.get_price(&xlm).is_some());
+}
+
+#[test]
+fn a_feeder_going_stale_can_drop_below_the_quorum() {
+    let h = setup();
+    h.client.set_min_reports(&2);
+
+    let xlm = Symbol::new(&h.env, "XLM");
+    let feeder_a = Address::generate(&h.env);
+    let feeder_b = Address::generate(&h.env);
+    h.client.add_feeder(&feeder_a);
+    h.client.add_feeder(&feeder_b);
+    h.client.report_price(&feeder_a, &xlm, &1_000_000);
+    h.client.report_price(&feeder_b, &xlm, &1_100_000);
+    assert!(h.client.get_price(&xlm).is_some());
+
+    // feeder_a's report ages out; only feeder_b stays fresh, below quorum.
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + h.client.get_max_staleness() + 1);
+    h.client.report_price(&feeder_b, &xlm, &1_100_000);
+
+    assert!(h.client.get_price(&xlm).is_none());
+}
+
 // ─── transfer_admin ─────────────────────────────────────────────────────────
 
 #[test]
@@ -396,6 +469,16 @@ fn set_max_staleness_emits_a_max_staleness_updated_event_with_the_new_value() {
 }
 
 #[test]
+fn set_min_reports_emits_a_min_reports_updated_event_with_the_new_value() {
+    let h = setup();
+    h.client.set_min_reports(&3);
+
+    let events = h.env.events().all();
+    let (_, _topics, data) = events.last().unwrap();
+    assert_eq!(u32::try_from_val(&h.env, &data).unwrap(), 3);
+}
+
+#[test]
 fn pause_and_unpause_each_emit_their_own_event() {
     let h = setup();
     let events_before = h.env.events().all().len();
@@ -427,6 +510,7 @@ fn setup_multisig(h: &Harness) -> (Address, [Address; 3]) {
             signers[2].clone()
         ],
         &2,
+        &0,
     );
     (contract_id, signers)
 }
@@ -550,6 +634,46 @@ fn set_max_staleness_via_multisig_still_rejects_zero_once_approved() {
 
     h.client
         .set_max_staleness_via_multisig(&multisig_id, &action_id, &0);
+}
+
+#[test]
+fn set_min_reports_via_multisig_applies_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 6u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client
+        .set_min_reports_via_multisig(&multisig_id, &action_id, &3);
+    assert_eq!(h.client.get_min_reports(), 3);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // Unauthorized
+fn set_min_reports_via_multisig_rejects_when_not_yet_approved() {
+    let h = setup();
+    let (multisig_id, _signers) = setup_multisig(&h);
+
+    h.client
+        .set_min_reports_via_multisig(&multisig_id, &99u64, &3);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")] // InvalidMinReports
+fn set_min_reports_via_multisig_still_rejects_zero_once_approved() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+
+    let action_id = 7u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    h.client
+        .set_min_reports_via_multisig(&multisig_id, &action_id, &0);
 }
 
 // ─── cross-contract: add_feeder_via_multisig / remove_feeder_via_multisig ──

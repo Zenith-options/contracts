@@ -20,6 +20,11 @@ pub fn max_staleness_updated(env: &Env, new_staleness: u64) {
         .publish((Symbol::new(env, "max_staleness_updated"),), new_staleness);
 }
 
+pub fn min_reports_updated(env: &Env, new_min_reports: u32) {
+    env.events()
+        .publish((Symbol::new(env, "min_reports_updated"),), new_min_reports);
+}
+
 pub fn feeder_added(env: &Env, feeder: Address) {
     env.events()
         .publish((Symbol::new(env, "feeder_added"),), feeder);

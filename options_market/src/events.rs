@@ -105,3 +105,10 @@ pub fn fee_rate_updated(env: &Env, new_bps: i128) {
     env.events()
         .publish((Symbol::new(env, "fee_rate_updated"),), new_bps);
 }
+
+pub fn series_escrowed_to_vault(env: &Env, series_id: u64, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "series_escrowed_to_vault"), series_id),
+        amount,
+    );
+}

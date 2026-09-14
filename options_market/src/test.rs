@@ -7,6 +7,7 @@ use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
     token, Address, BytesN, Env, Symbol, TryFromVal,
 };
+use vault::{Vault, VaultClient};
 
 const USDC_DECIMALS: i128 = 10_000_000; // matches PRICE_PRECISION
 
@@ -483,6 +484,106 @@ fn exercise_twice_is_rejected() {
     h.client.exercise(&buyer, &pos_id);
 }
 
+// ─── exercise_batch ─────────────────────────────────────────────────────────
+
+#[test]
+fn exercise_batch_pays_out_every_position_in_the_list() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_a = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_b = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    let total = h
+        .client
+        .exercise_batch(&buyer, &soroban_sdk::vec![&h.env, pos_a, pos_b]);
+    // Intrinsic = 50 per position, two positions.
+    assert_eq!(total, 100_000_000);
+    assert_eq!(balance(&h, &buyer) - before, 100_000_000);
+
+    assert!(h.client.get_position(&pos_a).unwrap().is_exercised);
+    assert!(h.client.get_position(&pos_b).unwrap().is_exercised);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")] // InvalidBatchSize
+fn exercise_batch_rejects_an_empty_list() {
+    let h = setup();
+    let buyer = Address::generate(&h.env);
+    h.client.exercise_batch(&buyer, &soroban_sdk::vec![&h.env]);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")] // InvalidBatchSize
+fn exercise_batch_rejects_more_than_the_max_batch_size() {
+    let h = setup();
+    let buyer = Address::generate(&h.env);
+    let mut ids = soroban_sdk::vec![&h.env];
+    for i in 0..26u64 {
+        ids.push_back(i);
+    }
+    h.client.exercise_batch(&buyer, &ids);
+}
+
+#[test]
+fn exercise_batch_is_all_or_nothing() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let itm_pos = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let never_created_pos_id = 9_999u64;
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    let result = h.client.try_exercise_batch(
+        &buyer,
+        &soroban_sdk::vec![&h.env, itm_pos, never_created_pos_id],
+    );
+    assert!(result.is_err());
+
+    // The whole call aborted — the otherwise-valid ITM position in the
+    // same batch was never paid out or marked exercised.
+    assert_eq!(balance(&h, &buyer), before);
+    assert!(!h.client.get_position(&itm_pos).unwrap().is_exercised);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")] // Unauthorized
+fn exercise_batch_rejects_a_position_owned_by_someone_else() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    h.client
+        .exercise_batch(&stranger, &soroban_sdk::vec![&h.env, pos_id]);
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #5)")] // SeriesNotExpired
 fn set_settlement_price_before_expiry_is_rejected() {
@@ -582,6 +683,73 @@ fn reclaim_collateral_twice_is_rejected() {
     h.client.set_settlement_price(&series_id, &(650_000_000));
     h.client.reclaim_collateral(&writer, &pos_id);
     h.client.reclaim_collateral(&writer, &pos_id);
+}
+
+// ─── reclaim_batch ──────────────────────────────────────────────────────────
+
+#[test]
+fn reclaim_batch_pays_out_every_position_in_the_list() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, 2 * USDC_DECIMALS);
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 1_400_000_000);
+    let pos_a = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let pos_b = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000)); // ITM by 50 each
+
+    let before = balance(&h, &writer);
+    let total = h
+        .client
+        .reclaim_batch(&writer, &soroban_sdk::vec![&h.env, pos_a, pos_b]);
+    // (700 locked - 50 max loss) * 2 positions = 1300.
+    assert_eq!(total, 1_300_000_000);
+    assert_eq!(balance(&h, &writer) - before, 1_300_000_000);
+
+    assert!(h.client.get_position(&pos_a).unwrap().is_settled);
+    assert!(h.client.get_position(&pos_b).unwrap().is_settled);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")] // InvalidBatchSize
+fn reclaim_batch_rejects_an_empty_list() {
+    let h = setup();
+    let writer = Address::generate(&h.env);
+    h.client.reclaim_batch(&writer, &soroban_sdk::vec![&h.env]);
+}
+
+#[test]
+fn reclaim_batch_is_all_or_nothing() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let valid_pos = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let never_created_pos_id = 9_999u64;
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM, full reclaim
+
+    let before = balance(&h, &writer);
+    let result = h.client.try_reclaim_batch(
+        &writer,
+        &soroban_sdk::vec![&h.env, valid_pos, never_created_pos_id],
+    );
+    assert!(result.is_err());
+
+    assert_eq!(balance(&h, &writer), before);
+    assert!(!h.client.get_position(&valid_pos).unwrap().is_settled);
 }
 
 // ─── update_premium ─────────────────────────────────────────────────────────
@@ -842,6 +1010,206 @@ fn cancel_series_rejects_an_already_cancelled_series() {
     h.client.cancel_series(&series_id);
 }
 
+// ─── cross-contract: escrow_series_to_vault / claim_refund_from_vault ──────
+
+/// Deploys a real vault contract in the SAME Env as the options market
+/// under test, with its OWN admin set to the options market's contract
+/// address — the precondition escrow_series_to_vault/claim_refund_from_-
+/// vault's doc comments require, so options_market's cross-contract
+/// deposit()/withdraw() calls satisfy vault's own auth checks the same
+/// way any contract-to-contract call does (see vault's own docs).
+fn setup_vault(h: &Harness) -> Address {
+    let contract_id = h.env.register_contract(None, Vault);
+    let client = VaultClient::new(&h.env, &contract_id);
+    client.initialize(&h.client.address, &h.token);
+    contract_id
+}
+
+#[test]
+fn escrow_then_claim_refund_from_vault_pays_buyer_net_of_fee() {
+    let h = setup();
+    h.env.mock_all_auths_allowing_non_root_auth();
+    let vault_id = setup_vault(&h);
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.client.cancel_series(&series_id);
+    // 40_000_000 premium net of the 0.5% fee = 39_800_000 is this
+    // position's own refund-eligible principal.
+    assert_eq!(h.client.get_series_escrow(&series_id), 39_800_000);
+
+    h.client.escrow_series_to_vault(&vault_id, &series_id);
+    // Fully moved out of options_market's own accounting...
+    assert_eq!(h.client.get_series_escrow(&series_id), 0);
+    // ...and now sitting in the vault, tagged by series_id.
+    let vault_client = VaultClient::new(&h.env, &vault_id);
+    assert_eq!(vault_client.balance_of(&series_id), 39_800_000);
+
+    let before = balance(&h, &buyer);
+    h.client.claim_refund_from_vault(&vault_id, &buyer, &pos_id);
+    assert_eq!(balance(&h, &buyer) - before, 39_800_000);
+    assert_eq!(vault_client.balance_of(&series_id), 0);
+    assert!(h.client.get_position(&pos_id).unwrap().is_settled);
+}
+
+#[test]
+fn escrow_then_claim_refund_from_vault_pays_writer_full_collateral() {
+    let h = setup();
+    h.env.mock_all_auths_allowing_non_root_auth();
+    let vault_id = setup_vault(&h);
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Funds the (contract-wide) premium pool from a DECOY series that
+    // never gets cancelled — using the series under test itself would
+    // inflate ITS OWN SeriesEscrow with a buyer position whose premium
+    // write_option immediately pays out to the writer, money that's
+    // genuinely gone by the time this series is cancelled. That's a
+    // real, pre-existing edge case in the pooled-premium design (see the
+    // README's "no order matching" gap) — orthogonal to what this test
+    // is actually checking, so it's sidestepped here rather than papered
+    // over.
+    let decoy_series_id = make_series(&h, OptionType::Call, 650_000_000, 40_000_000);
+    fund_premium_pool(&h, decoy_series_id, USDC_DECIMALS);
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    h.client.cancel_series(&series_id);
+    h.client.escrow_series_to_vault(&vault_id, &series_id);
+
+    let before = balance(&h, &writer);
+    h.client
+        .claim_refund_from_vault(&vault_id, &writer, &pos_id);
+    assert_eq!(balance(&h, &writer) - before, 700_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")] // SeriesNotCancelled
+fn escrow_series_to_vault_rejects_a_still_active_series() {
+    let h = setup();
+    h.env.mock_all_auths_allowing_non_root_auth();
+    let vault_id = setup_vault(&h);
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    h.client.escrow_series_to_vault(&vault_id, &series_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")] // NothingToEscrow
+fn escrow_series_to_vault_rejects_a_second_call() {
+    let h = setup();
+    h.env.mock_all_auths_allowing_non_root_auth();
+    let vault_id = setup_vault(&h);
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    h.client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.client.cancel_series(&series_id);
+    h.client.escrow_series_to_vault(&vault_id, &series_id);
+    h.client.escrow_series_to_vault(&vault_id, &series_id); // nothing left
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")] // NothingToEscrow
+fn escrow_series_to_vault_rejects_a_series_with_no_positions() {
+    let h = setup();
+    h.env.mock_all_auths_allowing_non_root_auth();
+    let vault_id = setup_vault(&h);
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    h.client.cancel_series(&series_id);
+    h.client.escrow_series_to_vault(&vault_id, &series_id);
+}
+
+/// The whole point of this integration: escrow_series_to_vault only ever
+/// moves what's genuinely still outstanding, even when some positions in
+/// the same series already claimed through the ORIGINAL claim_refund
+/// path (which pays directly from options_market's own balance) before
+/// escrow_series_to_vault ran. Without SeriesEscrow being debited by
+/// BOTH claim paths, this call would move the position ALREADY paid
+/// out's amount a second time, over-funding the vault out of OTHER
+/// series' shared balance.
+#[test]
+fn escrow_series_to_vault_only_moves_the_remaining_liability() {
+    let h = setup();
+    h.env.mock_all_auths_allowing_non_root_auth();
+    let vault_id = setup_vault(&h);
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer_a = Address::generate(&h.env);
+    let buyer_b = Address::generate(&h.env);
+    mint(&h, &buyer_a, 1_000 * USDC_DECIMALS);
+    mint(&h, &buyer_b, 1_000 * USDC_DECIMALS);
+    let pos_a = h
+        .client
+        .buy_option(&buyer_a, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let pos_b = h
+        .client
+        .buy_option(&buyer_b, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.client.cancel_series(&series_id);
+    // buyer_a claims through the original direct-transfer path first.
+    h.client.claim_refund(&buyer_a, &pos_a);
+    assert_eq!(h.client.get_series_escrow(&series_id), 39_800_000); // only pos_b left
+
+    h.client.escrow_series_to_vault(&vault_id, &series_id);
+    let vault_client = VaultClient::new(&h.env, &vault_id);
+    // Only buyer_b's still-outstanding refund moved — not double pos_a's.
+    assert_eq!(vault_client.balance_of(&series_id), 39_800_000);
+
+    let before = balance(&h, &buyer_b);
+    h.client
+        .claim_refund_from_vault(&vault_id, &buyer_b, &pos_b);
+    assert_eq!(balance(&h, &buyer_b) - before, 39_800_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")] // AlreadySettled
+fn claim_refund_from_vault_twice_is_rejected() {
+    let h = setup();
+    h.env.mock_all_auths_allowing_non_root_auth();
+    let vault_id = setup_vault(&h);
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.client.cancel_series(&series_id);
+    h.client.escrow_series_to_vault(&vault_id, &series_id);
+    h.client.claim_refund_from_vault(&vault_id, &buyer, &pos_id);
+    h.client.claim_refund_from_vault(&vault_id, &buyer, &pos_id);
+}
+
+#[test]
+fn series_escrowed_to_vault_event_carries_series_id_and_amount() {
+    let h = setup();
+    h.env.mock_all_auths_allowing_non_root_auth();
+    let vault_id = setup_vault(&h);
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    h.client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.client.cancel_series(&series_id);
+    h.client.escrow_series_to_vault(&vault_id, &series_id);
+
+    let events = h.env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    let event_series_id = u64::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(event_series_id, series_id);
+    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 39_800_000);
+}
+
 // ─── fee rate ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -1055,6 +1423,7 @@ fn setup_multisig(h: &Harness) -> (Address, [Address; 3]) {
             signers[2].clone()
         ],
         &2,
+        &0,
     );
     (contract_id, signers)
 }

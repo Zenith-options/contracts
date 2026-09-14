@@ -21,6 +21,14 @@ pub enum DataKey {
     FeeRateBps,
     SeriesCountForUnderlying(Symbol),
     PremiumPool,
+    /// Running total of refund-eligible principal still outstanding for
+    /// this series: every buy_option/write_option adds its position's own
+    /// refund amount (premium net of fee, or full collateral), every
+    /// claim_refund/claim_refund_from_vault subtracts what it actually
+    /// paid out. Read once by escrow_series_to_vault to size
+    /// exactly how much of options_market's own balance to quarantine
+    /// into vault for this series — see that function's doc comment.
+    SeriesEscrow(u64),
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────

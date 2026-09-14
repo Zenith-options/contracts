@@ -16,6 +16,11 @@ pub const MAX_FEE_RATE_BPS: i128 = 1_000; // 10% hard ceiling, even for the admi
 /// happens either.
 pub const MAX_SERIES_PER_UNDERLYING: u32 = 50;
 
+/// Caps how many position_ids exercise_batch/reclaim_batch will process in
+/// a single call, so a caller with a very large position count can't build
+/// a batch that blows through Soroban's per-call resource limits.
+pub const MAX_BATCH_SIZE: u32 = 25;
+
 /// Protocol fee on an amount, given a rate in basis points (1 bps = 0.01%).
 pub fn calc_fee(amount: i128, fee_rate_bps: i128) -> i128 {
     amount

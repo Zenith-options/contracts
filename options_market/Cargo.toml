@@ -29,6 +29,8 @@ soroban-sdk = { version = "21.0.0", features = ["testutils"] }
 price_oracle = { package = "zenith-price-oracle", path = "../price_oracle", features = ["testutils"] }
 # Same reasoning as price_oracle above, for src/multisig_client.rs.
 multisig = { package = "zenith-multisig", path = "../multisig", features = ["testutils"] }
+# Same reasoning as price_oracle above, for src/vault_client.rs.
+vault = { package = "zenith-vault", path = "../vault", features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]

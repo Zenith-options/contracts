@@ -20,11 +20,13 @@ mod multisig_client;
 mod price_oracle_client;
 mod storage;
 mod types;
+mod vault_client;
 
 use error::Error;
 use math::{
-    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_FEE_RATE_BPS, MAX_SERIES_PER_UNDERLYING,
-    MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION, SETTLEMENT_WINDOW,
+    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_BATCH_SIZE, MAX_FEE_RATE_BPS,
+    MAX_SERIES_PER_UNDERLYING, MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION,
+    SETTLEMENT_WINDOW,
 };
 use storage::{
     add_user_position, fee_rate_bps, next_position_id, require_active_series, require_not_paused,
@@ -553,12 +555,148 @@ impl OptionsMarket {
             usdc.transfer(&env.current_contract_address(), &owner, &refund);
         }
 
+        Self::debit_series_escrow(&env, position.series_id, refund);
+
         position.is_settled = true;
         env.storage()
             .persistent()
             .set(&DataKey::Position(position_id), &position);
 
         events::refund_claimed(&env, owner, position_id, refund);
+    }
+
+    /// Moves a Cancelled series' entire remaining refund liability — every
+    /// not-yet-claimed position's own premium-net-of-fee or full
+    /// collateral, tracked incrementally in SeriesEscrow since this
+    /// series' first buy_option/write_option — out of options_market's
+    /// own undifferentiated token balance and into `vault`, tagged by
+    /// `series_id`. This is what actually closes the gap documented in
+    /// the README: today, a writer's collateral refund and a buyer's
+    /// premium refund both draw from the SAME shared contract balance
+    /// that every OTHER series' positions draw from too, so nothing stops
+    /// this series' claims from collectively drawing down funds that were
+    /// never this series' to begin with. Once quarantined here, vault's
+    /// own InsufficientEscrowBalance check enforces that claim_refund_-
+    /// from_vault against this tag can never pay out more than this
+    /// series specifically was ever owed — a real, provable bound instead
+    /// of an assumption about the shared pot happening to have enough.
+    ///
+    /// Permissionless — this only relocates the contract's OWN funds into
+    /// a vault it already trusts (the same "nothing external to vouch
+    /// for" reasoning as set_settlement_price_from_oracle), it doesn't
+    /// authorize paying out to anyone. Callable at most once per series:
+    /// SeriesEscrow is zeroed here, so a second call finds nothing left
+    /// to move and rejects with NothingToEscrow. Safe to call after some
+    /// positions already used the original claim_refund path — SeriesEscrow
+    /// is debited there too, so this only ever moves what's genuinely
+    /// still outstanding.
+    ///
+    /// Requires `vault` to have been deployed with its OWN admin set to
+    /// this contract's address — the same precondition every other
+    /// `_via_multisig`/vault-calling function here documents, since
+    /// that's what lets this cross-contract call satisfy vault's
+    /// `deposit`/`withdraw` auth checks without a human signature.
+    pub fn escrow_series_to_vault(env: Env, vault_contract: Address, series_id: u64) {
+        let series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+        if series.state != SeriesState::Cancelled {
+            panic_with_error!(&env, Error::SeriesNotCancelled);
+        }
+
+        let series_escrow_key = DataKey::SeriesEscrow(series_id);
+        let amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&series_escrow_key)
+            .unwrap_or(0);
+        if amount <= 0 {
+            panic_with_error!(&env, Error::NothingToEscrow);
+        }
+        env.storage().persistent().set(&series_escrow_key, &0i128);
+
+        let vault = vault_client::Client::new(&env, &vault_contract);
+        vault.deposit(&env.current_contract_address(), &series_id, &amount);
+
+        events::series_escrowed_to_vault(&env, series_id, amount);
+    }
+
+    /// Alternative to claim_refund for a Cancelled series whose refund
+    /// liability has been moved into `vault` via
+    /// escrow_series_to_vault: pays this position's own
+    /// refund out of vault's series_id-tagged escrow instead of
+    /// options_market's own balance. Same eligibility checks and same
+    /// refund formula as claim_refund — this only changes WHERE the
+    /// payout is funded from, not who's entitled to what.
+    pub fn claim_refund_from_vault(
+        env: Env,
+        vault_contract: Address,
+        owner: Address,
+        position_id: u64,
+    ) {
+        owner.require_auth();
+
+        let mut position: OptionPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+
+        if position.owner != owner {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if position.is_settled {
+            panic_with_error!(&env, Error::AlreadySettled);
+        }
+
+        let series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(position.series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Cancelled {
+            panic_with_error!(&env, Error::SeriesNotCancelled);
+        }
+
+        let refund = match position.side {
+            PositionSide::Long => position
+                .premium_paid
+                .checked_sub(position.fee_paid)
+                .unwrap(),
+            PositionSide::Short => position.collateral_locked,
+        };
+
+        if refund > 0 {
+            let vault = vault_client::Client::new(&env, &vault_contract);
+            vault.withdraw(&position.series_id, &owner, &refund);
+        }
+
+        Self::debit_series_escrow(&env, position.series_id, refund);
+
+        position.is_settled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(position_id), &position);
+
+        events::refund_claimed(&env, owner, position_id, refund);
+    }
+
+    fn debit_series_escrow(env: &Env, series_id: u64, amount: i128) {
+        let key = DataKey::SeriesEscrow(series_id);
+        let outstanding: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&key, &outstanding.checked_sub(amount).unwrap());
+    }
+
+    pub fn get_series_escrow(env: Env, series_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SeriesEscrow(series_id))
+            .unwrap_or(0)
     }
 
     // ── Buying Options (Long) ─────────────────────────────────────────────────
@@ -665,6 +803,20 @@ impl OptionsMarket {
         env.storage().instance().set(
             &DataKey::PremiumPool,
             &(pool.checked_add(premium_after_fee).unwrap()),
+        );
+
+        // Tracks this position's own refund-eligible principal against
+        // its series — see SeriesEscrow's doc comment and
+        // escrow_series_to_vault.
+        let series_escrow_key = DataKey::SeriesEscrow(series_id);
+        let series_escrow: i128 = env
+            .storage()
+            .persistent()
+            .get(&series_escrow_key)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &series_escrow_key,
+            &(series_escrow.checked_add(premium_after_fee).unwrap()),
         );
 
         events::option_bought(&env, buyer, pos_id, series_id, contracts, total_premium);
@@ -798,6 +950,17 @@ impl OptionsMarket {
             .persistent()
             .set(&DataKey::Series(series_id), &series);
 
+        let series_escrow_key = DataKey::SeriesEscrow(series_id);
+        let series_escrow: i128 = env
+            .storage()
+            .persistent()
+            .get(&series_escrow_key)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &series_escrow_key,
+            &(series_escrow.checked_add(required_collateral).unwrap()),
+        );
+
         events::option_written(
             &env,
             writer,
@@ -817,42 +980,85 @@ impl OptionsMarket {
     /// Settlement price must be set by oracle first
     pub fn exercise(env: Env, owner: Address, position_id: u64) {
         owner.require_auth();
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
+        let usdc = token::Client::new(&env, &collateral_token);
+        Self::exercise_one(&env, &owner, position_id, &usdc);
+    }
 
+    /// Same as exercise(), but for every position_id in one call — for an
+    /// owner with several long positions (e.g. bought into the same series
+    /// more than once) who'd otherwise need one transaction per position to
+    /// wind them all down. All-or-nothing, same as any other Soroban call:
+    /// if any single position_id in the batch fails exercise()'s own
+    /// checks (not in the money, already exercised, wrong owner, ...), the
+    /// whole batch aborts rather than silently skipping it. Capped at
+    /// MAX_BATCH_SIZE so the batch itself can't be sized to blow through
+    /// this call's resource budget. Returns the summed payout.
+    pub fn exercise_batch(env: Env, owner: Address, position_ids: Vec<u64>) -> i128 {
+        owner.require_auth();
+        if position_ids.is_empty() || position_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::InvalidBatchSize);
+        }
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
+        let usdc = token::Client::new(&env, &collateral_token);
+
+        let mut total_payout: i128 = 0;
+        for position_id in position_ids.iter() {
+            let payout = Self::exercise_one(&env, &owner, position_id, &usdc);
+            total_payout = total_payout.checked_add(payout).unwrap();
+        }
+        total_payout
+    }
+
+    /// Shared core of exercise()/exercise_batch(): validates one position,
+    /// pays out its intrinsic value, marks it exercised, and returns the
+    /// payout. Assumes `owner`'s authorization was already checked by the
+    /// caller — checking it once per batch, not once per position, is the
+    /// entire point of exercise_batch existing.
+    fn exercise_one(env: &Env, owner: &Address, position_id: u64, usdc: &token::Client) -> i128 {
         let mut position: OptionPosition = env
             .storage()
             .persistent()
             .get(&DataKey::Position(position_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, Error::PositionNotFound));
 
-        if position.owner != owner {
-            panic_with_error!(&env, Error::Unauthorized);
+        if position.owner != *owner {
+            panic_with_error!(env, Error::Unauthorized);
         }
         if position.side != PositionSide::Long {
-            panic_with_error!(&env, Error::WrongSide);
+            panic_with_error!(env, Error::WrongSide);
         }
         if position.is_exercised {
-            panic_with_error!(&env, Error::AlreadyExercised);
+            panic_with_error!(env, Error::AlreadyExercised);
         }
 
         let series: OptionSeries = env
             .storage()
             .persistent()
             .get(&DataKey::Series(position.series_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, Error::SeriesNotFound));
 
         let now = env.ledger().timestamp();
 
         // European: exercise only after expiry and within settlement window
         if now < series.expiry {
-            panic_with_error!(&env, Error::SeriesNotExpired);
+            panic_with_error!(env, Error::SeriesNotExpired);
         }
         if now > series.expiry + SETTLEMENT_WINDOW {
-            panic_with_error!(&env, Error::ExerciseWindowClosed);
+            panic_with_error!(env, Error::ExerciseWindowClosed);
         }
 
         let settlement_price = series
             .settlement_price
-            .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
+            .unwrap_or_else(|| panic_with_error!(env, Error::PriceNotSet));
 
         // Determine payout
         let payout = calc_payout(
@@ -863,24 +1069,19 @@ impl OptionsMarket {
         );
 
         if payout <= 0 {
-            panic_with_error!(&env, Error::NotInTheMoney);
+            panic_with_error!(env, Error::NotInTheMoney);
         }
 
         // Pay out to option holder
-        let collateral_token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::CollateralToken)
-            .unwrap();
-        let usdc = token::Client::new(&env, &collateral_token);
-        usdc.transfer(&env.current_contract_address(), &owner, &payout);
+        usdc.transfer(&env.current_contract_address(), owner, &payout);
 
         position.is_exercised = true;
         env.storage()
             .persistent()
             .set(&DataKey::Position(position_id), &position);
 
-        events::option_exercised(&env, owner, position_id, settlement_price, payout);
+        events::option_exercised(env, owner.clone(), position_id, settlement_price, payout);
+        payout
     }
 
     /// Oracle sets the settlement price for a series
@@ -950,36 +1151,70 @@ impl OptionsMarket {
     /// Writers reclaim unused collateral after settlement
     pub fn reclaim_collateral(env: Env, writer: Address, position_id: u64) {
         writer.require_auth();
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
+        let usdc = token::Client::new(&env, &collateral_token);
+        Self::reclaim_one(&env, &writer, position_id, &usdc);
+    }
 
+    /// Same as reclaim_collateral(), but for every position_id in one
+    /// call — same rationale and same all-or-nothing/MAX_BATCH_SIZE
+    /// contract as exercise_batch(). Returns the summed reclaim.
+    pub fn reclaim_batch(env: Env, writer: Address, position_ids: Vec<u64>) -> i128 {
+        writer.require_auth();
+        if position_ids.is_empty() || position_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::InvalidBatchSize);
+        }
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
+        let usdc = token::Client::new(&env, &collateral_token);
+
+        let mut total_reclaim: i128 = 0;
+        for position_id in position_ids.iter() {
+            let reclaim = Self::reclaim_one(&env, &writer, position_id, &usdc);
+            total_reclaim = total_reclaim.checked_add(reclaim).unwrap();
+        }
+        total_reclaim
+    }
+
+    /// Shared core of reclaim_collateral()/reclaim_batch(). Assumes
+    /// `writer`'s authorization was already checked once by the caller.
+    fn reclaim_one(env: &Env, writer: &Address, position_id: u64, usdc: &token::Client) -> i128 {
         let mut position: OptionPosition = env
             .storage()
             .persistent()
             .get(&DataKey::Position(position_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, Error::PositionNotFound));
 
-        if position.owner != writer {
-            panic_with_error!(&env, Error::Unauthorized);
+        if position.owner != *writer {
+            panic_with_error!(env, Error::Unauthorized);
         }
         if position.side != PositionSide::Short {
-            panic_with_error!(&env, Error::WrongSide);
+            panic_with_error!(env, Error::WrongSide);
         }
         if position.is_settled {
-            panic_with_error!(&env, Error::AlreadySettled);
+            panic_with_error!(env, Error::AlreadySettled);
         }
 
         let series: OptionSeries = env
             .storage()
             .persistent()
             .get(&DataKey::Series(position.series_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+            .unwrap_or_else(|| panic_with_error!(env, Error::SeriesNotFound));
 
         if series.state != SeriesState::Settled {
-            panic_with_error!(&env, Error::SeriesNotExpired);
+            panic_with_error!(env, Error::SeriesNotExpired);
         }
 
         let settlement_price = series
             .settlement_price
-            .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
+            .unwrap_or_else(|| panic_with_error!(env, Error::PriceNotSet));
 
         // Compute how much of collateral was consumed by exercised long positions
         let max_loss = calc_payout(
@@ -995,13 +1230,7 @@ impl OptionsMarket {
             .max(0);
 
         if reclaim > 0 {
-            let collateral_token: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::CollateralToken)
-                .unwrap();
-            let usdc = token::Client::new(&env, &collateral_token);
-            usdc.transfer(&env.current_contract_address(), &writer, &reclaim);
+            usdc.transfer(&env.current_contract_address(), writer, &reclaim);
         }
 
         position.is_settled = true;
@@ -1009,7 +1238,8 @@ impl OptionsMarket {
             .persistent()
             .set(&DataKey::Position(position_id), &position);
 
-        events::collateral_reclaimed(&env, writer, position_id, reclaim);
+        events::collateral_reclaimed(env, writer.clone(), position_id, reclaim);
+        reclaim
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
