@@ -23,6 +23,7 @@ use math::{median, MAX_FEEDERS};
 use types::DataKey;
 
 const DEFAULT_MAX_STALENESS: u64 = 3600; // 1 hour
+const DEFAULT_MIN_REPORTS: u32 = 1; // any single fresh report is enough, the original behavior
 
 fn require_not_paused(env: &Env) {
     let paused: bool = env
@@ -52,6 +53,9 @@ impl PriceOracle {
         env.storage()
             .instance()
             .set(&DataKey::MaxStaleness, &DEFAULT_MAX_STALENESS);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinReports, &DEFAULT_MIN_REPORTS);
     }
 
     /// Admin adjusts how old a feeder's report can be and still count
@@ -98,6 +102,50 @@ impl PriceOracle {
             .instance()
             .get(&DataKey::MaxStaleness)
             .unwrap()
+    }
+
+    /// Admin adjusts how many CURRENTLY-fresh feeder reports get_price
+    /// requires before it returns an aggregate at all. Without this,
+    /// get_price will happily return a "median" backed by a single fresh
+    /// report the moment every other feeder's report goes stale (or is
+    /// removed) — that one feeder then fully determines the price with
+    /// no averaging effect at all, defeating the point of aggregating
+    /// across multiple feeders in the first place.
+    pub fn set_min_reports(env: Env, count: u32) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        if count == 0 {
+            panic_with_error!(&env, Error::InvalidMinReports);
+        }
+        env.storage().instance().set(&DataKey::MinReports, &count);
+        events::min_reports_updated(&env, count);
+    }
+
+    /// Permissionless alternative to set_min_reports: cross-calls a
+    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// requiring the admin's own signature. Worth gating the same way as
+    /// set_max_staleness_via_multisig — a compromised admin lowering
+    /// min_reports back to 1 is a quiet way to make get_price trust a
+    /// single feeder again.
+    pub fn set_min_reports_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        count: u32,
+    ) {
+        let multisig = multisig_client::Client::new(&env, &multisig_contract);
+        if !multisig.is_approved(&action_id) {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if count == 0 {
+            panic_with_error!(&env, Error::InvalidMinReports);
+        }
+        env.storage().instance().set(&DataKey::MinReports, &count);
+        events::min_reports_updated(&env, count);
+    }
+
+    pub fn get_min_reports(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::MinReports).unwrap()
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -338,7 +386,8 @@ impl PriceOracle {
             }
         }
 
-        if count == 0 {
+        let min_reports: u32 = env.storage().instance().get(&DataKey::MinReports).unwrap();
+        if count == 0 || (count as u32) < min_reports {
             None
         } else {
             Some(median(&mut buffer, count))

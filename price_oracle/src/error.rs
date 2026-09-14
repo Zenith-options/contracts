@@ -13,4 +13,5 @@ pub enum Error {
     InvalidStaleness = 7,
     TooManyFeeders = 8,
     Unauthorized = 9,
+    InvalidMinReports = 10,
 }

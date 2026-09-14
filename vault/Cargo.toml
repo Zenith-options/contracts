@@ -5,7 +5,11 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# rlib alongside cdylib so other contracts (options_market) can depend on
+# this crate as a normal Rust library to get VaultClient's generated type
+# for cross-contract tests, while still building a deployable wasm cdylib
+# on its own — same pattern as price_oracle's Cargo.toml.
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 opt-level = "z"

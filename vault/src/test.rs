@@ -459,6 +459,7 @@ fn setup_multisig(h: &Harness) -> (Address, [Address; 3]) {
             signers[2].clone()
         ],
         &2,
+        &0,
     );
     (contract_id, signers)
 }

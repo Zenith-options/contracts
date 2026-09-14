@@ -26,4 +26,6 @@ pub enum Error {
     TooManySeriesForUnderlying = 20,
     InsufficientPremiumPool = 21,
     InvalidSeriesParams = 22,
+    InvalidBatchSize = 23,
+    NothingToEscrow = 24,
 }

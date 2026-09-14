@@ -50,7 +50,14 @@ impl Multisig {
     /// metadata, not a claim of consent; the actual security property
     /// (only real signers can approve) lives entirely in approve()'s
     /// own require_auth().
-    pub fn initialize(env: Env, signers: Vec<Address>, threshold: u32) {
+    /// `approval_ttl` is fixed here and immutable afterward, same as
+    /// `signers` and `threshold` — zero means approvals never expire
+    /// (the original, still-default behavior); a nonzero value means an
+    /// approval older than that many seconds stops counting toward
+    /// `is_approved`, so a vote cast for a long-abandoned action can't
+    /// silently still be sitting at threshold if that `action_id` is
+    /// ever reused.
+    pub fn initialize(env: Env, signers: Vec<Address>, threshold: u32, approval_ttl: u64) {
         if env.storage().instance().has(&DataKey::Signers) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
@@ -69,6 +76,9 @@ impl Multisig {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+        env.storage()
+            .instance()
+            .set(&DataKey::ApprovalTtl, &approval_ttl);
     }
 
     pub fn is_signer(env: Env, address: Address) -> bool {
@@ -85,8 +95,16 @@ impl Multisig {
         env.storage().instance().get(&DataKey::Threshold).unwrap()
     }
 
-    /// Records `signer`'s approval of `action_id`. Requires the signer's
-    /// own signature and current membership in the fixed signer set.
+    pub fn get_approval_ttl(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::ApprovalTtl).unwrap()
+    }
+
+    /// Records `signer`'s approval of `action_id`, stamped with the
+    /// current ledger timestamp. Requires the signer's own signature and
+    /// current membership in the fixed signer set. A signer whose
+    /// previous approval of this `action_id` has already expired is
+    /// treated the same as one who never approved — they can approve
+    /// again, which simply refreshes the timestamp.
     pub fn approve(env: Env, signer: Address, action_id: u64) {
         signer.require_auth();
 
@@ -95,61 +113,67 @@ impl Multisig {
             panic_with_error!(&env, Error::NotASigner);
         }
 
-        let approval_key = DataKey::Approval(action_id, signer.clone());
-        if env
-            .storage()
-            .persistent()
-            .get(&approval_key)
-            .unwrap_or(false)
-        {
+        if Self::has_approved(env.clone(), action_id, signer.clone()) {
             panic_with_error!(&env, Error::AlreadyApproved);
         }
-        env.storage().persistent().set(&approval_key, &true);
-
-        let count_key = DataKey::ApprovalCount(action_id);
-        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&count_key, &count.checked_add(1).unwrap());
+        env.storage().persistent().set(
+            &DataKey::Approval(action_id, signer.clone()),
+            &env.ledger().timestamp(),
+        );
         events::approved(&env, signer, action_id);
     }
 
     /// Withdraws `signer`'s own approval of `action_id` — e.g. they
     /// approved before new information came in and want to reconsider.
+    /// An already-expired approval has nothing left to withdraw, so this
+    /// rejects it the same as a signer who never approved at all.
     pub fn revoke(env: Env, signer: Address, action_id: u64) {
         signer.require_auth();
 
-        let approval_key = DataKey::Approval(action_id, signer.clone());
-        if !env
-            .storage()
-            .persistent()
-            .get(&approval_key)
-            .unwrap_or(false)
-        {
+        if !Self::has_approved(env.clone(), action_id, signer.clone()) {
             panic_with_error!(&env, Error::NotYetApproved);
         }
-        env.storage().persistent().set(&approval_key, &false);
-
-        let count_key = DataKey::ApprovalCount(action_id);
-        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         env.storage()
             .persistent()
-            .set(&count_key, &count.saturating_sub(1));
+            .remove(&DataKey::Approval(action_id, signer.clone()));
         events::revoked(&env, signer, action_id);
     }
 
+    /// True only if `signer` approved `action_id` AND that approval
+    /// hasn't expired under `approval_ttl` (zero ttl = never expires).
     pub fn has_approved(env: Env, action_id: u64, signer: Address) -> bool {
-        env.storage()
+        let approved_at: Option<u64> = env
+            .storage()
             .persistent()
-            .get(&DataKey::Approval(action_id, signer))
-            .unwrap_or(false)
+            .get(&DataKey::Approval(action_id, signer));
+        let Some(approved_at) = approved_at else {
+            return false;
+        };
+        let ttl: u64 = env.storage().instance().get(&DataKey::ApprovalTtl).unwrap();
+        if ttl == 0 {
+            return true;
+        }
+        env.ledger()
+            .timestamp()
+            .checked_sub(approved_at)
+            .unwrap_or(u64::MAX)
+            <= ttl
     }
 
+    /// Counts only currently-unexpired approvals — recomputed by
+    /// checking every signer's own freshness rather than an incremental
+    /// counter, since an approval can go stale purely from time passing,
+    /// with no revoke() transaction to update a counter at the moment it
+    /// happens.
     pub fn get_approval_count(env: Env, action_id: u64) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ApprovalCount(action_id))
-            .unwrap_or(0)
+        let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        let mut count = 0u32;
+        for signer in signers.iter() {
+            if Self::has_approved(env.clone(), action_id, signer) {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub fn is_approved(env: Env, action_id: u64) -> bool {
@@ -176,11 +200,8 @@ impl Multisig {
         for signer in signers.iter() {
             env.storage()
                 .persistent()
-                .set(&DataKey::Approval(action_id, signer), &false);
+                .remove(&DataKey::Approval(action_id, signer));
         }
-        env.storage()
-            .persistent()
-            .set(&DataKey::ApprovalCount(action_id), &0u32);
         events::reset(&env, action_id);
     }
 }
