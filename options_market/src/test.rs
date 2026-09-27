@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use crate::error::Error;
 use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
 use multisig::{Multisig, MultisigClient};
 use price_oracle::{PriceOracle, PriceOracleClient};
@@ -359,6 +360,194 @@ fn write_option_succeeds_once_the_pool_partially_covers_it() {
 
     // The writer's premium exactly drained the pool the lone buyer funded.
     assert_eq!(h.client.get_premium_pool(), 0);
+}
+
+// ─── split_position (#52) ───────────────────────────────────────────────────
+
+fn buy(h: &Harness, series_id: u64, contracts: i128) -> (Address, u64) {
+    let buyer = Address::generate(&h.env);
+    mint(h, &buyer, 10_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &contracts, &(10_000 * USDC_DECIMALS));
+    (buyer, pos_id)
+}
+
+#[test]
+fn split_long_divides_every_field_and_preserves_totals() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 3 * USDC_DECIMALS);
+    let before = h.client.get_position(&pos_id).unwrap();
+    let escrow_before = h.client.get_series_escrow(&series_id);
+    let (_, oi_before, _) = h.client.get_stats();
+
+    let new_id = h.client.split_position(&buyer, &pos_id, &USDC_DECIMALS);
+    let orig = h.client.get_position(&pos_id).unwrap();
+    let new = h.client.get_position(&new_id).unwrap();
+
+    // 1 of 3 contracts: exactly a third of premium and fee.
+    assert_eq!(new.contracts, USDC_DECIMALS);
+    assert_eq!(new.premium_paid, 40_000_000);
+    assert_eq!(new.fee_paid, 200_000);
+    assert_eq!(orig.contracts, 2 * USDC_DECIMALS);
+    assert_eq!(orig.premium_paid, 80_000_000);
+    assert_eq!(orig.fee_paid, 400_000);
+
+    assert_eq!(new.series_id, before.series_id);
+    assert!(new.side == PositionSide::Long);
+    assert_eq!(new.owner, buyer);
+    assert_eq!(new.opened_at, before.opened_at);
+    assert!(h.client.get_user_positions(&buyer).contains(new_id));
+
+    // Nothing series-level moved.
+    assert_eq!(h.client.get_series_escrow(&series_id), escrow_before);
+    let (_, oi_after, _) = h.client.get_stats();
+    assert_eq!(oi_after, oi_before);
+    assert_eq!(
+        h.client.get_series(&series_id).unwrap().open_interest,
+        3 * USDC_DECIMALS
+    );
+}
+
+#[test]
+fn uneven_split_rounds_down_and_leaves_the_remainder_in_the_original() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Put, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, 3 * USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    let required = 3 * 700_000_000 * 11 / 10;
+    mint(&h, &writer, required);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &(3 * USDC_DECIMALS), &required);
+    let before = h.client.get_position(&pos_id).unwrap();
+
+    let split = 7; // 7 base units of a 30_000_000-unit position
+    let new_id = h.client.split_position(&writer, &pos_id, &split);
+    let orig = h.client.get_position(&pos_id).unwrap();
+    let new = h.client.get_position(&new_id).unwrap();
+
+    let floor = |x: i128| x * split / before.contracts;
+    assert_eq!(new.collateral_locked, floor(before.collateral_locked));
+    assert_eq!(new.premium_paid, floor(before.premium_paid));
+    assert_eq!(
+        orig.collateral_locked + new.collateral_locked,
+        before.collateral_locked
+    );
+    assert_eq!(orig.premium_paid + new.premium_paid, before.premium_paid);
+    assert_eq!(orig.fee_paid + new.fee_paid, before.fee_paid);
+    assert_eq!(orig.contracts + new.contracts, before.contracts);
+}
+
+#[test]
+fn split_halves_refund_the_same_total_on_cancellation() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    let new_id = h.client.split_position(&buyer, &pos_id, &USDC_DECIMALS);
+
+    h.client.cancel_series(&series_id);
+    let before = balance(&h, &buyer);
+    h.client.claim_refund(&buyer, &pos_id);
+    h.client.claim_refund(&buyer, &new_id);
+
+    // Unsplit refund: 80 USDC premium net of the 0.5% fee.
+    assert_eq!(balance(&h, &buyer) - before, 80_000_000 - 400_000);
+    assert_eq!(h.client.get_series_escrow(&series_id), 0);
+}
+
+#[test]
+fn split_halves_exercise_for_the_full_intrinsic_value() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    let new_id = h.client.split_position(&buyer, &pos_id, &USDC_DECIMALS);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &pos_id);
+    h.client.exercise(&buyer, &new_id);
+    // (750 - 700) * 2 contracts.
+    assert_eq!(balance(&h, &buyer) - before, 100_000_000);
+}
+
+#[test]
+fn split_rejects_amounts_outside_the_open_range() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    for bad in [0, -1, 2 * USDC_DECIMALS, 3 * USDC_DECIMALS] {
+        assert_eq!(
+            h.client.try_split_position(&buyer, &pos_id, &bad),
+            Err(Ok(Error::InvalidSplitAmount.into())),
+            "split of {bad} should be rejected"
+        );
+    }
+    assert_eq!(
+        h.client.get_position(&pos_id).unwrap().contracts,
+        2 * USDC_DECIMALS
+    );
+}
+
+#[test]
+fn split_rejects_a_non_owner() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (_buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .try_split_position(&stranger, &pos_id, &USDC_DECIMALS),
+        Err(Ok(Error::Unauthorized.into()))
+    );
+}
+
+#[test]
+fn split_rejects_closed_positions() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, exercised) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    let (buyer2, still_open) = buy(&h, series_id, 2 * USDC_DECIMALS);
+
+    // Settled via refund on a cancelled series.
+    let other_series = make_series(&h, OptionType::Put, 700_000_000, 40_000_000);
+    let (buyer3, cancelled_pos) = buy(&h, other_series, 2 * USDC_DECIMALS);
+    h.client.cancel_series(&other_series);
+    h.client.claim_refund(&buyer3, &cancelled_pos);
+    assert_eq!(
+        h.client
+            .try_split_position(&buyer3, &cancelled_pos, &USDC_DECIMALS),
+        Err(Ok(Error::AlreadySettled.into()))
+    );
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+    h.client.exercise(&buyer, &exercised);
+    assert_eq!(
+        h.client
+            .try_split_position(&buyer, &exercised, &USDC_DECIMALS),
+        Err(Ok(Error::AlreadyExercised.into()))
+    );
+    // An unexercised position in the same expired series can still split.
+    h.client
+        .split_position(&buyer2, &still_open, &USDC_DECIMALS);
+}
+
+#[test]
+fn split_is_blocked_while_paused() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    h.client.pause();
+    assert_eq!(
+        h.client.try_split_position(&buyer, &pos_id, &USDC_DECIMALS),
+        Err(Ok(Error::ContractPaused.into()))
+    );
 }
 
 // ─── settlement + exercise ──────────────────────────────────────────────────

@@ -28,4 +28,7 @@ pub enum Error {
     InvalidSeriesParams = 22,
     InvalidBatchSize = 23,
     NothingToEscrow = 24,
+    // 25 and 26 are claimed by open PRs #140 (PremiumBelowMinimum) and #141
+    // (DuplicateSeries); skipped here so the codes never collide on merge.
+    InvalidSplitAmount = 27,
 }
