@@ -829,12 +829,18 @@ impl OptionsMarket {
     /// Write (sell) options — lock collateral, receive premium
     /// For calls: collateral = contracts × underlying price (covered call)
     /// For puts:  collateral = contracts × strike price × 110% (cash-secured put)
+    /// `min_premium` is slippage protection: the write fails with
+    /// `PremiumBelowMinimum` if the net premium the writer would receive
+    /// (after the protocol fee) is below it, so an `update_premium` cut or a
+    /// `set_fee_rate` increase ordered ahead of the write can't lock the
+    /// writer's collateral for less than they agreed to. Pass 0 to opt out.
     pub fn write_option(
         env: Env,
         writer: Address,
         series_id: u64,
         contracts: i128,
         collateral_amount: i128,
+        min_premium: i128,
     ) -> u64 {
         require_not_paused(&env);
         writer.require_auth();
@@ -909,6 +915,10 @@ impl OptionsMarket {
             .unwrap();
         let fee = calc_fee(total_premium, fee_rate_bps(&env));
         let writer_premium = total_premium - fee;
+
+        if writer_premium < min_premium {
+            panic_with_error!(&env, Error::PremiumBelowMinimum);
+        }
 
         let pool: i128 = env
             .storage()
