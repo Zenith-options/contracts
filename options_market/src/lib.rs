@@ -29,7 +29,8 @@ use math::{
     SETTLEMENT_WINDOW,
 };
 use storage::{
-    add_user_position, fee_rate_bps, next_position_id, require_active_series, require_not_paused,
+    add_user_position, claim_series_index, fee_rate_bps, next_position_id, require_active_series,
+    require_not_paused,
 };
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
 
@@ -269,6 +270,14 @@ impl OptionsMarket {
             .get(&DataKey::SeriesCounter)
             .unwrap();
         let series_id = counter.checked_add(1).unwrap();
+        claim_series_index(
+            &env,
+            &underlying,
+            &option_type,
+            strike_price,
+            expiry,
+            series_id,
+        );
 
         let series = OptionSeries {
             series_id,
@@ -347,6 +356,14 @@ impl OptionsMarket {
             .get(&DataKey::SeriesCounter)
             .unwrap();
         let series_id = counter.checked_add(1).unwrap();
+        claim_series_index(
+            &env,
+            &underlying,
+            &option_type,
+            strike_price,
+            expiry,
+            series_id,
+        );
 
         let series = OptionSeries {
             series_id,
@@ -1271,6 +1288,23 @@ impl OptionsMarket {
             .persistent()
             .get(&DataKey::SeriesCountForUnderlying(underlying))
             .unwrap_or(0)
+    }
+
+    /// Series id listed for this exact (underlying, option_type, strike,
+    /// expiry) spec, or `None` if no such series exists.
+    pub fn get_series_id(
+        env: Env,
+        underlying: Symbol,
+        option_type: OptionType,
+        strike_price: i128,
+        expiry: u64,
+    ) -> Option<u64> {
+        env.storage().persistent().get(&DataKey::SeriesIndex(
+            underlying,
+            option_type,
+            strike_price,
+            expiry,
+        ))
     }
 
     pub fn get_series(env: Env, series_id: u64) -> Option<OptionSeries> {

@@ -29,6 +29,10 @@ pub enum DataKey {
     /// exactly how much of options_market's own balance to quarantine
     /// into vault for this series — see that function's doc comment.
     SeriesEscrow(u64),
+    /// (underlying, option_type, strike_price, expiry) -> series_id. One
+    /// series per contract spec: create_series and its multisig variant
+    /// reject a second listing with DuplicateSeries.
+    SeriesIndex(Symbol, OptionType, i128, u64),
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────

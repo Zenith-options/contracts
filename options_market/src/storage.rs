@@ -1,7 +1,7 @@
-use soroban_sdk::{panic_with_error, Address, Env, Vec};
+use soroban_sdk::{panic_with_error, Address, Env, Symbol, Vec};
 
 use crate::error::Error;
-use crate::types::{DataKey, OptionSeries, SeriesState};
+use crate::types::{DataKey, OptionSeries, OptionType, SeriesState};
 
 pub fn fee_rate_bps(env: &Env) -> i128 {
     env.storage()
@@ -58,4 +58,29 @@ pub fn add_user_position(env: &Env, user: &Address, position_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     positions.push_back(position_id);
     env.storage().persistent().set(&key, &positions);
+}
+
+/// Reserve the (underlying, option_type, strike, expiry) spec for
+/// `series_id`, panicking with `DuplicateSeries` if a series with that exact
+/// spec was already listed. Shared by every series-creation path so the
+/// check can't drift between them. The reservation is permanent: a cancelled
+/// or settled series still owns its spec.
+pub fn claim_series_index(
+    env: &Env,
+    underlying: &Symbol,
+    option_type: &OptionType,
+    strike_price: i128,
+    expiry: u64,
+    series_id: u64,
+) {
+    let key = DataKey::SeriesIndex(
+        underlying.clone(),
+        option_type.clone(),
+        strike_price,
+        expiry,
+    );
+    if env.storage().persistent().has(&key) {
+        panic_with_error!(env, Error::DuplicateSeries);
+    }
+    env.storage().persistent().set(&key, &series_id);
 }
