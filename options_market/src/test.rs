@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use crate::error::Error;
 use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
 use multisig::{Multisig, MultisigClient};
 use price_oracle::{PriceOracle, PriceOracleClient};
@@ -359,6 +360,178 @@ fn write_option_succeeds_once_the_pool_partially_covers_it() {
 
     // The writer's premium exactly drained the pool the lone buyer funded.
     assert_eq!(h.client.get_premium_pool(), 0);
+}
+
+// ─── transfer_position (#51) ────────────────────────────────────────────────
+
+fn buy_one(h: &Harness, series_id: u64) -> (Address, u64) {
+    let buyer = Address::generate(&h.env);
+    mint(h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    (buyer, pos_id)
+}
+
+#[test]
+fn transferred_long_is_exercisable_only_by_the_new_owner() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (seller, pos_id) = buy_one(&h, series_id);
+    let buyer = Address::generate(&h.env);
+
+    h.client.transfer_position(&seller, &buyer, &pos_id);
+    assert_eq!(h.client.get_position(&pos_id).unwrap().owner, buyer);
+    assert!(!h.client.get_user_positions(&seller).contains(pos_id));
+    assert!(h.client.get_user_positions(&buyer).contains(pos_id));
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    assert_eq!(
+        h.client.try_exercise(&seller, &pos_id),
+        Err(Ok(Error::Unauthorized.into()))
+    );
+    let before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &pos_id);
+    assert_eq!(balance(&h, &buyer) - before, 50_000_000);
+}
+
+#[test]
+fn transferred_short_moves_the_collateral_reclaim_right() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+    let recipient = Address::generate(&h.env);
+
+    h.client.transfer_position(&writer, &recipient, &pos_id);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000)); // ITM by 50
+    assert_eq!(
+        h.client.try_reclaim_collateral(&writer, &pos_id),
+        Err(Ok(Error::Unauthorized.into()))
+    );
+    h.client.reclaim_collateral(&recipient, &pos_id);
+    // 700 locked - 50 max loss.
+    assert_eq!(balance(&h, &recipient), 650_000_000);
+}
+
+#[test]
+fn transferred_position_refunds_the_new_owner_on_cancellation() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (seller, pos_id) = buy_one(&h, series_id);
+    let buyer = Address::generate(&h.env);
+    h.client.transfer_position(&seller, &buyer, &pos_id);
+
+    h.client.cancel_series(&series_id);
+    h.client.claim_refund(&buyer, &pos_id);
+    // 40 USDC premium net of the 0.5% fee.
+    assert_eq!(balance(&h, &buyer), 40_000_000 - 200_000);
+}
+
+#[test]
+fn transfer_position_requires_the_owner() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (owner, pos_id) = buy_one(&h, series_id);
+    let stranger = Address::generate(&h.env);
+
+    assert_eq!(
+        h.client
+            .try_transfer_position(&stranger, &stranger, &pos_id),
+        Err(Ok(Error::Unauthorized.into()))
+    );
+
+    // Without the owner's signature the transfer fails.
+    h.env.set_auths(&[]);
+    assert!(h
+        .client
+        .try_transfer_position(&owner, &stranger, &pos_id)
+        .is_err());
+    assert_eq!(h.client.get_position(&pos_id).unwrap().owner, owner);
+}
+
+#[test]
+fn transfer_position_rejects_closed_positions() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (owner, exercised) = buy_one(&h, series_id);
+    let to = Address::generate(&h.env);
+
+    let other = make_series(&h, OptionType::Put, 700_000_000, 40_000_000);
+    let (owner2, refunded) = buy_one(&h, other);
+    h.client.cancel_series(&other);
+    h.client.claim_refund(&owner2, &refunded);
+    assert_eq!(
+        h.client.try_transfer_position(&owner2, &to, &refunded),
+        Err(Ok(Error::AlreadySettled.into()))
+    );
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+    h.client.exercise(&owner, &exercised);
+    assert_eq!(
+        h.client.try_transfer_position(&owner, &to, &exercised),
+        Err(Ok(Error::AlreadyExercised.into()))
+    );
+}
+
+#[test]
+fn transfer_to_self_is_a_no_op() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (owner, pos_id) = buy_one(&h, series_id);
+    h.client.transfer_position(&owner, &owner, &pos_id);
+    let positions = h.client.get_user_positions(&owner);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions.get(0), Some(pos_id));
+}
+
+#[test]
+fn transfer_position_is_blocked_while_paused() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (owner, pos_id) = buy_one(&h, series_id);
+    h.client.pause();
+    assert_eq!(
+        h.client
+            .try_transfer_position(&owner, &Address::generate(&h.env), &pos_id),
+        Err(Ok(Error::ContractPaused.into()))
+    );
+}
+
+#[test]
+fn position_transferred_event_carries_both_parties_and_the_position() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (from, pos_id) = buy_one(&h, series_id);
+    let to = Address::generate(&h.env);
+    h.client.transfer_position(&from, &to, &pos_id);
+
+    let events = h.env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        Symbol::try_from_val(&h.env, &topics.get(0).unwrap()).unwrap(),
+        Symbol::new(&h.env, "position_transferred")
+    );
+    assert_eq!(
+        Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap(),
+        from
+    );
+    assert_eq!(
+        Address::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap(),
+        to
+    );
+    assert_eq!(u64::try_from_val(&h.env, &data).unwrap(), pos_id);
 }
 
 // ─── settlement + exercise ──────────────────────────────────────────────────

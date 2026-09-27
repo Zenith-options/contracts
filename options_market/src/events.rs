@@ -101,6 +101,13 @@ pub fn refund_claimed(env: &Env, owner: Address, position_id: u64, amount: i128)
     );
 }
 
+pub fn position_transferred(env: &Env, from: Address, to: Address, position_id: u64) {
+    env.events().publish(
+        (Symbol::new(env, "position_transferred"), from, to),
+        position_id,
+    );
+}
+
 pub fn fee_rate_updated(env: &Env, new_bps: i128) {
     env.events()
         .publish((Symbol::new(env, "fee_rate_updated"),), new_bps);

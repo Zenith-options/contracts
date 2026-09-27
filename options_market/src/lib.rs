@@ -29,7 +29,8 @@ use math::{
     SETTLEMENT_WINDOW,
 };
 use storage::{
-    add_user_position, fee_rate_bps, next_position_id, require_active_series, require_not_paused,
+    add_user_position, fee_rate_bps, next_position_id, remove_user_position, require_active_series,
+    require_not_paused,
 };
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
 
@@ -972,6 +973,54 @@ impl OptionsMarket {
         );
 
         pos_id
+    }
+
+    // ── Position Transfer ─────────────────────────────────────────────────────
+
+    /// Transfer ownership of an open position from `from` to `to` (issue #51).
+    /// `from` must sign and own the position. Both parties' `UserPositions`
+    /// lists are updated, and the new owner inherits every right attached to
+    /// the position (exercise for longs, collateral reclaim and cancellation
+    /// refunds for either side).
+    ///
+    /// Shorts are transferable too: their collateral is fully locked in this
+    /// contract at write time, so the recipient receives only the right to
+    /// reclaim whatever collateral is left after settlement, not an unfunded
+    /// obligation.
+    ///
+    /// Fails with `Unauthorized` if `from` isn't the owner, and with
+    /// `AlreadyExercised` / `AlreadySettled` for a closed position. Blocked
+    /// while paused. Transferring to `from` itself is a no-op.
+    pub fn transfer_position(env: Env, from: Address, to: Address, position_id: u64) {
+        require_not_paused(&env);
+        from.require_auth();
+
+        let mut position: OptionPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+        if position.owner != from {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if position.is_exercised {
+            panic_with_error!(&env, Error::AlreadyExercised);
+        }
+        if position.is_settled {
+            panic_with_error!(&env, Error::AlreadySettled);
+        }
+        if to == from {
+            return;
+        }
+
+        position.owner = to.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(position_id), &position);
+        remove_user_position(&env, &from, position_id);
+        add_user_position(&env, &to, position_id);
+
+        events::position_transferred(&env, from, to, position_id);
     }
 
     // ── Exercise ──────────────────────────────────────────────────────────────

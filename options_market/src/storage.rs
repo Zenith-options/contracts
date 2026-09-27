@@ -49,6 +49,19 @@ pub fn next_position_id(env: &Env) -> u64 {
     next
 }
 
+pub fn remove_user_position(env: &Env, user: &Address, position_id: u64) {
+    let key = DataKey::UserPositions(user.clone());
+    let mut positions: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    if let Some(idx) = positions.first_index_of(position_id) {
+        positions.remove(idx);
+        env.storage().persistent().set(&key, &positions);
+    }
+}
+
 pub fn add_user_position(env: &Env, user: &Address, position_id: u64) {
     let key = DataKey::UserPositions(user.clone());
     let mut positions: Vec<u64> = env
