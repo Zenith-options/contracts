@@ -1,5 +1,6 @@
 #![cfg(test)]
 
+use crate::error::Error;
 use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
 use multisig::{Multisig, MultisigClient};
 use price_oracle::{PriceOracle, PriceOracleClient};
@@ -1331,6 +1332,91 @@ fn series_cap_is_tracked_independently_per_underlying() {
             .get_series_count_for_underlying(&Symbol::new(&h.env, "BTC")),
         1
     );
+}
+
+// ─── premium must be positive (#47) ─────────────────────────────────────────
+
+fn try_list_with_premium(h: &Harness, premium: i128) -> Result<u64, soroban_sdk::Error> {
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    h.client
+        .try_create_series(
+            &Symbol::new(&h.env, "XLM"),
+            &OptionType::Call,
+            &700_000_000,
+            &expiry,
+            &premium,
+            &450_000_000i128,
+        )
+        .map(|ok| ok.expect("series id converts"))
+        .map_err(|err| err.expect("contract error, not an invoke failure"))
+}
+
+fn approved_multisig(h: &Harness, action_id: u64) -> Address {
+    let (multisig_id, signers) = setup_multisig(h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+    multisig_id
+}
+
+#[test]
+fn create_series_rejects_a_zero_or_negative_premium() {
+    let h = setup();
+    for premium in [0, -1] {
+        assert_eq!(
+            try_list_with_premium(&h, premium),
+            Err(Error::InvalidSeriesParams.into()),
+            "premium {premium} should be rejected"
+        );
+    }
+    // The smallest positive premium is accepted.
+    assert!(try_list_with_premium(&h, 1).is_ok());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")] // InvalidSeriesParams
+fn create_series_via_multisig_rejects_a_zero_premium() {
+    let h = setup();
+    let multisig_id = approved_multisig(&h, 9);
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    h.client.create_series_via_multisig(
+        &multisig_id,
+        &9u64,
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &0,
+        &450_000_000,
+    );
+}
+
+#[test]
+fn update_premium_rejects_a_zero_or_negative_premium() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    for premium in [0, -1] {
+        assert_eq!(
+            h.client
+                .try_update_premium(&series_id, &premium, &450_000_000),
+            Err(Ok(Error::InvalidSeriesParams.into())),
+            "premium {premium} should be rejected"
+        );
+    }
+    assert_eq!(h.client.get_series(&series_id).unwrap().premium, 40_000_000);
+
+    h.client.update_premium(&series_id, &1, &450_000_000);
+    assert_eq!(h.client.get_series(&series_id).unwrap().premium, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #22)")] // InvalidSeriesParams
+fn update_premium_via_multisig_rejects_a_zero_premium() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let multisig_id = approved_multisig(&h, 9);
+    h.client
+        .update_premium_via_multisig(&multisig_id, &9u64, &series_id, &0, &450_000_000);
 }
 
 // ─── cross-contract: set_settlement_price_from_oracle ──────────────────────
