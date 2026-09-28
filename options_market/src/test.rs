@@ -7,7 +7,7 @@ use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
     token, Address, BytesN, Env, Symbol, TryFromVal,
 };
-use vault::{Vault, VaultClient};
+use vault::{Tag, Vault, VaultClient};
 
 const USDC_DECIMALS: i128 = 10_000_000; // matches PRICE_PRECISION
 
@@ -1013,16 +1013,25 @@ fn cancel_series_rejects_an_already_cancelled_series() {
 // ─── cross-contract: escrow_series_to_vault / claim_refund_from_vault ──────
 
 /// Deploys a real vault contract in the SAME Env as the options market
-/// under test, with its OWN admin set to the options market's contract
-/// address — the precondition escrow_series_to_vault/claim_refund_from_-
-/// vault's doc comments require, so options_market's cross-contract
-/// deposit()/withdraw() calls satisfy vault's own auth checks the same
-/// way any contract-to-contract call does (see vault's own docs).
+/// under test, with the options market registered as an integrator — the
+/// precondition escrow_series_to_vault/claim_refund_from_vault's doc
+/// comments require, so options_market owns its `(self, "series", id)`
+/// tags and its cross-contract deposit()/withdraw() calls satisfy vault's
+/// tag-owner auth checks the same way any contract-to-contract call does.
 fn setup_vault(h: &Harness) -> Address {
     let contract_id = h.env.register_contract(None, Vault);
     let client = VaultClient::new(&h.env, &contract_id);
-    client.initialize(&h.client.address, &h.token);
+    client.initialize(&Address::generate(&h.env), &h.token);
+    client.set_integrator(&h.client.address, &true);
     contract_id
+}
+
+fn series_tag(h: &Harness, series_id: u64) -> Tag {
+    Tag {
+        owner: h.client.address.clone(),
+        kind: Symbol::new(&h.env, "series"),
+        id: series_id,
+    }
 }
 
 #[test]
@@ -1048,12 +1057,18 @@ fn escrow_then_claim_refund_from_vault_pays_buyer_net_of_fee() {
     assert_eq!(h.client.get_series_escrow(&series_id), 0);
     // ...and now sitting in the vault, tagged by series_id.
     let vault_client = VaultClient::new(&h.env, &vault_id);
-    assert_eq!(vault_client.balance_of(&series_id), 39_800_000);
+    assert_eq!(
+        vault_client.balance_of(&h.token, &series_tag(&h, series_id)),
+        39_800_000
+    );
 
     let before = balance(&h, &buyer);
     h.client.claim_refund_from_vault(&vault_id, &buyer, &pos_id);
     assert_eq!(balance(&h, &buyer) - before, 39_800_000);
-    assert_eq!(vault_client.balance_of(&series_id), 0);
+    assert_eq!(
+        vault_client.balance_of(&h.token, &series_tag(&h, series_id)),
+        0
+    );
     assert!(h.client.get_position(&pos_id).unwrap().is_settled);
 }
 
@@ -1162,7 +1177,10 @@ fn escrow_series_to_vault_only_moves_the_remaining_liability() {
     h.client.escrow_series_to_vault(&vault_id, &series_id);
     let vault_client = VaultClient::new(&h.env, &vault_id);
     // Only buyer_b's still-outstanding refund moved — not double pos_a's.
-    assert_eq!(vault_client.balance_of(&series_id), 39_800_000);
+    assert_eq!(
+        vault_client.balance_of(&h.token, &series_tag(&h, series_id)),
+        39_800_000
+    );
 
     let before = balance(&h, &buyer_b);
     h.client

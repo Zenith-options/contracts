@@ -10,4 +10,7 @@ pub enum Error {
     ContractPaused = 4,
     NoUntaggedFunds = 5,
     Unauthorized = 6,
+    TokenNotAllowed = 7,
+    UnregisteredIntegrator = 8,
+    InsufficientVaultBalance = 9,
 }

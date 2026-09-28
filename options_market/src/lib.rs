@@ -591,11 +591,12 @@ impl OptionsMarket {
     /// is debited there too, so this only ever moves what's genuinely
     /// still outstanding.
     ///
-    /// Requires `vault` to have been deployed with its OWN admin set to
-    /// this contract's address — the same precondition every other
-    /// `_via_multisig`/vault-calling function here documents, since
-    /// that's what lets this cross-contract call satisfy vault's
-    /// `deposit`/`withdraw` auth checks without a human signature.
+    /// Requires `vault` to have this contract registered as an
+    /// integrator (so it can create its `(self, "series", id)` tag) and
+    /// the collateral token allowlisted. This contract then owns that
+    /// tag, which is what lets its cross-contract `deposit`/`withdraw`
+    /// calls satisfy vault's tag-owner auth checks without a human
+    /// signature.
     pub fn escrow_series_to_vault(env: Env, vault_contract: Address, series_id: u64) {
         let series: OptionSeries = env
             .storage()
@@ -617,8 +618,18 @@ impl OptionsMarket {
         }
         env.storage().persistent().set(&series_escrow_key, &0i128);
 
+        let token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
         let vault = vault_client::Client::new(&env, &vault_contract);
-        vault.deposit(&env.current_contract_address(), &series_id, &amount);
+        vault.deposit(
+            &env.current_contract_address(),
+            &token,
+            &vault_client::series_tag(&env, series_id),
+            &amount,
+        );
 
         events::series_escrowed_to_vault(&env, series_id, amount);
     }
@@ -670,8 +681,18 @@ impl OptionsMarket {
         };
 
         if refund > 0 {
+            let token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::CollateralToken)
+                .unwrap();
             let vault = vault_client::Client::new(&env, &vault_contract);
-            vault.withdraw(&position.series_id, &owner, &refund);
+            vault.withdraw(
+                &token,
+                &vault_client::series_tag(&env, position.series_id),
+                &owner,
+                &refund,
+            );
         }
 
         Self::debit_series_escrow(&env, position.series_id, refund);
