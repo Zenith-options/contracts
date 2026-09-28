@@ -29,6 +29,12 @@ pub enum DataKey {
     /// exactly how much of options_market's own balance to quarantine
     /// into vault for this series — see that function's doc comment.
     SeriesEscrow(u64),
+    /// Optional params registry (see ../params). When set, FeeRateBps and
+    /// SettlementWindow are cached copies of its values, refreshed only
+    /// when the registry's version moves past ParamsVersion.
+    ParamsRegistry,
+    ParamsVersion,
+    SettlementWindow,
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────

@@ -1732,39 +1732,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zenith-multisig"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
-]
-
-[[package]]
-name = "zenith-options-market"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
- "zenith-multisig",
- "zenith-params",
- "zenith-price-oracle",
- "zenith-vault",
-]
-
-[[package]]
-name = "zenith-params"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
-]
-
-[[package]]
-name = "zenith-price-oracle"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
-]
-
-[[package]]
-name = "zenith-vault"
+name = "zenith-grants-escrow"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
