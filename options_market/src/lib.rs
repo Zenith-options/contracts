@@ -24,14 +24,18 @@ mod vault_client;
 
 use error::Error;
 use math::{
-    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_BATCH_SIZE, MAX_FEE_RATE_BPS,
-    MAX_SERIES_PER_UNDERLYING, MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION,
-    SETTLEMENT_WINDOW,
+    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_BATCH_SIZE, MAX_FEE_RATE_BPS, MAX_PAGE_LIMIT,
+    MAX_PAGE_SCAN, MAX_SERIES_PER_UNDERLYING, MIN_COLLATERAL_RATIO, PRICE_PRECISION,
+    RATE_PRECISION, SETTLEMENT_WINDOW,
 };
 use storage::{
-    add_user_position, fee_rate_bps, next_position_id, require_active_series, require_not_paused,
+    add_series_to_underlying, add_user_position, fee_rate_bps, next_position_id,
+    require_active_series, require_not_paused,
 };
-use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
+use types::{
+    AccountSummary, DataKey, OptionPosition, OptionSeries, OptionType, PositionPage, PositionSide,
+    SeriesFilter, SeriesPage, SeriesState,
+};
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
@@ -101,7 +105,7 @@ impl OptionsMarket {
     pub fn set_fee_rate_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         new_bps: u32,
     ) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
@@ -137,7 +141,7 @@ impl OptionsMarket {
     pub fn transfer_admin_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         new_admin: Address,
     ) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
@@ -169,7 +173,7 @@ impl OptionsMarket {
     pub fn upgrade_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         new_wasm_hash: BytesN<32>,
     ) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
@@ -206,7 +210,7 @@ impl OptionsMarket {
     /// contract as everywhere Multisig is used: it's this caller's job to
     /// pick a stable id scheme, not Multisig's or options_market's to
     /// interpret one.
-    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: BytesN<32>) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -215,7 +219,7 @@ impl OptionsMarket {
         events::paused(&env);
     }
 
-    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: BytesN<32>) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -291,6 +295,8 @@ impl OptionsMarket {
             .instance()
             .set(&DataKey::SeriesCounter, &series_id);
 
+        add_series_to_underlying(&env, &series.underlying, series_id);
+
         events::series_created(&env, series_id, strike_price, expiry, premium);
 
         series_id
@@ -305,7 +311,7 @@ impl OptionsMarket {
     pub fn create_series_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         underlying: Symbol,
         option_type: OptionType,
         strike_price: i128,
@@ -369,6 +375,8 @@ impl OptionsMarket {
             .instance()
             .set(&DataKey::SeriesCounter, &series_id);
 
+        add_series_to_underlying(&env, &series.underlying, series_id);
+
         events::series_created(&env, series_id, strike_price, expiry, premium);
 
         series_id
@@ -406,7 +414,7 @@ impl OptionsMarket {
     pub fn update_premium_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         series_id: u64,
         new_premium: i128,
         new_implied_vol: i128,
@@ -473,7 +481,7 @@ impl OptionsMarket {
     pub fn cancel_series_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         series_id: u64,
     ) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
@@ -714,38 +722,58 @@ impl OptionsMarket {
         require_not_paused(&env);
         buyer.require_auth();
 
-        if contracts <= 0 {
-            panic_with_error!(&env, Error::ZeroContracts);
+        let (pos_id, total_premium, fee) =
+            Self::buy_one(&env, &buyer, series_id, contracts, max_premium);
+
+        // Premium goes to vault (covers writer payouts on exercise); fee to protocol
+        Self::collect_premium(&env, &buyer, total_premium, fee);
+
+        events::option_bought(&env, buyer, pos_id, series_id, contracts, total_premium);
+
+        pos_id
+    }
+
+    /// buy_option for several `(series_id, contracts, max_premium)` orders
+    /// at once — e.g. a strangle or a ladder — with ONE premium pull from
+    /// the buyer and ONE fee transfer for the whole batch. Each order goes
+    /// through exactly the same validation as buy_option (shared buy_one),
+    /// orders are applied in the given order (duplicate series allowed),
+    /// and it's all-or-nothing. Capped at MAX_BATCH_SIZE. Emits one
+    /// `bought` event per order, same as buy_option. Returns the new
+    /// position ids in order.
+    pub fn buy_batch(env: Env, buyer: Address, orders: Vec<(u64, i128, i128)>) -> Vec<u64> {
+        require_not_paused(&env);
+        buyer.require_auth();
+        if orders.is_empty() || orders.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::InvalidBatchSize);
         }
 
-        let mut series: OptionSeries = require_active_series(&env, series_id);
-
-        let total_premium = contracts
-            .checked_mul(series.premium)
-            .unwrap()
-            .checked_div(PRICE_PRECISION)
-            .unwrap();
-
-        if total_premium > max_premium {
-            panic_with_error!(&env, Error::InsufficientPremium);
+        let mut filled: Vec<(u64, u64, i128, i128)> = Vec::new(&env);
+        let mut total: i128 = 0;
+        let mut total_fee: i128 = 0;
+        for (series_id, contracts, max_premium) in orders.iter() {
+            let (pos_id, premium, fee) =
+                Self::buy_one(&env, &buyer, series_id, contracts, max_premium);
+            total = total.checked_add(premium).unwrap();
+            total_fee = total_fee.checked_add(fee).unwrap();
+            filled.push_back((pos_id, series_id, contracts, premium));
         }
 
-        // Collect premium
-        let collateral_token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::CollateralToken)
-            .unwrap();
-        let usdc = token::Client::new(&env, &collateral_token);
+        Self::collect_premium(&env, &buyer, total, total_fee);
 
-        // Protocol fee
-        let fee = calc_fee(total_premium, fee_rate_bps(&env));
-        let premium_after_fee = total_premium - fee;
+        let mut pos_ids = Vec::new(&env);
+        for (pos_id, series_id, contracts, premium) in filled.iter() {
+            events::option_bought(&env, buyer.clone(), pos_id, series_id, contracts, premium);
+            pos_ids.push_back(pos_id);
+        }
+        pos_ids
+    }
 
-        // Premium goes to vault (covers writer payouts on exercise)
-        usdc.transfer(&buyer, &env.current_contract_address(), &total_premium);
-
-        // Fee to protocol
+    /// Pulls `total_premium` from `buyer` and forwards `fee` of it to the
+    /// fee recipient.
+    fn collect_premium(env: &Env, buyer: &Address, total_premium: i128, fee: i128) {
+        let usdc = Self::usdc(env);
+        usdc.transfer(buyer, &env.current_contract_address(), &total_premium);
         if fee > 0 {
             let fee_recipient: Address = env
                 .storage()
@@ -754,9 +782,86 @@ impl OptionsMarket {
                 .unwrap();
             usdc.transfer(&env.current_contract_address(), &fee_recipient, &fee);
         }
+    }
+
+    fn require_page_limit(env: &Env, limit: u32) {
+        if limit == 0 || limit > MAX_PAGE_LIMIT {
+            panic_with_error!(env, Error::InvalidPageLimit);
+        }
+    }
+
+    fn indicative_value(env: &Env, position: &OptionPosition) -> i128 {
+        if position.is_exercised || position.is_settled {
+            return 0;
+        }
+        let Some(series) = env
+            .storage()
+            .persistent()
+            .get::<_, OptionSeries>(&DataKey::Series(position.series_id))
+        else {
+            return 0;
+        };
+        let price = series.settlement_price.or_else(|| {
+            env.storage()
+                .persistent()
+                .get(&DataKey::UnderlyingPrice(series.underlying.clone()))
+        });
+        let Some(price) = price else { return 0 };
+        let value = calc_payout(
+            &series.option_type,
+            series.strike_price,
+            price,
+            position.contracts,
+        );
+        match position.side {
+            PositionSide::Long => value,
+            PositionSide::Short => -value,
+        }
+    }
+
+    fn usdc(env: &Env) -> token::Client<'_> {
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
+        token::Client::new(env, &collateral_token)
+    }
+
+    /// Shared core of buy_option()/buy_batch(): validates one order and
+    /// records its position and accounting, without moving any tokens —
+    /// the caller settles the premium (and fee) in aggregate. Returns
+    /// (position_id, total_premium, fee). Assumes auth and pause were
+    /// already checked by the caller.
+    fn buy_one(
+        env: &Env,
+        buyer: &Address,
+        series_id: u64,
+        contracts: i128,
+        max_premium: i128,
+    ) -> (u64, i128, i128) {
+        if contracts <= 0 {
+            panic_with_error!(env, Error::ZeroContracts);
+        }
+
+        let mut series: OptionSeries = require_active_series(env, series_id);
+
+        let total_premium = contracts
+            .checked_mul(series.premium)
+            .unwrap()
+            .checked_div(PRICE_PRECISION)
+            .unwrap();
+
+        if total_premium > max_premium {
+            panic_with_error!(env, Error::InsufficientPremium);
+        }
+
+        // Protocol fee
+        let fee = calc_fee(total_premium, fee_rate_bps(env));
+        let premium_after_fee = total_premium - fee;
 
         // Create position
-        let pos_id = next_position_id(&env);
+        let pos_id = next_position_id(env);
         let position = OptionPosition {
             position_id: pos_id,
             series_id,
@@ -774,7 +879,7 @@ impl OptionsMarket {
         env.storage()
             .persistent()
             .set(&DataKey::Position(pos_id), &position);
-        add_user_position(&env, &buyer, pos_id);
+        add_user_position(env, buyer, pos_id);
 
         // Update OI
         series.open_interest = series.open_interest.checked_add(contracts).unwrap();
@@ -819,9 +924,7 @@ impl OptionsMarket {
             &(series_escrow.checked_add(premium_after_fee).unwrap()),
         );
 
-        events::option_bought(&env, buyer, pos_id, series_id, contracts, total_premium);
-
-        pos_id
+        (pos_id, total_premium, fee)
     }
 
     // ── Writing Options (Short / Covered) ─────────────────────────────────────
@@ -839,11 +942,93 @@ impl OptionsMarket {
         require_not_paused(&env);
         writer.require_auth();
 
-        if contracts <= 0 {
-            panic_with_error!(&env, Error::ZeroContracts);
+        let (pos_id, required_collateral, writer_premium) =
+            Self::write_one(&env, &writer, series_id, contracts, collateral_amount);
+
+        // Writer locks collateral, then receives premium from the pool
+        let usdc = Self::usdc(&env);
+        usdc.transfer(
+            &writer,
+            &env.current_contract_address(),
+            &required_collateral,
+        );
+        usdc.transfer(&env.current_contract_address(), &writer, &writer_premium);
+
+        events::option_written(
+            &env,
+            writer,
+            pos_id,
+            series_id,
+            contracts,
+            writer_premium,
+            required_collateral,
+        );
+
+        pos_id
+    }
+
+    /// write_option for several `(series_id, contracts, collateral_amount)`
+    /// orders at once, with ONE collateral pull and ONE premium payout for
+    /// the whole batch. Orders draw on the premium pool strictly in the
+    /// given order, each validated exactly as write_option does (shared
+    /// write_one); duplicate series allowed; all-or-nothing; capped at
+    /// MAX_BATCH_SIZE. Emits one `written` event per order. Returns the
+    /// new position ids in order.
+    pub fn write_batch(env: Env, writer: Address, orders: Vec<(u64, i128, i128)>) -> Vec<u64> {
+        require_not_paused(&env);
+        writer.require_auth();
+        if orders.is_empty() || orders.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, Error::InvalidBatchSize);
         }
 
-        let mut series: OptionSeries = require_active_series(&env, series_id);
+        let mut filled: Vec<(u64, u64, i128, i128, i128)> = Vec::new(&env);
+        let mut total_collateral: i128 = 0;
+        let mut total_premium: i128 = 0;
+        for (series_id, contracts, collateral_amount) in orders.iter() {
+            let (pos_id, collateral, premium) =
+                Self::write_one(&env, &writer, series_id, contracts, collateral_amount);
+            total_collateral = total_collateral.checked_add(collateral).unwrap();
+            total_premium = total_premium.checked_add(premium).unwrap();
+            filled.push_back((pos_id, series_id, contracts, premium, collateral));
+        }
+
+        let usdc = Self::usdc(&env);
+        usdc.transfer(&writer, &env.current_contract_address(), &total_collateral);
+        usdc.transfer(&env.current_contract_address(), &writer, &total_premium);
+
+        let mut pos_ids = Vec::new(&env);
+        for (pos_id, series_id, contracts, premium, collateral) in filled.iter() {
+            events::option_written(
+                &env,
+                writer.clone(),
+                pos_id,
+                series_id,
+                contracts,
+                premium,
+                collateral,
+            );
+            pos_ids.push_back(pos_id);
+        }
+        pos_ids
+    }
+
+    /// Shared core of write_option()/write_batch(): validates one order,
+    /// draws its premium from the pool, and records its position and
+    /// accounting, without moving any tokens. Returns (position_id,
+    /// required_collateral, writer_premium). Assumes auth and pause were
+    /// already checked by the caller.
+    fn write_one(
+        env: &Env,
+        writer: &Address,
+        series_id: u64,
+        contracts: i128,
+        collateral_amount: i128,
+    ) -> (u64, i128, i128) {
+        if contracts <= 0 {
+            panic_with_error!(env, Error::ZeroContracts);
+        }
+
+        let mut series: OptionSeries = require_active_series(env, series_id);
 
         // Required collateral depends on option type
         let required_collateral = match series.option_type {
@@ -876,22 +1061,8 @@ impl OptionsMarket {
         };
 
         if collateral_amount < required_collateral {
-            panic_with_error!(&env, Error::InsufficientCollateral);
+            panic_with_error!(env, Error::InsufficientCollateral);
         }
-
-        let collateral_token: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::CollateralToken)
-            .unwrap();
-        let usdc = token::Client::new(&env, &collateral_token);
-
-        // Writer locks collateral
-        usdc.transfer(
-            &writer,
-            &env.current_contract_address(),
-            &required_collateral,
-        );
 
         // Writer receives premium, drawn from the pool that buyers' premium
         // payments fund (see buy_option) — NOT from the vault's raw token
@@ -907,7 +1078,7 @@ impl OptionsMarket {
             .unwrap()
             .checked_div(PRICE_PRECISION)
             .unwrap();
-        let fee = calc_fee(total_premium, fee_rate_bps(&env));
+        let fee = calc_fee(total_premium, fee_rate_bps(env));
         let writer_premium = total_premium - fee;
 
         let pool: i128 = env
@@ -916,16 +1087,14 @@ impl OptionsMarket {
             .get(&DataKey::PremiumPool)
             .unwrap_or(0);
         if pool < writer_premium {
-            panic_with_error!(&env, Error::InsufficientPremiumPool);
+            panic_with_error!(env, Error::InsufficientPremiumPool);
         }
         env.storage().instance().set(
             &DataKey::PremiumPool,
             &(pool.checked_sub(writer_premium).unwrap()),
         );
 
-        usdc.transfer(&env.current_contract_address(), &writer, &writer_premium);
-
-        let pos_id = next_position_id(&env);
+        let pos_id = next_position_id(env);
         let position = OptionPosition {
             position_id: pos_id,
             series_id,
@@ -943,7 +1112,7 @@ impl OptionsMarket {
         env.storage()
             .persistent()
             .set(&DataKey::Position(pos_id), &position);
-        add_user_position(&env, &writer, pos_id);
+        add_user_position(env, writer, pos_id);
 
         series.open_interest = series.open_interest.checked_add(contracts).unwrap();
         env.storage()
@@ -961,17 +1130,7 @@ impl OptionsMarket {
             &(series_escrow.checked_add(required_collateral).unwrap()),
         );
 
-        events::option_written(
-            &env,
-            writer,
-            pos_id,
-            series_id,
-            contracts,
-            writer_premium,
-            required_collateral,
-        );
-
-        pos_id
+        (pos_id, required_collateral, writer_premium)
     }
 
     // ── Exercise ──────────────────────────────────────────────────────────────
@@ -1288,6 +1447,129 @@ impl OptionsMarket {
             .persistent()
             .get(&DataKey::UserPositions(user))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Up to `limit` (1..=MAX_PAGE_LIMIT) series with id > `cursor`
+    /// matching `filter`, in id order. Scans at most MAX_PAGE_SCAN ids per
+    /// call so a sparse filter can't blow the read budget — a page may
+    /// therefore come back short (even empty) with a nonzero
+    /// `next_cursor`; keep paging until it's 0. Series whose entry is
+    /// missing (e.g. archived) are skipped. `state` matches the stored
+    /// state, which stays `Active` past expiry until settled/cancelled.
+    pub fn get_series_page(env: Env, cursor: u64, limit: u32, filter: SeriesFilter) -> SeriesPage {
+        Self::require_page_limit(&env, limit);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SeriesCounter)
+            .unwrap_or(0);
+        let mut items = Vec::new(&env);
+        let mut id = cursor;
+        let mut scanned = 0u32;
+        while id < count && items.len() < limit && scanned < MAX_PAGE_SCAN {
+            id += 1;
+            scanned += 1;
+            let series: Option<OptionSeries> = env.storage().persistent().get(&DataKey::Series(id));
+            let Some(series) = series else { continue };
+            if (filter.state.is_empty() || filter.state.contains(&series.state))
+                && (filter.underlying.is_empty() || filter.underlying.contains(&series.underlying))
+                && (filter.option_type.is_empty()
+                    || filter.option_type.contains(&series.option_type))
+            {
+                items.push_back(series);
+            }
+        }
+        SeriesPage {
+            items,
+            next_cursor: if id < count { id } else { 0 },
+        }
+    }
+
+    /// Up to `limit` (1..=MAX_PAGE_LIMIT) of `user`'s positions starting
+    /// at index `cursor` of their position list, optionally only one
+    /// `side`. Same bounded-scan and skip-missing rules as
+    /// get_series_page.
+    pub fn get_user_positions_page(
+        env: Env,
+        user: Address,
+        cursor: u32,
+        limit: u32,
+        side: Option<PositionSide>,
+    ) -> PositionPage {
+        Self::require_page_limit(&env, limit);
+        let ids = Self::get_user_positions(env.clone(), user);
+        let mut items = Vec::new(&env);
+        let mut i = cursor;
+        let mut scanned = 0u32;
+        while i < ids.len() && items.len() < limit && scanned < MAX_PAGE_SCAN {
+            let position: Option<OptionPosition> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Position(ids.get(i).unwrap()));
+            i += 1;
+            scanned += 1;
+            let Some(position) = position else { continue };
+            if side.is_none() || side.as_ref() == Some(&position.side) {
+                items.push_back(position);
+            }
+        }
+        PositionPage {
+            items,
+            next_cursor: if i < ids.len() { i } else { 0 },
+        }
+    }
+
+    /// Every series id ever listed on `underlying`, oldest first. Bounded
+    /// by MAX_SERIES_PER_UNDERLYING.
+    pub fn get_series_by_underlying(env: Env, underlying: Symbol) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SeriesByUnderlying(underlying))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// INDICATIVE ONLY, never used for settlement: the position's
+    /// intrinsic value at the series' settlement price if set, else at the
+    /// last admin-set underlying price (0 if neither exists). Positive for
+    /// longs, negative (a liability) for shorts, 0 once exercised/settled.
+    pub fn get_position_value(env: Env, position_id: u64) -> i128 {
+        let position: OptionPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+        Self::indicative_value(&env, &position)
+    }
+
+    /// INDICATIVE ONLY — sums get_position_value over `user`'s open
+    /// positions, plus the collateral their open shorts still lock.
+    pub fn get_account_summary(env: Env, user: Address) -> AccountSummary {
+        let mut summary = AccountSummary {
+            open_positions: 0,
+            long_value: 0,
+            short_liability: 0,
+            collateral_locked: 0,
+            net_value: 0,
+        };
+        for id in Self::get_user_positions(env.clone(), user).iter() {
+            let position: Option<OptionPosition> =
+                env.storage().persistent().get(&DataKey::Position(id));
+            let Some(position) = position else { continue };
+            if position.is_exercised || position.is_settled {
+                continue;
+            }
+            summary.open_positions += 1;
+            let value = Self::indicative_value(&env, &position);
+            match position.side {
+                PositionSide::Long => summary.long_value += value,
+                PositionSide::Short => {
+                    summary.short_liability -= value;
+                    summary.collateral_locked += position.collateral_locked;
+                }
+            }
+        }
+        summary.net_value = summary.long_value - summary.short_liability;
+        summary
     }
 
     pub fn get_underlying_price(env: Env, underlying: Symbol) -> Option<i128> {

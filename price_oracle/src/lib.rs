@@ -7,7 +7,7 @@
 //! admin-authorized feeders report prices per symbol, and the aggregate
 //! (median across fresh reports) is what callers read.
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env, Symbol, Vec};
 
 #[cfg(test)]
 mod test;
@@ -81,7 +81,7 @@ impl PriceOracle {
     pub fn set_max_staleness_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         seconds: u64,
     ) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
@@ -130,7 +130,7 @@ impl PriceOracle {
     pub fn set_min_reports_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         count: u32,
     ) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
@@ -168,7 +168,7 @@ impl PriceOracle {
     pub fn transfer_admin_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         new_admin: Address,
     ) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
@@ -200,7 +200,7 @@ impl PriceOracle {
 
     /// Permissionless alternative to pause(), same rationale and pattern
     /// as options_market's pause_via_multisig.
-    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: BytesN<32>) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -209,7 +209,7 @@ impl PriceOracle {
         events::paused(&env);
     }
 
-    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: BytesN<32>) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -252,7 +252,7 @@ impl PriceOracle {
     pub fn add_feeder_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         feeder: Address,
     ) {
         require_not_paused(&env);
@@ -299,7 +299,7 @@ impl PriceOracle {
     pub fn remove_feeder_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         feeder: Address,
     ) {
         require_not_paused(&env);

@@ -1,4 +1,4 @@
-use soroban_sdk::{panic_with_error, Address, Env, Vec};
+use soroban_sdk::{panic_with_error, Address, Env, Symbol, Vec};
 
 use crate::error::Error;
 use crate::types::{DataKey, OptionSeries, SeriesState};
@@ -58,4 +58,15 @@ pub fn add_user_position(env: &Env, user: &Address, position_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     positions.push_back(position_id);
     env.storage().persistent().set(&key, &positions);
+}
+
+pub fn add_series_to_underlying(env: &Env, underlying: &Symbol, series_id: u64) {
+    let key = DataKey::SeriesByUnderlying(underlying.clone());
+    let mut ids: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    ids.push_back(series_id);
+    env.storage().persistent().set(&key, &ids);
 }

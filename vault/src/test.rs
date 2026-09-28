@@ -4,7 +4,7 @@ use crate::{Vault, VaultClient};
 use multisig::{Multisig, MultisigClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _},
-    token, Address, Env, TryFromVal,
+    token, Address, BytesN, Env, TryFromVal,
 };
 
 struct Harness<'a> {
@@ -470,7 +470,7 @@ fn pause_via_multisig_pauses_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 1u64;
+    let action_id = aid(&h.env, 1);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -486,9 +486,9 @@ fn pause_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    multisig_client.approve(&signers[0], &1u64); // only 1 of 3
+    multisig_client.approve(&signers[0], &aid(&h.env, 1)); // only 1 of 3
 
-    h.client.pause_via_multisig(&multisig_id, &1u64);
+    h.client.pause_via_multisig(&multisig_id, &aid(&h.env, 1));
 }
 
 #[test]
@@ -500,7 +500,7 @@ fn unpause_via_multisig_unpauses_once_approved() {
     h.client.pause();
     assert!(h.client.is_paused());
 
-    let action_id = 3u64;
+    let action_id = aid(&h.env, 3);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -515,7 +515,8 @@ fn unpause_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client.pause();
-    h.client.unpause_via_multisig(&multisig_id, &99u64);
+    h.client
+        .unpause_via_multisig(&multisig_id, &aid(&h.env, 99));
 }
 
 #[test]
@@ -524,7 +525,7 @@ fn transfer_admin_via_multisig_hands_off_control_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 2u64;
+    let action_id = aid(&h.env, 2);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -542,7 +543,7 @@ fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
     let new_admin = Address::generate(&h.env);
 
     h.client
-        .transfer_admin_via_multisig(&multisig_id, &99u64, &new_admin);
+        .transfer_admin_via_multisig(&multisig_id, &aid(&h.env, 99), &new_admin);
 }
 
 // ─── cross-contract: withdraw_via_multisig ─────────────────────────────────
@@ -556,7 +557,7 @@ fn withdraw_via_multisig_pays_out_once_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 4u64;
+    let action_id = aid(&h.env, 4);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -579,7 +580,7 @@ fn withdraw_via_multisig_rejects_when_not_yet_approved() {
 
     let payee = Address::generate(&h.env);
     h.client
-        .withdraw_via_multisig(&multisig_id, &99u64, &7, &payee, &150);
+        .withdraw_via_multisig(&multisig_id, &aid(&h.env, 99), &7, &payee, &150);
 }
 
 #[test]
@@ -592,7 +593,7 @@ fn withdraw_via_multisig_still_enforces_the_tags_own_balance_once_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 5u64;
+    let action_id = aid(&h.env, 5);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -614,7 +615,7 @@ fn transfer_tag_via_multisig_moves_escrow_once_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 6u64;
+    let action_id = aid(&h.env, 6);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -636,7 +637,7 @@ fn transfer_tag_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .transfer_tag_via_multisig(&multisig_id, &99u64, &1, &2, &150);
+        .transfer_tag_via_multisig(&multisig_id, &aid(&h.env, 99), &1, &2, &150);
 }
 
 // ─── cross-contract: sweep_untagged_via_multisig ───────────────────────────
@@ -652,7 +653,7 @@ fn sweep_untagged_via_multisig_recovers_once_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 7u64;
+    let action_id = aid(&h.env, 7);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -674,5 +675,9 @@ fn sweep_untagged_via_multisig_rejects_when_not_yet_approved() {
 
     let recovered_to = Address::generate(&h.env);
     h.client
-        .sweep_untagged_via_multisig(&multisig_id, &99u64, &recovered_to);
+        .sweep_untagged_via_multisig(&multisig_id, &aid(&h.env, 99), &recovered_to);
+}
+
+fn aid(env: &Env, n: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[n; 32])
 }

@@ -11,7 +11,7 @@
 //! 7" is always answerable instead of inferred from the token contract's
 //! raw balance.
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, BytesN, Env};
 
 #[cfg(test)]
 mod test;
@@ -71,7 +71,7 @@ impl Vault {
     pub fn transfer_admin_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         new_admin: Address,
     ) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
@@ -105,7 +105,7 @@ impl Vault {
 
     /// Permissionless alternative to pause(), same rationale and pattern
     /// as options_market's and price_oracle's pause_via_multisig.
-    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+    pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: BytesN<32>) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -114,7 +114,7 @@ impl Vault {
         events::paused(&env);
     }
 
-    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+    pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: BytesN<32>) {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -227,7 +227,7 @@ impl Vault {
     pub fn withdraw_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         tag: u64,
         to: Address,
         amount: i128,
@@ -310,7 +310,7 @@ impl Vault {
     pub fn transfer_tag_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         from_tag: u64,
         to_tag: u64,
         amount: i128,
@@ -403,7 +403,7 @@ impl Vault {
     pub fn sweep_untagged_via_multisig(
         env: Env,
         multisig_contract: Address,
-        action_id: u64,
+        action_id: BytesN<32>,
         to: Address,
     ) -> i128 {
         let multisig = multisig_client::Client::new(&env, &multisig_contract);

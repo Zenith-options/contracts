@@ -28,4 +28,5 @@ pub enum Error {
     InvalidSeriesParams = 22,
     InvalidBatchSize = 23,
     NothingToEscrow = 24,
+    InvalidPageLimit = 25,
 }

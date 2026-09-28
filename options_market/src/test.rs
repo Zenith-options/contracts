@@ -1,11 +1,15 @@
 #![cfg(test)]
+extern crate std;
 
-use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
+use crate::{
+    OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide, SeriesFilter,
+    SeriesState,
+};
 use multisig::{Multisig, MultisigClient};
 use price_oracle::{PriceOracle, PriceOracleClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
-    token, Address, BytesN, Env, Symbol, TryFromVal,
+    token, Address, BytesN, Env, IntoVal, Symbol, TryFromVal,
 };
 use vault::{Vault, VaultClient};
 
@@ -1434,7 +1438,7 @@ fn pause_via_multisig_pauses_once_the_action_is_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 1u64;
+    let action_id = aid(&h.env, 1);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id); // 2 of 3, reaches threshold
 
@@ -1451,9 +1455,9 @@ fn pause_via_multisig_rejects_when_not_yet_approved() {
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
     // Only 1 of 3 — below the 2-of-3 threshold.
-    multisig_client.approve(&signers[0], &1u64);
+    multisig_client.approve(&signers[0], &aid(&h.env, 1));
 
-    h.client.pause_via_multisig(&multisig_id, &1u64);
+    h.client.pause_via_multisig(&multisig_id, &aid(&h.env, 1));
 }
 
 #[test]
@@ -1464,7 +1468,7 @@ fn unpause_via_multisig_unpauses_once_the_action_is_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 2u64;
+    let action_id = aid(&h.env, 2);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -1480,7 +1484,8 @@ fn unpause_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     // No approvals at all for this action_id.
-    h.client.unpause_via_multisig(&multisig_id, &99u64);
+    h.client
+        .unpause_via_multisig(&multisig_id, &aid(&h.env, 99));
 }
 
 #[test]
@@ -1489,7 +1494,7 @@ fn transfer_admin_via_multisig_hands_off_control_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 3u64;
+    let action_id = aid(&h.env, 3);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -1507,11 +1512,11 @@ fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
     // Only 1 of 3.
-    multisig_client.approve(&signers[0], &4u64);
+    multisig_client.approve(&signers[0], &aid(&h.env, 4));
 
     let new_admin = Address::generate(&h.env);
     h.client
-        .transfer_admin_via_multisig(&multisig_id, &4u64, &new_admin);
+        .transfer_admin_via_multisig(&multisig_id, &aid(&h.env, 4), &new_admin);
 }
 
 // ─── cross-contract: set_fee_rate_via_multisig ─────────────────────────────
@@ -1522,7 +1527,7 @@ fn set_fee_rate_via_multisig_applies_once_the_action_is_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 5u64;
+    let action_id = aid(&h.env, 5);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -1538,7 +1543,7 @@ fn set_fee_rate_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .set_fee_rate_via_multisig(&multisig_id, &99u64, &100);
+        .set_fee_rate_via_multisig(&multisig_id, &aid(&h.env, 99), &100);
 }
 
 #[test]
@@ -1548,7 +1553,7 @@ fn set_fee_rate_via_multisig_still_enforces_the_ceiling_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 6u64;
+    let action_id = aid(&h.env, 6);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -1571,7 +1576,7 @@ fn cancel_series_via_multisig_cancels_once_the_action_is_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 7u64;
+    let action_id = aid(&h.env, 7);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
     h.client
@@ -1593,7 +1598,7 @@ fn cancel_series_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .cancel_series_via_multisig(&multisig_id, &99u64, &series_id);
+        .cancel_series_via_multisig(&multisig_id, &aid(&h.env, 99), &series_id);
 }
 
 // ─── cross-contract: upgrade_via_multisig ──────────────────────────────────
@@ -1611,7 +1616,7 @@ fn upgrade_via_multisig_reaches_the_host_deployer_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 8u64;
+    let action_id = aid(&h.env, 8);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -1628,7 +1633,7 @@ fn upgrade_via_multisig_rejects_when_not_yet_approved() {
 
     let bogus_hash = BytesN::from_array(&h.env, &[0u8; 32]);
     h.client
-        .upgrade_via_multisig(&multisig_id, &99u64, &bogus_hash);
+        .upgrade_via_multisig(&multisig_id, &aid(&h.env, 99), &bogus_hash);
 }
 
 // ─── cross-contract: create_series_via_multisig ────────────────────────────
@@ -1639,7 +1644,7 @@ fn create_series_via_multisig_lists_a_series_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 9u64;
+    let action_id = aid(&h.env, 9);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -1668,7 +1673,7 @@ fn create_series_via_multisig_rejects_when_not_yet_approved() {
 
     h.client.create_series_via_multisig(
         &multisig_id,
-        &99u64,
+        &aid(&h.env, 99),
         &Symbol::new(&h.env, "XLM"),
         &OptionType::Call,
         &700_000_000,
@@ -1685,7 +1690,7 @@ fn create_series_via_multisig_still_validates_params_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 10u64;
+    let action_id = aid(&h.env, 10);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -1712,7 +1717,7 @@ fn update_premium_via_multisig_updates_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 11u64;
+    let action_id = aid(&h.env, 11);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -1738,7 +1743,7 @@ fn update_premium_via_multisig_rejects_when_not_yet_approved() {
 
     h.client.update_premium_via_multisig(
         &multisig_id,
-        &99u64,
+        &aid(&h.env, 99),
         &series_id,
         &45_000_000,
         &500_000_000,
@@ -1933,4 +1938,589 @@ fn collateral_reclaimed_event_carries_position_and_amount() {
     let (event_pos_id, reclaim) = <(u64, i128)>::try_from_val(&h.env, &data).unwrap();
     assert_eq!(event_pos_id, pos_id);
     assert_eq!(reclaim, 700_000_000); // full collateral back, OTM means no payout owed
+}
+
+fn aid(env: &Env, n: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[n; 32])
+}
+
+// ─── batch buy / write ──────────────────────────────────────────────────────
+
+/// Events emitted since `since` (a prior `events().all().len()`).
+fn token_transfer_count(h: &Harness, since: u32) -> usize {
+    h.env
+        .events()
+        .all()
+        .iter()
+        .skip(since as usize)
+        .filter(|(contract, _, _)| *contract == h.token)
+        .count()
+}
+
+fn event_count(h: &Harness, since: u32, name: &str) -> usize {
+    let name = Symbol::new(&h.env, name);
+    h.env
+        .events()
+        .all()
+        .iter()
+        .skip(since as usize)
+        .filter(|(contract, topics, _)| {
+            *contract == h.client.address
+                && Symbol::try_from_val(&h.env, &topics.get(0).unwrap()).ok() == Some(name.clone())
+        })
+        .count()
+}
+
+fn assert_same_position(a: &crate::OptionPosition, b: &crate::OptionPosition) {
+    assert_eq!(a.series_id, b.series_id);
+    assert!(a.side == b.side);
+    assert_eq!(a.contracts, b.contracts);
+    assert_eq!(a.premium_paid, b.premium_paid);
+    assert_eq!(a.fee_paid, b.fee_paid);
+    assert_eq!(a.collateral_locked, b.collateral_locked);
+}
+
+#[test]
+fn buy_batch_matches_n_single_buys_with_one_pull_and_one_fee_transfer() {
+    let h = setup();
+    let s1 = make_series(&h, OptionType::Call, 1_000_000, 500_000);
+    let s2 = make_series(&h, OptionType::Put, 2_000_000, 300_000);
+    let max = 1_000 * USDC_DECIMALS;
+    // Duplicate series (s1 twice) is allowed.
+    let orders = soroban_sdk::vec![
+        &h.env,
+        (s1, 2 * USDC_DECIMALS, max),
+        (s2, 3 * USDC_DECIMALS, max),
+        (s1, USDC_DECIMALS, max),
+    ];
+
+    let single = Address::generate(&h.env);
+    mint(&h, &single, max);
+    let mut single_ids = std::vec::Vec::new();
+    for (s, c, m) in orders.iter() {
+        single_ids.push(h.client.buy_option(&single, &s, &c, &m));
+    }
+    let fees_after_singles = balance(&h, &h.fee_recipient);
+    let pool_after_singles = h.client.get_premium_pool();
+
+    let batcher = Address::generate(&h.env);
+    mint(&h, &batcher, max);
+    let since = h.env.events().all().len();
+    let batch_ids = h.client.buy_batch(&batcher, &orders);
+
+    assert_eq!(token_transfer_count(&h, since), 2);
+    assert_eq!(event_count(&h, since, "option_bought"), 3);
+    assert_eq!(balance(&h, &batcher), balance(&h, &single));
+    assert_eq!(
+        balance(&h, &h.fee_recipient) - fees_after_singles,
+        fees_after_singles
+    );
+    assert_eq!(h.client.get_premium_pool(), 2 * pool_after_singles);
+    for (i, id) in batch_ids.iter().enumerate() {
+        assert_same_position(
+            &h.client.get_position(&id).unwrap(),
+            &h.client.get_position(&single_ids[i]).unwrap(),
+        );
+    }
+    assert_eq!(h.client.get_user_positions(&batcher), batch_ids);
+    assert_eq!(
+        h.client.get_series(&s1).unwrap().open_interest,
+        6 * USDC_DECIMALS
+    );
+}
+
+#[test]
+fn write_batch_matches_n_single_writes_with_one_pull_and_one_payout() {
+    let h = setup();
+    let s1 = make_series(&h, OptionType::Put, 1_000_000, 500_000);
+    let s2 = make_series(&h, OptionType::Put, 2_000_000, 300_000);
+    let orders = soroban_sdk::vec![
+        &h.env,
+        (s1, 2 * USDC_DECIMALS, 1_000 * USDC_DECIMALS),
+        (s2, 3 * USDC_DECIMALS, 1_000 * USDC_DECIMALS),
+        (s1, USDC_DECIMALS, 1_000 * USDC_DECIMALS),
+    ];
+    for _ in 0..2 {
+        fund_premium_pool(&h, s1, 3 * USDC_DECIMALS);
+        fund_premium_pool(&h, s2, 3 * USDC_DECIMALS);
+    }
+
+    let single = Address::generate(&h.env);
+    mint(&h, &single, 1_000 * USDC_DECIMALS);
+    let mut single_ids = std::vec::Vec::new();
+    for (s, c, m) in orders.iter() {
+        single_ids.push(h.client.write_option(&single, &s, &c, &m));
+    }
+
+    let batcher = Address::generate(&h.env);
+    mint(&h, &batcher, 1_000 * USDC_DECIMALS);
+    let since = h.env.events().all().len();
+    let batch_ids = h.client.write_batch(&batcher, &orders);
+
+    assert_eq!(token_transfer_count(&h, since), 2);
+    assert_eq!(event_count(&h, since, "option_written"), 3);
+    assert_eq!(balance(&h, &batcher), balance(&h, &single));
+    for (i, id) in batch_ids.iter().enumerate() {
+        assert_same_position(
+            &h.client.get_position(&id).unwrap(),
+            &h.client.get_position(&single_ids[i]).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn buy_batch_is_all_or_nothing() {
+    let h = setup();
+    let s1 = make_series(&h, OptionType::Call, 1_000_000, 500_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let orders = soroban_sdk::vec![
+        &h.env,
+        (s1, USDC_DECIMALS, 1_000 * USDC_DECIMALS),
+        (s1, 0i128, 1_000 * USDC_DECIMALS), // ZeroContracts
+    ];
+    assert!(h.client.try_buy_batch(&buyer, &orders).is_err());
+    assert_eq!(balance(&h, &buyer), 1_000 * USDC_DECIMALS);
+    assert_eq!(h.client.get_user_positions(&buyer).len(), 0);
+}
+
+#[test]
+fn write_batch_rejects_when_the_pool_runs_dry_mid_batch() {
+    let h = setup();
+    let s1 = make_series(&h, OptionType::Put, 1_000_000, 500_000);
+    fund_premium_pool(&h, s1, USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 1_000 * USDC_DECIMALS);
+    let orders = soroban_sdk::vec![
+        &h.env,
+        (s1, USDC_DECIMALS, 1_000 * USDC_DECIMALS),
+        (s1, USDC_DECIMALS, 1_000 * USDC_DECIMALS),
+    ];
+    assert!(h.client.try_write_batch(&writer, &orders).is_err());
+    assert_eq!(balance(&h, &writer), 1_000 * USDC_DECIMALS);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")] // InvalidBatchSize
+fn buy_batch_rejects_an_empty_batch() {
+    let h = setup();
+    let buyer = Address::generate(&h.env);
+    h.client.buy_batch(&buyer, &soroban_sdk::vec![&h.env]);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")] // InvalidBatchSize
+fn write_batch_rejects_an_oversized_batch() {
+    let h = setup();
+    let s1 = make_series(&h, OptionType::Put, 1_000_000, 500_000);
+    let writer = Address::generate(&h.env);
+    let mut orders = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..=crate::math::MAX_BATCH_SIZE {
+        orders.push_back((s1, USDC_DECIMALS, USDC_DECIMALS));
+    }
+    h.client.write_batch(&writer, &orders);
+}
+
+/// Resource comparison: one buy_batch of 5 orders vs 5 buy_option calls.
+#[test]
+fn buy_batch_costs_less_than_the_equivalent_single_buys() {
+    let h = setup();
+    h.env.budget().reset_unlimited();
+    let s1 = make_series(&h, OptionType::Call, 1_000_000, 500_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+
+    let mut single_cpu = 0u64;
+    for _ in 0..5 {
+        h.env.budget().reset_default();
+        h.client
+            .buy_option(&buyer, &s1, &USDC_DECIMALS, &(1_000 * USDC_DECIMALS));
+        single_cpu += h.env.budget().cpu_instruction_cost();
+    }
+
+    let mut orders = soroban_sdk::Vec::new(&h.env);
+    for _ in 0..5 {
+        orders.push_back((s1, USDC_DECIMALS, 1_000 * USDC_DECIMALS));
+    }
+    h.env.budget().reset_default();
+    h.client.buy_batch(&buyer, &orders);
+    let batch_cpu = h.env.budget().cpu_instruction_cost();
+
+    std::println!("buy x5: singles {single_cpu} cpu, batch {batch_cpu} cpu");
+    assert!(batch_cpu < single_cpu);
+}
+
+// ─── paginated and mark-to-market views ─────────────────────────────────────
+
+fn no_filter(env: &Env) -> SeriesFilter {
+    SeriesFilter {
+        state: soroban_sdk::Vec::new(env),
+        underlying: soroban_sdk::Vec::new(env),
+        option_type: soroban_sdk::Vec::new(env),
+    }
+}
+
+fn make_series_on(h: &Harness, underlying: &str, option_type: OptionType) -> u64 {
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    h.client.create_series(
+        &Symbol::new(&h.env, underlying),
+        &option_type,
+        &1_000_000,
+        &expiry,
+        &500_000,
+        &(450_000_000i128),
+    )
+}
+
+#[test]
+fn series_page_walks_every_series_across_page_boundaries() {
+    let h = setup();
+    for _ in 0..5 {
+        make_series(&h, OptionType::Call, 1_000_000, 500_000);
+    }
+    let p1 = h.client.get_series_page(&0, &2, &no_filter(&h.env));
+    assert_eq!(p1.items.len(), 2);
+    assert_eq!(p1.items.get(0).unwrap().series_id, 1);
+    assert_eq!(p1.next_cursor, 2);
+    let p2 = h
+        .client
+        .get_series_page(&p1.next_cursor, &2, &no_filter(&h.env));
+    assert_eq!(p2.items.get(0).unwrap().series_id, 3);
+    let p3 = h
+        .client
+        .get_series_page(&p2.next_cursor, &2, &no_filter(&h.env));
+    assert_eq!(p3.items.len(), 1);
+    assert_eq!(p3.next_cursor, 0);
+    // Past the end, and on an empty market, pages are simply empty.
+    assert_eq!(
+        h.client
+            .get_series_page(&99, &2, &no_filter(&h.env))
+            .items
+            .len(),
+        0
+    );
+    let empty = setup();
+    let page = empty
+        .client
+        .get_series_page(&0, &50, &no_filter(&empty.env));
+    assert_eq!(page.items.len(), 0);
+}
+
+#[test]
+fn series_page_filters_by_state_underlying_and_type() {
+    let h = setup();
+    let xlm_call = make_series_on(&h, "XLM", OptionType::Call);
+    let btc_put = make_series_on(&h, "BTC", OptionType::Put);
+    let btc_call = make_series_on(&h, "BTC", OptionType::Call);
+    h.client.cancel_series(&btc_call);
+
+    let btc = SeriesFilter {
+        underlying: soroban_sdk::vec![&h.env, Symbol::new(&h.env, "BTC")],
+        ..no_filter(&h.env)
+    };
+    let page = h.client.get_series_page(&0, &50, &btc);
+    assert_eq!(page.items.len(), 2);
+
+    let active_btc = SeriesFilter {
+        state: soroban_sdk::vec![&h.env, SeriesState::Active],
+        ..btc.clone()
+    };
+    let page = h.client.get_series_page(&0, &50, &active_btc);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items.get(0).unwrap().series_id, btc_put);
+
+    let calls = SeriesFilter {
+        option_type: soroban_sdk::vec![&h.env, OptionType::Call],
+        state: soroban_sdk::vec![&h.env, SeriesState::Active],
+        ..no_filter(&h.env)
+    };
+    let page = h.client.get_series_page(&0, &50, &calls);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items.get(0).unwrap().series_id, xlm_call);
+
+    assert_eq!(
+        h.client
+            .get_series_by_underlying(&Symbol::new(&h.env, "BTC")),
+        soroban_sdk::vec![&h.env, btc_put, btc_call]
+    );
+    assert_eq!(
+        h.client
+            .get_series_by_underlying(&Symbol::new(&h.env, "ETH"))
+            .len(),
+        0
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")] // InvalidPageLimit
+fn series_page_rejects_a_limit_above_the_max() {
+    let h = setup();
+    h.client
+        .get_series_page(&0, &(crate::math::MAX_PAGE_LIMIT + 1), &no_filter(&h.env));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #25)")] // InvalidPageLimit
+fn positions_page_rejects_a_zero_limit() {
+    let h = setup();
+    let user = Address::generate(&h.env);
+    h.client.get_user_positions_page(&user, &0, &0, &None);
+}
+
+#[test]
+fn positions_page_paginates_and_filters_by_side() {
+    let h = setup();
+    let s1 = make_series(&h, OptionType::Put, 1_000_000, 500_000);
+    let user = Address::generate(&h.env);
+    mint(&h, &user, 1_000 * USDC_DECIMALS);
+    fund_premium_pool(&h, s1, 2 * USDC_DECIMALS);
+    for _ in 0..3 {
+        h.client
+            .buy_option(&user, &s1, &USDC_DECIMALS, &(1_000 * USDC_DECIMALS));
+    }
+    for _ in 0..2 {
+        h.client
+            .write_option(&user, &s1, &USDC_DECIMALS, &(1_000 * USDC_DECIMALS));
+    }
+
+    let p1 = h.client.get_user_positions_page(&user, &0, &2, &None);
+    assert_eq!(p1.items.len(), 2);
+    assert_eq!(p1.next_cursor, 2);
+    let p2 = h
+        .client
+        .get_user_positions_page(&user, &p1.next_cursor, &2, &None);
+    let p3 = h
+        .client
+        .get_user_positions_page(&user, &p2.next_cursor, &2, &None);
+    assert_eq!(p3.items.len(), 1);
+    assert_eq!(p3.next_cursor, 0);
+
+    let shorts = h
+        .client
+        .get_user_positions_page(&user, &0, &50, &Some(PositionSide::Short));
+    assert_eq!(shorts.items.len(), 2);
+    let longs = h
+        .client
+        .get_user_positions_page(&user, &0, &50, &Some(PositionSide::Long));
+    assert_eq!(longs.items.len(), 3);
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .get_user_positions_page(&stranger, &0, &50, &None)
+            .items
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn position_value_and_account_summary_are_indicative_intrinsic_values() {
+    let h = setup();
+    let strike = 1_000_000;
+    let s1 = make_series(&h, OptionType::Call, strike, 500_000);
+    let buyer = Address::generate(&h.env);
+    let writer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    mint(&h, &writer, 1_000 * USDC_DECIMALS);
+    let long_id = h
+        .client
+        .buy_option(&buyer, &s1, &(2 * USDC_DECIMALS), &(1_000 * USDC_DECIMALS));
+    let short_id =
+        h.client
+            .write_option(&writer, &s1, &(2 * USDC_DECIMALS), &(1_000 * USDC_DECIMALS));
+
+    // No price known yet: nothing to mark against.
+    assert_eq!(h.client.get_position_value(&long_id), 0);
+
+    let expiry = h.client.get_series(&s1).unwrap().expiry;
+    h.env.ledger().with_mut(|l| l.timestamp = expiry);
+    h.env.as_contract(&h.client.address, || {
+        h.env.storage().persistent().set(
+            &crate::types::DataKey::UnderlyingPrice(Symbol::new(&h.env, "XLM")),
+            &1_500_000i128,
+        );
+    });
+    // 2 contracts × (1.5 − 1.0) intrinsic
+    let expected = 2 * (1_500_000 - strike);
+    assert_eq!(h.client.get_position_value(&long_id), expected);
+    assert_eq!(h.client.get_position_value(&short_id), -expected);
+
+    let summary = h.client.get_account_summary(&writer);
+    assert_eq!(summary.open_positions, 1);
+    assert_eq!(summary.short_liability, expected);
+    assert_eq!(
+        summary.collateral_locked,
+        h.client.get_position(&short_id).unwrap().collateral_locked
+    );
+    assert_eq!(summary.net_value, -expected);
+    assert_eq!(h.client.get_account_summary(&buyer).long_value, expected);
+}
+
+/// Resource benchmark: both paginated views at the maximum page size must
+/// fit comfortably in a single default-budget invocation.
+#[test]
+fn paginated_views_fit_the_default_budget_at_max_limit() {
+    let h = setup();
+    h.env.budget().reset_unlimited();
+    let limit = crate::math::MAX_PAGE_LIMIT;
+    let s1 = make_series(&h, OptionType::Call, 1_000_000, 500_000);
+    for _ in 1..limit {
+        make_series(&h, OptionType::Call, 1_000_000, 500_000);
+    }
+    let user = Address::generate(&h.env);
+    mint(&h, &user, 10_000 * USDC_DECIMALS);
+    for _ in 0..limit {
+        h.client
+            .buy_option(&user, &s1, &USDC_DECIMALS, &(1_000 * USDC_DECIMALS));
+    }
+
+    h.env.budget().reset_default();
+    let page = h.client.get_series_page(&0, &limit, &no_filter(&h.env));
+    assert_eq!(page.items.len(), limit);
+    std::println!(
+        "get_series_page({limit}): {} cpu, {} mem",
+        h.env.budget().cpu_instruction_cost(),
+        h.env.budget().memory_bytes_cost()
+    );
+
+    h.env.budget().reset_default();
+    let page = h.client.get_user_positions_page(&user, &0, &limit, &None);
+    assert_eq!(page.items.len(), limit);
+    std::println!(
+        "get_user_positions_page({limit}): {} cpu, {} mem",
+        h.env.budget().cpu_instruction_cost(),
+        h.env.budget().memory_bytes_cost()
+    );
+}
+
+// ─── executor multisig as admin ─────────────────────────────────────────────
+
+/// options_market whose admin is a multisig contract, not a key.
+fn setup_executor<'a>() -> (Harness<'a>, MultisigClient<'a>, [Address; 3]) {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    h.client.transfer_admin(&multisig_id);
+    assert_eq!(h.client.get_admin(), multisig_id);
+    let ms = MultisigClient::new(&h.env, &multisig_id);
+    (h, ms, signers)
+}
+
+/// propose → approve ×2 → execute, with every mocked auth cleared before
+/// execute so the target's admin.require_auth() can only pass because
+/// the multisig itself is the direct caller.
+fn run_via_executor(
+    h: &Harness,
+    ms: &MultisigClient,
+    signers: &[Address; 3],
+    function: &str,
+    args: soroban_sdk::Vec<soroban_sdk::Val>,
+) -> soroban_sdk::Val {
+    let id = ms.propose(
+        &signers[0],
+        &h.client.address,
+        &Symbol::new(&h.env, function),
+        &args,
+    );
+    ms.approve(&signers[0], &id);
+    ms.approve(&signers[1], &id);
+    h.env.set_auths(&[]);
+    let ret = ms.execute(&id);
+    h.env.mock_all_auths();
+    ret
+}
+
+#[test]
+fn every_admin_function_is_reachable_through_the_executor() {
+    let (h, ms, signers) = setup_executor();
+    let e = &h.env;
+
+    run_via_executor(
+        &h,
+        &ms,
+        &signers,
+        "set_fee_rate",
+        soroban_sdk::vec![e, 75u32.into_val(e)],
+    );
+    assert_eq!(h.client.get_fee_rate(), 75);
+
+    run_via_executor(&h, &ms, &signers, "pause", soroban_sdk::vec![e]);
+    assert!(h.client.is_paused());
+    run_via_executor(&h, &ms, &signers, "unpause", soroban_sdk::vec![e]);
+    assert!(!h.client.is_paused());
+
+    let expiry = e.ledger().timestamp() + 30 * 86_400;
+    let ret = run_via_executor(
+        &h,
+        &ms,
+        &signers,
+        "create_series",
+        soroban_sdk::vec![
+            e,
+            Symbol::new(e, "XLM").into_val(e),
+            OptionType::Call.into_val(e),
+            1_000_000i128.into_val(e),
+            expiry.into_val(e),
+            500_000i128.into_val(e),
+            450_000_000i128.into_val(e),
+        ],
+    );
+    let series_id = u64::try_from_val(e, &ret).unwrap();
+    assert_eq!(series_id, 1);
+
+    run_via_executor(
+        &h,
+        &ms,
+        &signers,
+        "update_premium",
+        soroban_sdk::vec![
+            e,
+            series_id.into_val(e),
+            600_000i128.into_val(e),
+            400_000_000i128.into_val(e),
+        ],
+    );
+    assert_eq!(h.client.get_series(&series_id).unwrap().premium, 600_000);
+
+    run_via_executor(
+        &h,
+        &ms,
+        &signers,
+        "cancel_series",
+        soroban_sdk::vec![e, series_id.into_val(e)],
+    );
+    assert!(h.client.get_series(&series_id).unwrap().state == SeriesState::Cancelled);
+
+    let new_admin = Address::generate(e);
+    run_via_executor(
+        &h,
+        &ms,
+        &signers,
+        "transfer_admin",
+        soroban_sdk::vec![e, new_admin.into_val(e)],
+    );
+    assert_eq!(h.client.get_admin(), new_admin);
+}
+
+/// Same caveat as upgrade_reaches_the_host_deployer_past_the_admin_check:
+/// the bogus hash fails in the host deployer, past the admin check.
+#[test]
+#[should_panic]
+fn upgrade_is_reachable_through_the_executor() {
+    let (h, ms, signers) = setup_executor();
+    let hash = BytesN::from_array(&h.env, &[0u8; 32]);
+    run_via_executor(
+        &h,
+        &ms,
+        &signers,
+        "upgrade",
+        soroban_sdk::vec![&h.env, hash.into_val(&h.env)],
+    );
+}
+
+#[test]
+#[should_panic]
+fn admin_functions_reject_direct_calls_without_the_multisig() {
+    let (h, _ms, _signers) = setup_executor();
+    h.env.set_auths(&[]);
+    h.client.set_fee_rate(&75);
 }

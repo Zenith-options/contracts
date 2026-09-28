@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Symbol};
+use soroban_sdk::{contracttype, Address, Symbol, Vec};
 
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
@@ -29,6 +29,9 @@ pub enum DataKey {
     /// exactly how much of options_market's own balance to quarantine
     /// into vault for this series — see that function's doc comment.
     SeriesEscrow(u64),
+    /// underlying -> every series_id listed on it, appended on create.
+    /// Bounded by MAX_SERIES_PER_UNDERLYING.
+    SeriesByUnderlying(Symbol),
 }
 
 // ─── Data Types ───────────────────────────────────────────────────────────────
@@ -90,4 +93,47 @@ pub struct OptionPosition {
     pub is_exercised: bool,
     pub is_settled: bool,
     pub opened_at: u64,
+}
+
+// ─── View Types ───────────────────────────────────────────────────────────────
+
+/// Filters for get_series_page. Each field matches a series whose value
+/// is any of the listed ones; an empty list matches anything.
+#[contracttype]
+#[derive(Clone)]
+pub struct SeriesFilter {
+    pub state: Vec<SeriesState>,
+    pub underlying: Vec<Symbol>,
+    pub option_type: Vec<OptionType>,
+}
+
+/// One page of series. `next_cursor` is the cursor to pass for the next
+/// page, or 0 once there are no more series to scan.
+#[contracttype]
+#[derive(Clone)]
+pub struct SeriesPage {
+    pub items: Vec<OptionSeries>,
+    pub next_cursor: u64,
+}
+
+/// One page of a user's positions. `next_cursor` is the cursor to pass
+/// for the next page, or 0 once there are no more positions to scan.
+#[contracttype]
+#[derive(Clone)]
+pub struct PositionPage {
+    pub items: Vec<OptionPosition>,
+    pub next_cursor: u32,
+}
+
+/// INDICATIVE ONLY — a mark-to-market snapshot for frontends, never used
+/// for settlement. Values are intrinsic value at the settlement price if
+/// set, else at the last admin-set underlying price.
+#[contracttype]
+#[derive(Clone)]
+pub struct AccountSummary {
+    pub open_positions: u32,
+    pub long_value: i128,
+    pub short_liability: i128,
+    pub collateral_locked: i128,
+    pub net_value: i128,
 }

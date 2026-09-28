@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Val, Vec};
 
 #[contracttype]
 #[derive(Clone)]
@@ -14,5 +14,48 @@ pub enum DataKey {
     /// `action_id` is entirely caller-defined — this contract never
     /// interprets what the action actually does, only how many of the
     /// fixed signer set have signed off on it, and since when.
-    Approval(u64, Address),
+    Approval(BytesN<32>, Address),
+    /// action_id -> ActionMeta, the on-chain registry entry.
+    Action(BytesN<32>),
+    /// Bounded index of every action still awaiting a vote. Entries are
+    /// swap-removed on execute, reset, or expiry.
+    Pending,
+    /// How many entries in `Pending` a given signer registered — bounds
+    /// how much of the index any one signer can fill.
+    PendingCount(Address),
+    /// proposal_id -> Proposal, for actions the multisig executes itself.
+    Proposal(BytesN<32>),
+    /// Monotonic counter mixed into every proposal so two otherwise
+    /// identical calls get distinct ids.
+    ProposalNonce,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ActionStatus {
+    Pending = 0,
+    Executed = 1,
+    Reset = 2,
+    Expired = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionMeta {
+    pub proposer: Address,
+    pub created_at: u64,
+    pub description_hash: BytesN<32>,
+    pub status: ActionStatus,
+}
+
+/// A call the multisig makes as itself once approved. Its id is the
+/// sha256 of its XDR encoding, so the id commits to the exact payload.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Proposal {
+    pub target: Address,
+    pub function: Symbol,
+    pub args: Vec<Val>,
+    pub nonce: u64,
 }
