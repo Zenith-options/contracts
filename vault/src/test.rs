@@ -3,9 +3,11 @@
 use crate::{Vault, VaultClient};
 use multisig::{Multisig, MultisigClient};
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
-    token, Address, Env, TryFromVal,
+    testutils::{Address as _, Events as _, Ledger as _},
+    token, Address, Env, Symbol, TryFromVal,
 };
+
+const MAX_PAUSE: u64 = 30 * 24 * 60 * 60;
 
 struct Harness<'a> {
     env: Env,
@@ -25,7 +27,7 @@ fn setup<'a>() -> Harness<'a> {
 
     let contract_id = env.register_contract(None, Vault);
     let client = VaultClient::new(&env, &contract_id);
-    client.initialize(&admin, &token_address);
+    client.initialize(&admin, &token_address, &MAX_PAUSE);
 
     Harness {
         env,
@@ -55,7 +57,7 @@ fn initialize_sets_admin_and_token() {
 #[should_panic(expected = "Error(Contract, #1)")] // AlreadyInitialized
 fn initialize_twice_panics() {
     let h = setup();
-    h.client.initialize(&h.admin, &h.token);
+    h.client.initialize(&h.admin, &h.token, &MAX_PAUSE);
 }
 
 #[test]
@@ -77,7 +79,7 @@ fn initialize_without_any_authorization_panics() {
 
     let contract_id = env.register_contract(None, Vault);
     let client = VaultClient::new(&env, &contract_id);
-    client.initialize(&admin, &token_address);
+    client.initialize(&admin, &token_address, &MAX_PAUSE);
 }
 
 // ─── deposit ─────────────────────────────────────────────────────────────────
@@ -460,6 +462,11 @@ fn setup_multisig(h: &Harness) -> (Address, [Address; 3]) {
         ],
         &2,
         &0,
+        &multisig::Delays {
+            standard: 0,
+            critical: 0,
+        },
+        &None,
     );
     (contract_id, signers)
 }
@@ -675,4 +682,127 @@ fn sweep_untagged_via_multisig_rejects_when_not_yet_approved() {
     let recovered_to = Address::generate(&h.env);
     h.client
         .sweep_untagged_via_multisig(&multisig_id, &99u64, &recovered_to);
+}
+
+// ─── emergency escape hatch ──────────────────────────────────────────────────
+
+fn setup_hatch<'a>() -> (Harness<'a>, Address, Address) {
+    let h = setup();
+    h.env.ledger().set_timestamp(1_000);
+    let owner = Address::generate(&h.env);
+    let beneficiary = Address::generate(&h.env);
+    mint(&h, &owner, 500);
+    h.client.deposit(&owner, &7, &500);
+    h.client.set_beneficiary(&7, &beneficiary);
+    (h, owner, beneficiary)
+}
+
+fn advance(h: &Harness, seconds: u64) {
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + seconds);
+}
+
+#[test]
+fn first_depositor_owns_the_tag_and_sets_its_beneficiary() {
+    let (h, owner, beneficiary) = setup_hatch();
+    assert_eq!(h.client.get_tag_owner(&7), Some(owner));
+    assert_eq!(h.client.get_beneficiary(&7), Some(beneficiary));
+    assert_eq!(h.client.get_max_pause_duration(), MAX_PAUSE);
+}
+
+#[test]
+fn emergency_withdraw_opens_only_after_max_pause_duration() {
+    let (h, _, beneficiary) = setup_hatch();
+    h.client.pause();
+    assert_eq!(h.client.get_paused_at(), Some(1_000));
+
+    advance(&h, MAX_PAUSE);
+    assert!(h.client.try_emergency_withdraw(&7, &beneficiary).is_err());
+
+    advance(&h, 1);
+    assert_eq!(h.client.emergency_withdraw(&7, &beneficiary), 500);
+    assert_eq!(h.client.balance_of(&7), 0);
+    assert_eq!(h.client.get_total_escrowed(), 0);
+    assert_eq!(
+        token::Client::new(&h.env, &h.token).balance(&beneficiary),
+        500
+    );
+
+    let last = h.env.events().all().last().unwrap();
+    assert_eq!(
+        Symbol::try_from_val(&h.env, &last.1.get(0).unwrap()).unwrap(),
+        Symbol::new(&h.env, "emergency_withdrawn")
+    );
+}
+
+#[test]
+fn emergency_withdraw_is_unavailable_while_unpaused() {
+    let (h, _, beneficiary) = setup_hatch();
+    advance(&h, MAX_PAUSE * 2);
+    assert!(h.client.try_emergency_withdraw(&7, &beneficiary).is_err());
+}
+
+#[test]
+fn only_the_registered_beneficiary_can_emergency_withdraw() {
+    let (h, owner, _) = setup_hatch();
+    h.client.pause();
+    advance(&h, MAX_PAUSE + 1);
+    assert!(h.client.try_emergency_withdraw(&7, &owner).is_err());
+    // A tag with no beneficiary registered has no escape hatch.
+    assert!(h.client.try_emergency_withdraw(&8, &owner).is_err());
+}
+
+#[test]
+fn unpausing_and_repausing_does_not_reset_the_clock() {
+    let (h, _, beneficiary) = setup_hatch();
+    h.client.pause();
+    advance(&h, MAX_PAUSE - 10);
+    h.client.unpause();
+    advance(&h, 5);
+    h.client.pause();
+    advance(&h, 11);
+    assert_eq!(h.client.get_pause_duration(), MAX_PAUSE + 1);
+    assert_eq!(h.client.emergency_withdraw(&7, &beneficiary), 500);
+}
+
+#[test]
+fn a_full_unpaused_window_resets_accrued_pause_time() {
+    let (h, _, beneficiary) = setup_hatch();
+    h.client.pause();
+    advance(&h, MAX_PAUSE - 10);
+    h.client.unpause();
+    advance(&h, MAX_PAUSE);
+    h.client.pause();
+    advance(&h, 20);
+    assert_eq!(h.client.get_pause_duration(), 20);
+    assert!(h.client.try_emergency_withdraw(&7, &beneficiary).is_err());
+}
+
+#[test]
+fn beneficiary_cannot_be_changed_while_paused() {
+    let (h, _, _) = setup_hatch();
+    h.client.pause();
+    let attacker = Address::generate(&h.env);
+    assert!(h.client.try_set_beneficiary(&7, &attacker).is_err());
+}
+
+#[test]
+fn set_beneficiary_requires_an_owned_tag() {
+    let h = setup();
+    let who = Address::generate(&h.env);
+    assert!(h.client.try_set_beneficiary(&99, &who).is_err());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn initialize_rejects_a_zero_max_pause_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Vault);
+    VaultClient::new(&env, &contract_id).initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &0,
+    );
 }

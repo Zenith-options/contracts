@@ -20,8 +20,21 @@
 //! deliberately to keep this contract's own trust model simple: there's
 //! no in-protocol path for a compromised signer to add another
 //! compromised signer.
+//!
+//! Two ways to use it (see the README for when to use which):
+//! * Approval mode: signers `approve(action_id)` on-chain and a consumer's
+//!   `_via_multisig` entrypoint checks `is_executable(action_id, class)`,
+//!   which also enforces the per-class timelock.
+//! * Custom-account mode: set this contract's address as a plain `admin`
+//!   anywhere; `__check_auth` accepts M-of-N ed25519 signatures from the
+//!   transaction's auth payload. No timelock applies in this mode.
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Vec};
+use soroban_sdk::{
+    auth::{Context, CustomAccountInterface},
+    contract, contractimpl,
+    crypto::Hash,
+    panic_with_error, Address, Env, Vec,
+};
 
 #[cfg(test)]
 mod test;
@@ -30,8 +43,9 @@ mod error;
 mod events;
 mod types;
 
-use error::Error;
+pub use error::Error;
 use types::DataKey;
+pub use types::{AccountConfig, AccountSignature, ActionClass, Delays};
 
 #[contract]
 pub struct Multisig;
@@ -57,7 +71,16 @@ impl Multisig {
     /// `is_approved`, so a vote cast for a long-abandoned action can't
     /// silently still be sitting at threshold if that `action_id` is
     /// ever reused.
-    pub fn initialize(env: Env, signers: Vec<Address>, threshold: u32, approval_ttl: u64) {
+    /// `delays` (per-class timelocks) and `account` (optional custom-
+    /// account mode) are likewise fixed here and immutable afterward.
+    pub fn initialize(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+        approval_ttl: u64,
+        delays: Delays,
+        account: Option<AccountConfig>,
+    ) {
         if env.storage().instance().has(&DataKey::Signers) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
@@ -72,6 +95,24 @@ impl Multisig {
             }
         }
 
+        if delays.standard > delays.critical {
+            panic_with_error!(&env, Error::InvalidDelays);
+        }
+        if let Some(account) = &account {
+            if account.threshold == 0 || account.threshold > account.signers.len() {
+                panic_with_error!(&env, Error::InvalidThreshold);
+            }
+            for i in 0..account.signers.len() {
+                for j in (i + 1)..account.signers.len() {
+                    if account.signers.get(i).unwrap() == account.signers.get(j).unwrap() {
+                        panic_with_error!(&env, Error::DuplicateSigner);
+                    }
+                }
+            }
+            env.storage().instance().set(&DataKey::Account, account);
+        }
+
+        env.storage().instance().set(&DataKey::Delays, &delays);
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage()
             .instance()
@@ -116,10 +157,19 @@ impl Multisig {
         if Self::has_approved(env.clone(), action_id, signer.clone()) {
             panic_with_error!(&env, Error::AlreadyApproved);
         }
+        let was_approved = Self::is_approved(env.clone(), action_id);
         env.storage().persistent().set(
             &DataKey::Approval(action_id, signer.clone()),
             &env.ledger().timestamp(),
         );
+        let reached_key = DataKey::ReachedAt(action_id);
+        if Self::is_approved(env.clone(), action_id)
+            && (!was_approved || !env.storage().persistent().has(&reached_key))
+        {
+            env.storage()
+                .persistent()
+                .set(&reached_key, &env.ledger().timestamp());
+        }
         events::approved(&env, signer, action_id);
     }
 
@@ -136,6 +186,11 @@ impl Multisig {
         env.storage()
             .persistent()
             .remove(&DataKey::Approval(action_id, signer.clone()));
+        if !Self::is_approved(env.clone(), action_id) {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ReachedAt(action_id));
+        }
         events::revoked(&env, signer, action_id);
     }
 
@@ -182,6 +237,50 @@ impl Multisig {
         count >= threshold
     }
 
+    pub fn get_delays(env: Env) -> Delays {
+        env.storage().instance().get(&DataKey::Delays).unwrap()
+    }
+
+    pub fn get_delay(env: Env, class: ActionClass) -> u64 {
+        let delays = Self::get_delays(env);
+        match class {
+            ActionClass::Emergency => 0,
+            ActionClass::Standard => delays.standard,
+            ActionClass::Critical => delays.critical,
+        }
+    }
+
+    /// When `action_id` last crossed the threshold, if it's currently
+    /// tracked as having done so.
+    pub fn get_threshold_reached_at(env: Env, action_id: u64) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReachedAt(action_id))
+    }
+
+    /// True once `action_id` is approved AND has stayed at threshold for
+    /// at least `class`'s delay. Emergency-class actions only need to be
+    /// approved. This is what consumers' `_via_multisig` entrypoints
+    /// check, so signer majorities can't land a hostile change before
+    /// users have time to exit.
+    pub fn is_executable(env: Env, action_id: u64, class: ActionClass) -> bool {
+        if !Self::is_approved(env.clone(), action_id) {
+            return false;
+        }
+        let delay = Self::get_delay(env.clone(), class);
+        if delay == 0 {
+            return true;
+        }
+        match Self::get_threshold_reached_at(env.clone(), action_id) {
+            Some(reached_at) => env.ledger().timestamp() >= reached_at.saturating_add(delay),
+            None => false,
+        }
+    }
+
+    pub fn get_account_config(env: Env) -> Option<AccountConfig> {
+        env.storage().instance().get(&DataKey::Account)
+    }
+
     /// Clears every signer's approval of `action_id` and resets its count
     /// to zero — for whoever executed the underlying action to call once
     /// it's done, so the same votes can't linger indefinitely and be
@@ -202,6 +301,63 @@ impl Multisig {
                 .persistent()
                 .remove(&DataKey::Approval(action_id, signer));
         }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ReachedAt(action_id));
         events::reset(&env, action_id);
+    }
+}
+
+#[contractimpl]
+impl CustomAccountInterface for Multisig {
+    type Signature = Vec<AccountSignature>;
+    type Error = Error;
+
+    /// Accepts the call if at least `threshold` distinct configured keys
+    /// signed `signature_payload`. Signatures must be sorted strictly
+    /// ascending by public key, which also rules out duplicates. If the
+    /// account has an `allowed_contracts` policy, every authorized
+    /// context must be a call into one of those contracts.
+    #[allow(non_snake_case)]
+    fn __check_auth(
+        env: Env,
+        signature_payload: Hash<32>,
+        signatures: Vec<AccountSignature>,
+        auth_contexts: Vec<Context>,
+    ) -> Result<(), Error> {
+        let account: AccountConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Account)
+            .ok_or(Error::AccountNotConfigured)?;
+
+        if signatures.len() < account.threshold {
+            return Err(Error::InsufficientSignatures);
+        }
+        let payload = signature_payload.to_bytes().into();
+        for i in 0..signatures.len() {
+            let sig = signatures.get(i).unwrap();
+            if i > 0 && signatures.get(i - 1).unwrap().public_key >= sig.public_key {
+                return Err(Error::UnsortedSignatures);
+            }
+            if !account.signers.contains(&sig.public_key) {
+                return Err(Error::NotASigner);
+            }
+            env.crypto()
+                .ed25519_verify(&sig.public_key, &payload, &sig.signature);
+        }
+
+        if !account.allowed_contracts.is_empty() {
+            for context in auth_contexts.iter() {
+                let allowed = match context {
+                    Context::Contract(c) => account.allowed_contracts.contains(&c.contract),
+                    Context::CreateContractHostFn(_) => false,
+                };
+                if !allowed {
+                    return Err(Error::ContextNotAllowed);
+                }
+            }
+        }
+        Ok(())
     }
 }

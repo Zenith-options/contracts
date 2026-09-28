@@ -9,6 +9,7 @@
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, token, Address, BytesN, Env, Symbol, Vec,
 };
+use zenith_common::{require_admin_or_multisig, ActionClass, Auth};
 
 #[cfg(test)]
 mod test;
@@ -16,7 +17,6 @@ mod test;
 mod error;
 mod events;
 mod math;
-mod multisig_client;
 mod price_oracle_client;
 mod storage;
 mod types;
@@ -33,10 +33,173 @@ use storage::{
 };
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
 
+fn require_auth(env: &Env, auth: &Auth, class: ActionClass) {
+    require_admin_or_multisig(env, &DataKey::Admin, auth, class, Error::Unauthorized);
+}
+
 // ─── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct OptionsMarket;
+
+impl OptionsMarket {
+    fn transfer_admin_inner(env: Env, auth: Auth, new_admin: Address) {
+        require_auth(&env, &auth, ActionClass::Critical);
+        let admin = zenith_common::set_admin(&env, &DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
+    }
+
+    fn set_paused_inner(env: Env, auth: Auth, paused: bool) {
+        let class = if paused {
+            ActionClass::Emergency
+        } else {
+            ActionClass::Standard
+        };
+        require_auth(&env, &auth, class);
+        zenith_common::set_paused(&env, &DataKey::Paused, paused);
+        if paused {
+            events::paused(&env);
+        } else {
+            events::unpaused(&env);
+        }
+    }
+
+    fn set_fee_rate_inner(env: Env, auth: Auth, new_bps: u32) {
+        require_auth(&env, &auth, ActionClass::Standard);
+
+        let new_bps = new_bps as i128;
+        if new_bps > MAX_FEE_RATE_BPS {
+            panic_with_error!(&env, Error::InvalidFeeRate);
+        }
+
+        env.storage().instance().set(&DataKey::FeeRateBps, &new_bps);
+        events::fee_rate_updated(&env, new_bps);
+    }
+
+    fn upgrade_inner(env: Env, auth: Auth, new_wasm_hash: BytesN<32>) {
+        require_auth(&env, &auth, ActionClass::Critical);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_series_inner(
+        env: Env,
+        auth: Auth,
+        underlying: Symbol,
+        option_type: OptionType,
+        strike_price: i128,
+        expiry: u64,
+        premium: i128,
+        implied_vol: i128,
+    ) -> u64 {
+        require_not_paused(&env);
+        require_auth(&env, &auth, ActionClass::Standard);
+
+        let now = env.ledger().timestamp();
+        if expiry <= now + 3600 {
+            panic_with_error!(&env, Error::ExpiryTooSoon);
+        }
+        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
+            panic_with_error!(&env, Error::InvalidSeriesParams);
+        }
+
+        let underlying_count_key = DataKey::SeriesCountForUnderlying(underlying.clone());
+        let underlying_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&underlying_count_key)
+            .unwrap_or(0);
+        if underlying_count >= MAX_SERIES_PER_UNDERLYING {
+            panic_with_error!(&env, Error::TooManySeriesForUnderlying);
+        }
+        env.storage().persistent().set(
+            &underlying_count_key,
+            &(underlying_count.checked_add(1).unwrap()),
+        );
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SeriesCounter)
+            .unwrap();
+        let series_id = counter.checked_add(1).unwrap();
+
+        let series = OptionSeries {
+            series_id,
+            underlying,
+            option_type,
+            strike_price,
+            expiry,
+            premium,
+            implied_vol,
+            open_interest: 0,
+            state: SeriesState::Active,
+            settlement_price: None,
+            created_at: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+        env.storage()
+            .instance()
+            .set(&DataKey::SeriesCounter, &series_id);
+
+        events::series_created(&env, series_id, strike_price, expiry, premium);
+
+        series_id
+    }
+
+    fn update_premium_inner(
+        env: Env,
+        auth: Auth,
+        series_id: u64,
+        new_premium: i128,
+        new_implied_vol: i128,
+    ) {
+        require_not_paused(&env);
+        require_auth(&env, &auth, ActionClass::Standard);
+
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Active {
+            panic_with_error!(&env, Error::SeriesNotActive);
+        }
+
+        series.premium = new_premium;
+        series.implied_vol = new_implied_vol;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+
+        events::premium_updated(&env, series_id, new_premium, new_implied_vol);
+    }
+
+    fn cancel_series_inner(env: Env, auth: Auth, series_id: u64) {
+        require_auth(&env, &auth, ActionClass::Standard);
+
+        let mut series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Active {
+            panic_with_error!(&env, Error::SeriesNotActive);
+        }
+
+        series.state = SeriesState::Cancelled;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Series(series_id), &series);
+
+        events::series_cancelled(&env, series_id);
+    }
+}
 
 #[contractimpl]
 impl OptionsMarket {
@@ -81,20 +244,11 @@ impl OptionsMarket {
     /// capped at MAX_FEE_RATE_BPS so a compromised or careless admin can't
     /// set an absurd rate that effectively confiscates every trade.
     pub fn set_fee_rate(env: Env, new_bps: u32) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let new_bps = new_bps as i128;
-        if new_bps > MAX_FEE_RATE_BPS {
-            panic_with_error!(&env, Error::InvalidFeeRate);
-        }
-
-        env.storage().instance().set(&DataKey::FeeRateBps, &new_bps);
-        events::fee_rate_updated(&env, new_bps);
+        Self::set_fee_rate_inner(env, Auth::Admin, new_bps);
     }
 
     /// Permissionless alternative to set_fee_rate: cross-calls a deployed
-    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// Multisig and checks is_executable(action_id, class) instead of requiring
     /// the admin's own signature. Same MAX_FEE_RATE_BPS cap applies —
     /// M-of-N approval doesn't bypass the sanity check, it just replaces
     /// whose signature satisfies the auth requirement.
@@ -104,32 +258,18 @@ impl OptionsMarket {
         action_id: u64,
         new_bps: u32,
     ) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        let new_bps = new_bps as i128;
-        if new_bps > MAX_FEE_RATE_BPS {
-            panic_with_error!(&env, Error::InvalidFeeRate);
-        }
-
-        env.storage().instance().set(&DataKey::FeeRateBps, &new_bps);
-        events::fee_rate_updated(&env, new_bps);
+        Self::set_fee_rate_inner(env, Auth::Multisig(multisig_contract, action_id), new_bps);
     }
 
     /// Admin hands off control to a new address. Requires the CURRENT admin's
     /// signature, not the incoming one — the new admin doesn't need to do
     /// anything to receive control.
     pub fn transfer_admin(env: Env, new_admin: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        events::admin_transferred(&env, admin, new_admin);
+        Self::transfer_admin_inner(env, Auth::Admin, new_admin);
     }
 
     /// Permissionless alternative to transfer_admin: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// deployed Multisig and checks is_executable(action_id, class) instead of
     /// requiring the current admin's own signature. Same rationale as
     /// pause_via_multisig — arguably even more important here, since a
     /// single lost or compromised admin key otherwise has no recovery
@@ -140,13 +280,7 @@ impl OptionsMarket {
         action_id: u64,
         new_admin: Address,
     ) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        events::admin_transferred(&env, admin, new_admin);
+        Self::transfer_admin_inner(env, Auth::Multisig(multisig_contract, action_id), new_admin);
     }
 
     /// Admin-gated contract upgrade: swaps the WASM executable behind this
@@ -155,13 +289,11 @@ impl OptionsMarket {
     /// existing storage. Storage layout compatibility with the new code is
     /// the deployer's responsibility, same as any Soroban upgrade.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Self::upgrade_inner(env, Auth::Admin, new_wasm_hash);
     }
 
     /// Permissionless alternative to upgrade: cross-calls a deployed
-    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// Multisig and checks is_executable(action_id, class) instead of requiring
     /// the admin's own signature. Swapping the contract's executable is
     /// the single most consequential action any of these contracts can
     /// take — gating it behind M-of-N approval rather than one key is the
@@ -172,11 +304,11 @@ impl OptionsMarket {
         action_id: u64,
         new_wasm_hash: BytesN<32>,
     ) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Self::upgrade_inner(
+            env,
+            Auth::Multisig(multisig_contract, action_id),
+            new_wasm_hash,
+        );
     }
 
     /// Emergency stop: blocks new series creation and new trades
@@ -184,17 +316,11 @@ impl OptionsMarket {
     /// block exercise, set_settlement_price, or reclaim_collateral — a
     /// pause should let existing positions wind down, not trap funds.
     pub fn pause(env: Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &true);
-        events::paused(&env);
+        Self::set_paused_inner(env, Auth::Admin, true);
     }
 
     pub fn unpause(env: Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &false);
-        events::unpaused(&env);
+        Self::set_paused_inner(env, Auth::Admin, false);
     }
 
     /// Permissionless alternative to pause(): instead of the single
@@ -207,21 +333,11 @@ impl OptionsMarket {
     /// pick a stable id scheme, not Multisig's or options_market's to
     /// interpret one.
     pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        env.storage().instance().set(&DataKey::Paused, &true);
-        events::paused(&env);
+        Self::set_paused_inner(env, Auth::Multisig(multisig_contract, action_id), true);
     }
 
     pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        env.storage().instance().set(&DataKey::Paused, &false);
-        events::unpaused(&env);
+        Self::set_paused_inner(env, Auth::Multisig(multisig_contract, action_id), false);
     }
 
     // ── Series Management (Admin) ─────────────────────────────────────────────
@@ -237,67 +353,20 @@ impl OptionsMarket {
         premium: i128,
         implied_vol: i128,
     ) -> u64 {
-        require_not_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let now = env.ledger().timestamp();
-        if expiry <= now + 3600 {
-            panic_with_error!(&env, Error::ExpiryTooSoon);
-        }
-        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
-            panic_with_error!(&env, Error::InvalidSeriesParams);
-        }
-
-        let underlying_count_key = DataKey::SeriesCountForUnderlying(underlying.clone());
-        let underlying_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&underlying_count_key)
-            .unwrap_or(0);
-        if underlying_count >= MAX_SERIES_PER_UNDERLYING {
-            panic_with_error!(&env, Error::TooManySeriesForUnderlying);
-        }
-        env.storage().persistent().set(
-            &underlying_count_key,
-            &(underlying_count.checked_add(1).unwrap()),
-        );
-
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SeriesCounter)
-            .unwrap();
-        let series_id = counter.checked_add(1).unwrap();
-
-        let series = OptionSeries {
-            series_id,
+        Self::create_series_inner(
+            env,
+            Auth::Admin,
             underlying,
             option_type,
             strike_price,
             expiry,
             premium,
             implied_vol,
-            open_interest: 0,
-            state: SeriesState::Active,
-            settlement_price: None,
-            created_at: now,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Series(series_id), &series);
-        env.storage()
-            .instance()
-            .set(&DataKey::SeriesCounter, &series_id);
-
-        events::series_created(&env, series_id, strike_price, expiry, premium);
-
-        series_id
+        )
     }
 
     /// Permissionless alternative to create_series: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// deployed Multisig and checks is_executable(action_id, class) instead of
     /// requiring the admin's own signature. Same validation and per-
     /// underlying cap apply — approval changes who can list a series,
     /// not what parameters a series may have.
@@ -313,94 +382,25 @@ impl OptionsMarket {
         premium: i128,
         implied_vol: i128,
     ) -> u64 {
-        require_not_paused(&env);
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        let now = env.ledger().timestamp();
-        if expiry <= now + 3600 {
-            panic_with_error!(&env, Error::ExpiryTooSoon);
-        }
-        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
-            panic_with_error!(&env, Error::InvalidSeriesParams);
-        }
-
-        let underlying_count_key = DataKey::SeriesCountForUnderlying(underlying.clone());
-        let underlying_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&underlying_count_key)
-            .unwrap_or(0);
-        if underlying_count >= MAX_SERIES_PER_UNDERLYING {
-            panic_with_error!(&env, Error::TooManySeriesForUnderlying);
-        }
-        env.storage().persistent().set(
-            &underlying_count_key,
-            &(underlying_count.checked_add(1).unwrap()),
-        );
-
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::SeriesCounter)
-            .unwrap();
-        let series_id = counter.checked_add(1).unwrap();
-
-        let series = OptionSeries {
-            series_id,
+        Self::create_series_inner(
+            env,
+            Auth::Multisig(multisig_contract, action_id),
             underlying,
             option_type,
             strike_price,
             expiry,
             premium,
             implied_vol,
-            open_interest: 0,
-            state: SeriesState::Active,
-            settlement_price: None,
-            created_at: now,
-        };
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Series(series_id), &series);
-        env.storage()
-            .instance()
-            .set(&DataKey::SeriesCounter, &series_id);
-
-        events::series_created(&env, series_id, strike_price, expiry, premium);
-
-        series_id
+        )
     }
 
     /// Admin updates premium (e.g. after volatility changes)
     pub fn update_premium(env: Env, series_id: u64, new_premium: i128, new_implied_vol: i128) {
-        require_not_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let mut series: OptionSeries = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Series(series_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
-
-        if series.state != SeriesState::Active {
-            panic_with_error!(&env, Error::SeriesNotActive);
-        }
-
-        series.premium = new_premium;
-        series.implied_vol = new_implied_vol;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Series(series_id), &series);
-
-        events::premium_updated(&env, series_id, new_premium, new_implied_vol);
+        Self::update_premium_inner(env, Auth::Admin, series_id, new_premium, new_implied_vol);
     }
 
     /// Permissionless alternative to update_premium: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// deployed Multisig and checks is_executable(action_id, class) instead of
     /// requiring the admin's own signature. Same rationale as
     /// create_series_via_multisig.
     pub fn update_premium_via_multisig(
@@ -411,29 +411,13 @@ impl OptionsMarket {
         new_premium: i128,
         new_implied_vol: i128,
     ) {
-        require_not_paused(&env);
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        let mut series: OptionSeries = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Series(series_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
-
-        if series.state != SeriesState::Active {
-            panic_with_error!(&env, Error::SeriesNotActive);
-        }
-
-        series.premium = new_premium;
-        series.implied_vol = new_implied_vol;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Series(series_id), &series);
-
-        events::premium_updated(&env, series_id, new_premium, new_implied_vol);
+        Self::update_premium_inner(
+            env,
+            Auth::Multisig(multisig_contract, action_id),
+            series_id,
+            new_premium,
+            new_implied_vol,
+        );
     }
 
     /// Admin cancels an Active series (e.g. mispriced, or the underlying
@@ -443,29 +427,11 @@ impl OptionsMarket {
     /// touches, and an unbounded push-refund would scale badly with the
     /// number of open positions.
     pub fn cancel_series(env: Env, series_id: u64) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let mut series: OptionSeries = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Series(series_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
-
-        if series.state != SeriesState::Active {
-            panic_with_error!(&env, Error::SeriesNotActive);
-        }
-
-        series.state = SeriesState::Cancelled;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Series(series_id), &series);
-
-        events::series_cancelled(&env, series_id);
+        Self::cancel_series_inner(env, Auth::Admin, series_id);
     }
 
     /// Permissionless alternative to cancel_series: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// deployed Multisig and checks is_executable(action_id, class) instead of
     /// requiring the admin's own signature. Cancelling a series is
     /// disruptive to every open position in it, so gating it behind M-of-N
     /// approval (rather than a single key) is at least as warranted here
@@ -476,27 +442,7 @@ impl OptionsMarket {
         action_id: u64,
         series_id: u64,
     ) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        let mut series: OptionSeries = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Series(series_id))
-            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
-
-        if series.state != SeriesState::Active {
-            panic_with_error!(&env, Error::SeriesNotActive);
-        }
-
-        series.state = SeriesState::Cancelled;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Series(series_id), &series);
-
-        events::series_cancelled(&env, series_id);
+        Self::cancel_series_inner(env, Auth::Multisig(multisig_contract, action_id), series_id);
     }
 
     /// A position holder in a Cancelled series reclaims what they put in:
@@ -1245,14 +1191,11 @@ impl OptionsMarket {
     // ── Views ─────────────────────────────────────────────────────────────────
 
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
+        zenith_common::get_admin(&env, &DataKey::Admin)
     }
 
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        zenith_common::is_paused(&env, &DataKey::Paused)
     }
 
     pub fn get_fee_rate(env: Env) -> i128 {

@@ -1,0 +1,4 @@
+# Functions whose signature a PR intentionally changes, as "<crate> <fn>".
+# spec-diff fails on any other removed or changed ABI entry.
+multisig initialize
+vault initialize

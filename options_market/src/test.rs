@@ -1021,7 +1021,7 @@ fn cancel_series_rejects_an_already_cancelled_series() {
 fn setup_vault(h: &Harness) -> Address {
     let contract_id = h.env.register_contract(None, Vault);
     let client = VaultClient::new(&h.env, &contract_id);
-    client.initialize(&h.client.address, &h.token);
+    client.initialize(&h.client.address, &h.token, &(30 * 24 * 60 * 60));
     contract_id
 }
 
@@ -1424,6 +1424,11 @@ fn setup_multisig(h: &Harness) -> (Address, [Address; 3]) {
         ],
         &2,
         &0,
+        &multisig::Delays {
+            standard: 0,
+            critical: 0,
+        },
+        &None,
     );
     (contract_id, signers)
 }
@@ -1933,4 +1938,251 @@ fn collateral_reclaimed_event_carries_position_and_amount() {
     let (event_pos_id, reclaim) = <(u64, i128)>::try_from_val(&h.env, &data).unwrap();
     assert_eq!(event_pos_id, pos_id);
     assert_eq!(reclaim, 700_000_000); // full collateral back, OTM means no payout owed
+}
+
+// ─── cross-contract: timelock tiers ──────────────────────────────────────────
+
+#[test]
+fn via_multisig_actions_wait_for_their_class_delay_but_pause_does_not() {
+    let h = setup();
+    h.env.ledger().set_timestamp(1_000);
+    let signers = [Address::generate(&h.env), Address::generate(&h.env)];
+    let multisig_id = h.env.register_contract(None, Multisig);
+    let multisig = MultisigClient::new(&h.env, &multisig_id);
+    let (standard, critical) = (24 * 3600, 72 * 3600);
+    multisig.initialize(
+        &soroban_sdk::vec![&h.env, signers[0].clone(), signers[1].clone()],
+        &2,
+        &0,
+        &multisig::Delays { standard, critical },
+        &None,
+    );
+    for id in [1u64, 2, 3] {
+        multisig.approve(&signers[0], &id);
+        multisig.approve(&signers[1], &id);
+    }
+
+    // Emergency: immediate.
+    h.client.pause_via_multisig(&multisig_id, &1);
+    assert!(h.client.is_paused());
+
+    // Standard: blocked until 24h after threshold.
+    assert!(h
+        .client
+        .try_set_fee_rate_via_multisig(&multisig_id, &2, &50)
+        .is_err());
+    h.env.ledger().set_timestamp(1_000 + standard);
+    h.client.set_fee_rate_via_multisig(&multisig_id, &2, &50);
+    assert_eq!(h.client.get_fee_rate(), 50);
+
+    // Critical: still blocked at 24h, allowed at 72h.
+    let new_admin = Address::generate(&h.env);
+    assert!(h
+        .client
+        .try_transfer_admin_via_multisig(&multisig_id, &3, &new_admin)
+        .is_err());
+    h.env.ledger().set_timestamp(1_000 + critical);
+    h.client
+        .transfer_admin_via_multisig(&multisig_id, &3, &new_admin);
+    assert_eq!(h.client.get_admin(), new_admin);
+}
+
+// ─── multisig as a custom account (__check_auth) ─────────────────────────────
+
+mod custom_account {
+    extern crate std;
+
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use multisig::{AccountConfig, AccountSignature};
+    use soroban_sdk::{
+        xdr::{
+            HashIdPreimage, HashIdPreimageSorobanAuthorization, InvokeContractArgs, Limits,
+            ScAddress, ScEnvMetaEntry, ScSymbol, ScVal, SorobanAddressCredentials,
+            SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+            SorobanCredentials, VecM, WriteXdr,
+        },
+        Bytes, IntoVal, Val, Vec,
+    };
+
+    fn keys() -> [SigningKey; 3] {
+        let mut k = [
+            SigningKey::from_bytes(&[11; 32]),
+            SigningKey::from_bytes(&[12; 32]),
+            SigningKey::from_bytes(&[13; 32]),
+        ];
+        k.sort_by_key(|k| k.verifying_key().to_bytes());
+        k
+    }
+
+    /// A valid, function-less Soroban wasm module: the header plus a
+    /// `contractenvmetav0` custom section carrying the interface version.
+    fn minimal_wasm(env: &Env) -> Bytes {
+        let meta = ScEnvMetaEntry::ScEnvMetaKindInterfaceVersion(21u64 << 32)
+            .to_xdr(Limits::none())
+            .unwrap();
+        let name = b"contractenvmetav0";
+        let mut wasm = std::vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00];
+        wasm.push((1 + name.len() + meta.len()) as u8);
+        wasm.push(name.len() as u8);
+        wasm.extend_from_slice(name);
+        wasm.extend_from_slice(&meta);
+        Bytes::from_slice(env, &wasm)
+    }
+
+    /// Builds a real signed auth entry for `account` authorizing
+    /// `contract.fn_name(args)`, signed by `signers` (already sorted).
+    fn authorize(
+        env: &Env,
+        account: &Address,
+        signers: &[&SigningKey],
+        contract: &Address,
+        fn_name: &str,
+        args: Vec<Val>,
+        nonce: i64,
+    ) {
+        let expiration = env.ledger().sequence() + 100;
+        let invocation = SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                contract_address: contract.into(),
+                function_name: ScSymbol(fn_name.try_into().unwrap()),
+                args: args
+                    .iter()
+                    .map(|v| ScVal::try_from_val(env, &v).unwrap())
+                    .collect::<std::vec::Vec<_>>()
+                    .try_into()
+                    .unwrap(),
+            }),
+            sub_invocations: VecM::default(),
+        };
+        let preimage = HashIdPreimage::SorobanAuthorization(HashIdPreimageSorobanAuthorization {
+            network_id: env.ledger().network_id().to_array().into(),
+            nonce,
+            signature_expiration_ledger: expiration,
+            invocation: invocation.clone(),
+        });
+        let payload = env
+            .crypto()
+            .sha256(&Bytes::from_slice(
+                env,
+                &preimage.to_xdr(Limits::none()).unwrap(),
+            ))
+            .to_array();
+        let mut sigs = Vec::<AccountSignature>::new(env);
+        for key in signers {
+            sigs.push_back(AccountSignature {
+                public_key: BytesN::from_array(env, &key.verifying_key().to_bytes()),
+                signature: BytesN::from_array(env, &key.sign(&payload).to_bytes()),
+            });
+        }
+        env.set_auths(&[SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::Address(SorobanAddressCredentials {
+                address: ScAddress::from(account),
+                nonce,
+                signature_expiration_ledger: expiration,
+                signature: ScVal::try_from_val(env, &sigs.to_val()).unwrap(),
+            }),
+            root_invocation: invocation,
+        }]);
+    }
+
+    #[test]
+    fn options_market_admin_actions_through_signed_multisig_auth_entries() {
+        let env = Env::default(); // deliberately no mock_all_auths()
+        let k = keys();
+        let account = env.register_contract(None, Multisig);
+        let pubkeys = k
+            .clone()
+            .map(|k| BytesN::from_array(&env, &k.verifying_key().to_bytes()));
+        MultisigClient::new(&env, &account).initialize(
+            &soroban_sdk::vec![&env, Address::generate(&env)],
+            &1,
+            &0,
+            &multisig::Delays {
+                standard: 0,
+                critical: 0,
+            },
+            &Some(AccountConfig {
+                signers: soroban_sdk::vec![
+                    &env,
+                    pubkeys[0].clone(),
+                    pubkeys[1].clone(),
+                    pubkeys[2].clone()
+                ],
+                threshold: 2,
+                allowed_contracts: soroban_sdk::vec![&env],
+            }),
+        );
+
+        let market = env.register_contract(None, OptionsMarket);
+        let client = OptionsMarketClient::new(&env, &market);
+        let (oracle, token, fee_recipient) = (
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        );
+        authorize(
+            &env,
+            &account,
+            &[&k[0], &k[1]],
+            &market,
+            "initialize",
+            (&account, &oracle, &token, &fee_recipient).into_val(&env),
+            1,
+        );
+        client.initialize(&account, &oracle, &token, &fee_recipient);
+        assert_eq!(client.get_admin(), account);
+
+        // One signature is below the 2-of-3 threshold.
+        authorize(
+            &env,
+            &account,
+            &[&k[0]],
+            &market,
+            "set_fee_rate",
+            (50u32,).into_val(&env),
+            2,
+        );
+        assert!(client.try_set_fee_rate(&50).is_err());
+
+        authorize(
+            &env,
+            &account,
+            &[&k[1], &k[2]],
+            &market,
+            "set_fee_rate",
+            (50u32,).into_val(&env),
+            3,
+        );
+        client.set_fee_rate(&50);
+        assert_eq!(client.get_fee_rate(), 50);
+
+        authorize(
+            &env,
+            &account,
+            &[&k[0], &k[2]],
+            &market,
+            "pause",
+            Vec::new(&env),
+            4,
+        );
+        client.pause();
+        assert!(client.is_paused());
+
+        // Upgrade to a real uploaded executable: the smallest module the
+        // host accepts (no functions, just the env-meta section), so the
+        // swap is observable — the market's own functions disappear.
+        let hash = env.deployer().upload_contract_wasm(minimal_wasm(&env));
+        authorize(
+            &env,
+            &account,
+            &[&k[0], &k[1]],
+            &market,
+            "upgrade",
+            (hash.clone(),).into_val(&env),
+            5,
+        );
+        client.upgrade(&hash);
+        assert!(client.try_get_fee_rate().is_err());
+    }
 }

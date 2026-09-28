@@ -1,9 +1,16 @@
 #![cfg(test)]
 
-use crate::{Multisig, MultisigClient};
+use crate::{AccountConfig, AccountSignature, ActionClass, Delays, Multisig, MultisigClient};
+use ed25519_dalek::{Signer, SigningKey};
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger as _},
-    vec, Address, Env, TryFromVal,
+    auth::{Context, ContractContext},
+    testutils::{Address as _, BytesN as _, Events as _, Ledger as _},
+    vec, Address, BytesN, Env, IntoVal, Symbol, TryFromVal, Vec,
+};
+
+const NO_DELAYS: Delays = Delays {
+    standard: 0,
+    critical: 0,
 };
 
 struct Harness<'a> {
@@ -32,6 +39,8 @@ fn setup<'a>() -> Harness<'a> {
         ],
         &2,
         &0, // no approval expiry
+        &NO_DELAYS,
+        &None,
     );
 
     Harness {
@@ -57,8 +66,13 @@ fn initialize_sets_signers_and_threshold() {
 #[should_panic(expected = "Error(Contract, #1)")] // AlreadyInitialized
 fn initialize_twice_panics() {
     let h = setup();
-    h.client
-        .initialize(&vec![&h.env, h.signers[0].clone()], &1, &0);
+    h.client.initialize(
+        &vec![&h.env, h.signers[0].clone()],
+        &1,
+        &0,
+        &NO_DELAYS,
+        &None,
+    );
 }
 
 #[test]
@@ -69,7 +83,7 @@ fn initialize_rejects_a_zero_threshold() {
     let signers = vec![&env, Address::generate(&env)];
     let contract_id = env.register_contract(None, Multisig);
     let client = MultisigClient::new(&env, &contract_id);
-    client.initialize(&signers, &0, &0);
+    client.initialize(&signers, &0, &0, &NO_DELAYS, &None);
 }
 
 #[test]
@@ -80,7 +94,7 @@ fn initialize_rejects_a_threshold_above_the_signer_count() {
     let signers = vec![&env, Address::generate(&env), Address::generate(&env)];
     let contract_id = env.register_contract(None, Multisig);
     let client = MultisigClient::new(&env, &contract_id);
-    client.initialize(&signers, &3, &0);
+    client.initialize(&signers, &3, &0, &NO_DELAYS, &None);
 }
 
 #[test]
@@ -92,7 +106,7 @@ fn initialize_rejects_a_duplicate_signer() {
     let signers = vec![&env, signer.clone(), signer];
     let contract_id = env.register_contract(None, Multisig);
     let client = MultisigClient::new(&env, &contract_id);
-    client.initialize(&signers, &1, &0);
+    client.initialize(&signers, &1, &0, &NO_DELAYS, &None);
 }
 
 // ─── approve / revoke / is_approved ────────────────────────────────────────
@@ -201,6 +215,8 @@ fn setup_with_ttl<'a>(ttl: u64) -> Harness<'a> {
         ],
         &2,
         &ttl,
+        &NO_DELAYS,
+        &None,
     );
 
     Harness {
@@ -414,11 +430,11 @@ fn reset_emits_a_reset_event_with_the_action_id_as_data() {
 
 // ─── require_auth is load-bearing where it exists, absent where it doesn't ─
 
-/// Confirms initialize()'s lack of require_auth() is an intentional
+/// Confirms initialize(, &NO_DELAYS, &None)'s lack of require_auth() is an intentional
 /// design choice, not an untested oversight: it succeeds even with NO
-/// auths mocked at all, unlike every other contract's initialize()
+/// auths mocked at all, unlike every other contract's initialize(, &NO_DELAYS, &None)
 /// here (which all require the incoming admin's own signature). See
-/// the doc comment on initialize() for why this is safe — approve()'s
+/// the doc comment on initialize(, &NO_DELAYS, &None) for why this is safe — approve()'s
 /// own require_auth() is what actually gates anything.
 #[test]
 fn initialize_does_not_require_any_signers_authorization() {
@@ -440,6 +456,8 @@ fn initialize_does_not_require_any_signers_authorization() {
         ],
         &2,
         &0,
+        &NO_DELAYS,
+        &None,
     );
     assert_eq!(client.get_signer_count(), 3);
 }
@@ -447,7 +465,7 @@ fn initialize_does_not_require_any_signers_authorization() {
 #[test]
 #[should_panic] // no auth was mocked at all — require_auth() has nothing to accept
 fn approve_without_any_authorization_panics() {
-    // Unlike initialize(), approve() DOES require the signer's own
+    // Unlike initialize(, &NO_DELAYS, &None), approve() DOES require the signer's own
     // signature — this confirms that check is load-bearing, not a
     // no-op, by never arming mock_all_auths() in the first place.
     let env = Env::default();
@@ -467,7 +485,358 @@ fn approve_without_any_authorization_panics() {
         ],
         &2,
         &0,
+        &NO_DELAYS,
+        &None,
     );
 
     client.approve(&signers[0], &42);
+}
+
+// ─── timelock tiers ──────────────────────────────────────────────────────────
+
+const STANDARD: u64 = 24 * 60 * 60;
+const CRITICAL: u64 = 72 * 60 * 60;
+
+fn setup_timelocked<'a>(ttl: u64) -> Harness<'a> {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+    let signers = [
+        Address::generate(&env),
+        Address::generate(&env),
+        Address::generate(&env),
+    ];
+    let contract_id = env.register_contract(None, Multisig);
+    let client = MultisigClient::new(&env, &contract_id);
+    client.initialize(
+        &vec![
+            &env,
+            signers[0].clone(),
+            signers[1].clone(),
+            signers[2].clone(),
+        ],
+        &2,
+        &ttl,
+        &Delays {
+            standard: STANDARD,
+            critical: CRITICAL,
+        },
+        &None,
+    );
+    Harness {
+        env,
+        client,
+        signers,
+    }
+}
+
+fn advance(h: &Harness, seconds: u64) {
+    h.env
+        .ledger()
+        .set_timestamp(h.env.ledger().timestamp() + seconds);
+}
+
+#[test]
+fn emergency_class_is_executable_as_soon_as_threshold_is_reached() {
+    let h = setup_timelocked(0);
+    h.client.approve(&h.signers[0], &1);
+    assert!(!h.client.is_executable(&1, &ActionClass::Emergency));
+    h.client.approve(&h.signers[1], &1);
+    assert!(h.client.is_executable(&1, &ActionClass::Emergency));
+    assert!(!h.client.is_executable(&1, &ActionClass::Standard));
+    assert!(!h.client.is_executable(&1, &ActionClass::Critical));
+}
+
+#[test]
+fn each_class_becomes_executable_exactly_at_its_delay() {
+    let h = setup_timelocked(0);
+    h.client.approve(&h.signers[0], &1);
+    advance(&h, 50);
+    h.client.approve(&h.signers[1], &1);
+    let reached = h.env.ledger().timestamp();
+    assert_eq!(h.client.get_threshold_reached_at(&1), Some(reached));
+
+    advance(&h, STANDARD - 1);
+    assert!(!h.client.is_executable(&1, &ActionClass::Standard));
+    advance(&h, 1);
+    assert!(h.client.is_executable(&1, &ActionClass::Standard));
+    assert!(!h.client.is_executable(&1, &ActionClass::Critical));
+
+    h.env.ledger().set_timestamp(reached + CRITICAL - 1);
+    assert!(!h.client.is_executable(&1, &ActionClass::Critical));
+    advance(&h, 1);
+    assert!(h.client.is_executable(&1, &ActionClass::Critical));
+}
+
+#[test]
+fn a_third_approval_does_not_restart_the_timer() {
+    let h = setup_timelocked(0);
+    h.client.approve(&h.signers[0], &1);
+    h.client.approve(&h.signers[1], &1);
+    advance(&h, STANDARD - 10);
+    h.client.approve(&h.signers[2], &1);
+    advance(&h, 10);
+    assert!(h.client.is_executable(&1, &ActionClass::Standard));
+}
+
+#[test]
+fn revoke_during_the_delay_resets_the_timer() {
+    let h = setup_timelocked(0);
+    h.client.approve(&h.signers[0], &1);
+    h.client.approve(&h.signers[1], &1);
+    advance(&h, STANDARD / 2);
+    h.client.revoke(&h.signers[1], &1);
+    assert_eq!(h.client.get_threshold_reached_at(&1), None);
+
+    h.client.approve(&h.signers[2], &1);
+    let reached = h.env.ledger().timestamp();
+    assert_eq!(h.client.get_threshold_reached_at(&1), Some(reached));
+    advance(&h, STANDARD / 2);
+    assert!(!h.client.is_executable(&1, &ActionClass::Standard));
+    h.env.ledger().set_timestamp(reached + STANDARD);
+    assert!(h.client.is_executable(&1, &ActionClass::Standard));
+}
+
+#[test]
+fn an_approval_expiring_during_the_delay_resets_the_timer() {
+    let ttl = STANDARD / 2;
+    let h = setup_timelocked(ttl);
+    h.client.approve(&h.signers[0], &1);
+    h.client.approve(&h.signers[1], &1);
+    advance(&h, ttl + 1); // both approvals expire: below threshold
+    assert!(!h.client.is_executable(&1, &ActionClass::Emergency));
+
+    h.client.approve(&h.signers[0], &1);
+    h.client.approve(&h.signers[2], &1);
+    let reached = h.env.ledger().timestamp();
+    assert_eq!(h.client.get_threshold_reached_at(&1), Some(reached));
+}
+
+#[test]
+fn reset_clears_the_threshold_timestamp() {
+    let h = setup_timelocked(0);
+    h.client.approve(&h.signers[0], &1);
+    h.client.approve(&h.signers[1], &1);
+    h.client.reset(&1);
+    assert_eq!(h.client.get_threshold_reached_at(&1), None);
+    assert!(!h.client.is_executable(&1, &ActionClass::Emergency));
+}
+
+#[test]
+fn delays_are_exposed_and_emergency_is_always_zero() {
+    let h = setup_timelocked(0);
+    assert_eq!(h.client.get_delay(&ActionClass::Emergency), 0);
+    assert_eq!(h.client.get_delay(&ActionClass::Standard), STANDARD);
+    assert_eq!(h.client.get_delay(&ActionClass::Critical), CRITICAL);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn initialize_rejects_a_standard_delay_above_critical() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Multisig);
+    let client = MultisigClient::new(&env, &contract_id);
+    client.initialize(
+        &vec![&env, Address::generate(&env)],
+        &1,
+        &0,
+        &Delays {
+            standard: 2,
+            critical: 1,
+        },
+        &None,
+    );
+}
+
+// ─── custom account (__check_auth) ───────────────────────────────────────────
+
+fn keys() -> [SigningKey; 3] {
+    let mut k = [
+        SigningKey::from_bytes(&[1; 32]),
+        SigningKey::from_bytes(&[2; 32]),
+        SigningKey::from_bytes(&[3; 32]),
+    ];
+    k.sort_by_key(|k| k.verifying_key().to_bytes());
+    k
+}
+
+fn setup_account(env: &Env, allowed: Vec<Address>) -> Address {
+    let contract_id = env.register_contract(None, Multisig);
+    let pubkeys = keys().map(|k| BytesN::from_array(env, &k.verifying_key().to_bytes()));
+    MultisigClient::new(env, &contract_id).initialize(
+        &vec![env, Address::generate(env)],
+        &1,
+        &0,
+        &NO_DELAYS,
+        &Some(AccountConfig {
+            signers: vec![
+                env,
+                pubkeys[0].clone(),
+                pubkeys[1].clone(),
+                pubkeys[2].clone(),
+            ],
+            threshold: 2,
+            allowed_contracts: allowed,
+        }),
+    );
+    contract_id
+}
+
+fn sign(env: &Env, key: &SigningKey, payload: &BytesN<32>) -> AccountSignature {
+    AccountSignature {
+        public_key: BytesN::from_array(env, &key.verifying_key().to_bytes()),
+        signature: BytesN::from_array(env, &key.sign(&payload.to_array()).to_bytes()),
+    }
+}
+
+fn contract_context(env: &Env, contract: &Address) -> Vec<Context> {
+    vec![
+        env,
+        Context::Contract(ContractContext {
+            contract: contract.clone(),
+            fn_name: Symbol::new(env, "pause"),
+            args: vec![env],
+        }),
+    ]
+}
+
+fn check(
+    env: &Env,
+    account: &Address,
+    payload: &BytesN<32>,
+    sigs: Vec<AccountSignature>,
+    ctx: &Vec<Context>,
+) -> Result<(), Result<crate::Error, soroban_sdk::InvokeError>> {
+    env.try_invoke_contract_check_auth::<crate::Error>(account, payload, sigs.into_val(env), ctx)
+}
+
+#[test]
+fn check_auth_accepts_m_distinct_sorted_signer_signatures() {
+    let env = Env::default();
+    let account = setup_account(&env, vec![&env]);
+    let payload = BytesN::random(&env);
+    let k = keys();
+    let ctx = contract_context(&env, &Address::generate(&env));
+    let sigs = vec![
+        &env,
+        sign(&env, &k[0], &payload),
+        sign(&env, &k[2], &payload),
+    ];
+    assert_eq!(check(&env, &account, &payload, sigs, &ctx), Ok(()));
+}
+
+#[test]
+fn check_auth_rejects_too_few_signatures() {
+    let env = Env::default();
+    let account = setup_account(&env, vec![&env]);
+    let payload = BytesN::random(&env);
+    let ctx = contract_context(&env, &Address::generate(&env));
+    let sigs = vec![&env, sign(&env, &keys()[0], &payload)];
+    assert_eq!(
+        check(&env, &account, &payload, sigs, &ctx),
+        Err(Ok(crate::Error::InsufficientSignatures))
+    );
+}
+
+#[test]
+fn check_auth_rejects_duplicate_and_unsorted_signatures() {
+    let env = Env::default();
+    let account = setup_account(&env, vec![&env]);
+    let payload = BytesN::random(&env);
+    let k = keys();
+    let ctx = contract_context(&env, &Address::generate(&env));
+    let dup = vec![
+        &env,
+        sign(&env, &k[0], &payload),
+        sign(&env, &k[0], &payload),
+    ];
+    assert_eq!(
+        check(&env, &account, &payload, dup, &ctx),
+        Err(Ok(crate::Error::UnsortedSignatures))
+    );
+    let unsorted = vec![
+        &env,
+        sign(&env, &k[1], &payload),
+        sign(&env, &k[0], &payload),
+    ];
+    assert_eq!(
+        check(&env, &account, &payload, unsorted, &ctx),
+        Err(Ok(crate::Error::UnsortedSignatures))
+    );
+}
+
+#[test]
+fn check_auth_rejects_a_non_signer_key() {
+    let env = Env::default();
+    let account = setup_account(&env, vec![&env]);
+    let payload = BytesN::random(&env);
+    let mut k = [keys()[0].clone(), SigningKey::from_bytes(&[9; 32])];
+    k.sort_by_key(|k| k.verifying_key().to_bytes());
+    let ctx = contract_context(&env, &Address::generate(&env));
+    let sigs = vec![
+        &env,
+        sign(&env, &k[0], &payload),
+        sign(&env, &k[1], &payload),
+    ];
+    assert_eq!(
+        check(&env, &account, &payload, sigs, &ctx),
+        Err(Ok(crate::Error::NotASigner))
+    );
+}
+
+#[test]
+fn check_auth_rejects_a_signature_over_a_different_payload() {
+    let env = Env::default();
+    let account = setup_account(&env, vec![&env]);
+    let payload = BytesN::random(&env);
+    let other = BytesN::random(&env);
+    let k = keys();
+    let ctx = contract_context(&env, &Address::generate(&env));
+    let sigs = vec![&env, sign(&env, &k[0], &payload), sign(&env, &k[1], &other)];
+    assert!(check(&env, &account, &payload, sigs, &ctx).is_err());
+}
+
+#[test]
+fn check_auth_enforces_the_allowed_contracts_policy() {
+    let env = Env::default();
+    let allowed = Address::generate(&env);
+    let account = setup_account(&env, vec![&env, allowed.clone()]);
+    let payload = BytesN::random(&env);
+    let k = keys();
+    let sigs = vec![
+        &env,
+        sign(&env, &k[0], &payload),
+        sign(&env, &k[1], &payload),
+    ];
+    assert_eq!(
+        check(
+            &env,
+            &account,
+            &payload,
+            sigs.clone(),
+            &contract_context(&env, &allowed)
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        check(
+            &env,
+            &account,
+            &payload,
+            sigs,
+            &contract_context(&env, &Address::generate(&env))
+        ),
+        Err(Ok(crate::Error::ContextNotAllowed))
+    );
+}
+
+#[test]
+fn check_auth_fails_when_no_account_is_configured() {
+    let h = setup();
+    let payload = BytesN::random(&h.env);
+    let ctx = contract_context(&h.env, &Address::generate(&h.env));
+    assert_eq!(
+        check(&h.env, &h.client.address, &payload, vec![&h.env], &ctx),
+        Err(Ok(crate::Error::AccountNotConfigured))
+    );
 }

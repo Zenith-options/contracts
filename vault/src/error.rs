@@ -10,4 +10,8 @@ pub enum Error {
     ContractPaused = 4,
     NoUntaggedFunds = 5,
     Unauthorized = 6,
+    InvalidPauseDuration = 7,
+    EmergencyNotAvailable = 8,
+    NotBeneficiary = 9,
+    TagNotOwned = 10,
 }

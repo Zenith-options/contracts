@@ -1,0 +1,13 @@
+[package]
+name = "zenith-common"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# Plain rlib only: this crate defines no #[contract], so linking it into
+# every contract can't collide on exported symbol names.
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { version = "21.0.0" }

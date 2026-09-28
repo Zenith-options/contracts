@@ -11,14 +11,7 @@ pub fn fee_rate_bps(env: &Env) -> i128 {
 }
 
 pub fn require_not_paused(env: &Env) {
-    let paused: bool = env
-        .storage()
-        .instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false);
-    if paused {
-        panic_with_error!(env, Error::ContractPaused);
-    }
+    zenith_common::require_not_paused(env, &DataKey::Paused, Error::ContractPaused);
 }
 
 pub fn require_active_series(env: &Env, series_id: u64) -> OptionSeries {

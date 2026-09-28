@@ -8,6 +8,7 @@
 //! (median across fresh reports) is what callers read.
 
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Symbol, Vec};
+use zenith_common::{require_admin_or_multisig, ActionClass, Auth};
 
 #[cfg(test)]
 mod test;
@@ -15,7 +16,6 @@ mod test;
 mod error;
 mod events;
 mod math;
-mod multisig_client;
 mod types;
 
 use error::Error;
@@ -26,18 +26,89 @@ const DEFAULT_MAX_STALENESS: u64 = 3600; // 1 hour
 const DEFAULT_MIN_REPORTS: u32 = 1; // any single fresh report is enough, the original behavior
 
 fn require_not_paused(env: &Env) {
-    let paused: bool = env
-        .storage()
-        .instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false);
-    if paused {
-        panic_with_error!(env, Error::ContractPaused);
-    }
+    zenith_common::require_not_paused(env, &DataKey::Paused, Error::ContractPaused);
+}
+
+fn require_auth(env: &Env, auth: &Auth, class: ActionClass) {
+    require_admin_or_multisig(env, &DataKey::Admin, auth, class, Error::Unauthorized);
 }
 
 #[contract]
 pub struct PriceOracle;
+
+impl PriceOracle {
+    fn set_max_staleness_inner(env: Env, auth: Auth, seconds: u64) {
+        require_auth(&env, &auth, ActionClass::Standard);
+        if seconds == 0 {
+            panic_with_error!(&env, Error::InvalidStaleness);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxStaleness, &seconds);
+        events::max_staleness_updated(&env, seconds);
+    }
+
+    fn set_min_reports_inner(env: Env, auth: Auth, count: u32) {
+        require_auth(&env, &auth, ActionClass::Standard);
+        if count == 0 {
+            panic_with_error!(&env, Error::InvalidMinReports);
+        }
+        env.storage().instance().set(&DataKey::MinReports, &count);
+        events::min_reports_updated(&env, count);
+    }
+
+    fn transfer_admin_inner(env: Env, auth: Auth, new_admin: Address) {
+        require_auth(&env, &auth, ActionClass::Critical);
+        let admin = zenith_common::set_admin(&env, &DataKey::Admin, &new_admin);
+        events::admin_transferred(&env, admin, new_admin);
+    }
+
+    fn set_paused_inner(env: Env, auth: Auth, paused: bool) {
+        let class = if paused {
+            ActionClass::Emergency
+        } else {
+            ActionClass::Standard
+        };
+        require_auth(&env, &auth, class);
+        zenith_common::set_paused(&env, &DataKey::Paused, paused);
+        if paused {
+            events::paused(&env);
+        } else {
+            events::unpaused(&env);
+        }
+    }
+
+    fn add_feeder_inner(env: Env, auth: Auth, feeder: Address) {
+        require_not_paused(&env);
+        require_auth(&env, &auth, ActionClass::Standard);
+
+        let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
+        if feeders.contains(&feeder) {
+            panic_with_error!(&env, Error::FeederAlreadyAdded);
+        }
+        if feeders.len() >= MAX_FEEDERS {
+            panic_with_error!(&env, Error::TooManyFeeders);
+        }
+        feeders.push_back(feeder.clone());
+        env.storage().instance().set(&DataKey::Feeders, &feeders);
+        events::feeder_added(&env, feeder);
+    }
+
+    fn remove_feeder_inner(env: Env, auth: Auth, feeder: Address) {
+        require_not_paused(&env);
+        require_auth(&env, &auth, ActionClass::Standard);
+
+        let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
+        match feeders.first_index_of(&feeder) {
+            Some(i) => {
+                feeders.remove(i).unwrap();
+                env.storage().instance().set(&DataKey::Feeders, &feeders);
+                events::feeder_removed(&env, feeder);
+            }
+            None => panic_with_error!(&env, Error::FeederNotFound),
+        }
+    }
+}
 
 #[contractimpl]
 impl PriceOracle {
@@ -61,19 +132,11 @@ impl PriceOracle {
     /// Admin adjusts how old a feeder's report can be and still count
     /// toward get_price's aggregate.
     pub fn set_max_staleness(env: Env, seconds: u64) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        if seconds == 0 {
-            panic_with_error!(&env, Error::InvalidStaleness);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::MaxStaleness, &seconds);
-        events::max_staleness_updated(&env, seconds);
+        Self::set_max_staleness_inner(env, Auth::Admin, seconds);
     }
 
     /// Permissionless alternative to set_max_staleness: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// deployed Multisig and checks is_executable(action_id, class) instead of
     /// requiring the admin's own signature. Worth gating the same way as
     /// pause/transfer_admin — a compromised admin widening max_staleness
     /// is a quiet way to make get_price accept increasingly stale, and
@@ -84,17 +147,7 @@ impl PriceOracle {
         action_id: u64,
         seconds: u64,
     ) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        if seconds == 0 {
-            panic_with_error!(&env, Error::InvalidStaleness);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::MaxStaleness, &seconds);
-        events::max_staleness_updated(&env, seconds);
+        Self::set_max_staleness_inner(env, Auth::Multisig(multisig_contract, action_id), seconds);
     }
 
     pub fn get_max_staleness(env: Env) -> u64 {
@@ -112,17 +165,11 @@ impl PriceOracle {
     /// no averaging effect at all, defeating the point of aggregating
     /// across multiple feeders in the first place.
     pub fn set_min_reports(env: Env, count: u32) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        if count == 0 {
-            panic_with_error!(&env, Error::InvalidMinReports);
-        }
-        env.storage().instance().set(&DataKey::MinReports, &count);
-        events::min_reports_updated(&env, count);
+        Self::set_min_reports_inner(env, Auth::Admin, count);
     }
 
     /// Permissionless alternative to set_min_reports: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// deployed Multisig and checks is_executable(action_id, class) instead of
     /// requiring the admin's own signature. Worth gating the same way as
     /// set_max_staleness_via_multisig — a compromised admin lowering
     /// min_reports back to 1 is a quiet way to make get_price trust a
@@ -133,15 +180,7 @@ impl PriceOracle {
         action_id: u64,
         count: u32,
     ) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        if count == 0 {
-            panic_with_error!(&env, Error::InvalidMinReports);
-        }
-        env.storage().instance().set(&DataKey::MinReports, &count);
-        events::min_reports_updated(&env, count);
+        Self::set_min_reports_inner(env, Auth::Multisig(multisig_contract, action_id), count);
     }
 
     pub fn get_min_reports(env: Env) -> u32 {
@@ -149,20 +188,17 @@ impl PriceOracle {
     }
 
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
+        zenith_common::get_admin(&env, &DataKey::Admin)
     }
 
     /// Admin hands off control to a new address. Requires the CURRENT
     /// admin's signature, not the incoming one.
     pub fn transfer_admin(env: Env, new_admin: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        events::admin_transferred(&env, admin, new_admin);
+        Self::transfer_admin_inner(env, Auth::Admin, new_admin);
     }
 
     /// Permissionless alternative to transfer_admin: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// deployed Multisig and checks is_executable(action_id, class) instead of
     /// requiring the current admin's own signature — same pattern as
     /// options_market's transfer_admin_via_multisig.
     pub fn transfer_admin_via_multisig(
@@ -171,13 +207,7 @@ impl PriceOracle {
         action_id: u64,
         new_admin: Address,
     ) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        events::admin_transferred(&env, admin, new_admin);
+        Self::transfer_admin_inner(env, Auth::Multisig(multisig_contract, action_id), new_admin);
     }
 
     /// Emergency stop: blocks add_feeder, remove_feeder, and report_price.
@@ -185,67 +215,35 @@ impl PriceOracle {
     /// further changes to the feed, not hide the last-known price from
     /// callers still reading it.
     pub fn pause(env: Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &true);
-        events::paused(&env);
+        Self::set_paused_inner(env, Auth::Admin, true);
     }
 
     pub fn unpause(env: Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &false);
-        events::unpaused(&env);
+        Self::set_paused_inner(env, Auth::Admin, false);
     }
 
     /// Permissionless alternative to pause(), same rationale and pattern
     /// as options_market's pause_via_multisig.
     pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        env.storage().instance().set(&DataKey::Paused, &true);
-        events::paused(&env);
+        Self::set_paused_inner(env, Auth::Multisig(multisig_contract, action_id), true);
     }
 
     pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-        env.storage().instance().set(&DataKey::Paused, &false);
-        events::unpaused(&env);
+        Self::set_paused_inner(env, Auth::Multisig(multisig_contract, action_id), false);
     }
 
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        zenith_common::is_paused(&env, &DataKey::Paused)
     }
 
     /// Admin authorizes a new price feeder. Feeders are the only addresses
     /// allowed to call report_price.
     pub fn add_feeder(env: Env, feeder: Address) {
-        require_not_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
-        if feeders.contains(&feeder) {
-            panic_with_error!(&env, Error::FeederAlreadyAdded);
-        }
-        if feeders.len() >= MAX_FEEDERS {
-            panic_with_error!(&env, Error::TooManyFeeders);
-        }
-        feeders.push_back(feeder.clone());
-        env.storage().instance().set(&DataKey::Feeders, &feeders);
-        events::feeder_added(&env, feeder);
+        Self::add_feeder_inner(env, Auth::Admin, feeder);
     }
 
     /// Permissionless alternative to add_feeder: cross-calls a deployed
-    /// Multisig and checks is_approved(action_id) instead of requiring
+    /// Multisig and checks is_executable(action_id, class) instead of requiring
     /// the admin's own signature. Adding a feeder expands who can move
     /// get_price's aggregate, so gating it behind M-of-N is at least as
     /// warranted as pause.
@@ -255,45 +253,18 @@ impl PriceOracle {
         action_id: u64,
         feeder: Address,
     ) {
-        require_not_paused(&env);
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
-        if feeders.contains(&feeder) {
-            panic_with_error!(&env, Error::FeederAlreadyAdded);
-        }
-        if feeders.len() >= MAX_FEEDERS {
-            panic_with_error!(&env, Error::TooManyFeeders);
-        }
-        feeders.push_back(feeder.clone());
-        env.storage().instance().set(&DataKey::Feeders, &feeders);
-        events::feeder_added(&env, feeder);
+        Self::add_feeder_inner(env, Auth::Multisig(multisig_contract, action_id), feeder);
     }
 
     /// Admin revokes a feeder's authorization. Their most recent price
     /// report is left in storage (for audit purposes) but is no longer
     /// counted toward the aggregate once removed.
     pub fn remove_feeder(env: Env, feeder: Address) {
-        require_not_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-
-        let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
-        match feeders.first_index_of(&feeder) {
-            Some(i) => {
-                feeders.remove(i).unwrap();
-                env.storage().instance().set(&DataKey::Feeders, &feeders);
-                events::feeder_removed(&env, feeder);
-            }
-            None => panic_with_error!(&env, Error::FeederNotFound),
-        }
+        Self::remove_feeder_inner(env, Auth::Admin, feeder);
     }
 
     /// Permissionless alternative to remove_feeder: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
+    /// deployed Multisig and checks is_executable(action_id, class) instead of
     /// requiring the admin's own signature. Same rationale as
     /// add_feeder_via_multisig.
     pub fn remove_feeder_via_multisig(
@@ -302,21 +273,7 @@ impl PriceOracle {
         action_id: u64,
         feeder: Address,
     ) {
-        require_not_paused(&env);
-        let multisig = multisig_client::Client::new(&env, &multisig_contract);
-        if !multisig.is_approved(&action_id) {
-            panic_with_error!(&env, Error::Unauthorized);
-        }
-
-        let mut feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
-        match feeders.first_index_of(&feeder) {
-            Some(i) => {
-                feeders.remove(i).unwrap();
-                env.storage().instance().set(&DataKey::Feeders, &feeders);
-                events::feeder_removed(&env, feeder);
-            }
-            None => panic_with_error!(&env, Error::FeederNotFound),
-        }
+        Self::remove_feeder_inner(env, Auth::Multisig(multisig_contract, action_id), feeder);
     }
 
     pub fn is_feeder(env: Env, address: Address) -> bool {

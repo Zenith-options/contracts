@@ -1732,6 +1732,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zenith-common"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "zenith-multisig"
 version = "0.1.0"
 dependencies = [
@@ -1742,7 +1749,9 @@ dependencies = [
 name = "zenith-options-market"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "soroban-sdk",
+ "zenith-common",
  "zenith-multisig",
  "zenith-price-oracle",
  "zenith-vault",
@@ -1753,6 +1762,7 @@ name = "zenith-price-oracle"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "zenith-common",
 ]
 
 [[package]]
@@ -1760,6 +1770,7 @@ name = "zenith-vault"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "zenith-common",
 ]
 
 [[package]]

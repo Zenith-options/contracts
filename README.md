@@ -42,32 +42,38 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   threshold if that `action_id` is ever reused later. `options_market`,
   `price_oracle`, and `vault` each cross-call a live Multisig deployment
   as a permissionless alternative to their own admin-gated
-  `pause`/`unpause`/`transfer_admin`; see "Known gaps" below for what's
-  still admin-only.
+  functions, via `is_executable(action_id, class)`, which adds a
+  per-class timelock on top of `is_approved` (see "Timelock tiers"
+  below). It can also act as a Soroban **custom account**
+  (`__check_auth`) — set its address as a plain `admin` anywhere and
+  authorize calls with M-of-N ed25519 signatures.
+- [`common/`](common) — `zenith-common`, a plain rlib (no `#[contract]`,
+  no exported spec entries) shared by options_market, price_oracle and
+  vault: `require_admin_or_multisig(env, admin_key, Auth, class, err)`
+  with `enum Auth { Admin, Multisig(multisig, action_id) }`, plus pause
+  and admin-transfer helpers. Every admin function is a single
+  `x_inner(env, Auth, ...)` called by both its admin-gated entrypoint
+  and its `_via_multisig` twin, so no validation is duplicated between
+  twins.
 
 ## Building and testing
 
 Each crate is standalone (no workspace `Cargo.toml`), but **build order
-matters for options_market, price_oracle, and vault**: all three
-cross-call other contracts via soroban-sdk's `contractimport!` against
-their *compiled wasm* (not a normal source dependency — that would
-link the other contract's own functions into the caller's wasm and
-collide with functions of the same name, like `pause`/`transfer_admin`).
-options_market depends on price_oracle's, multisig's, AND (since the
-`escrow_series_to_vault`/`claim_refund_from_vault` integration) vault's
-wasm; price_oracle and vault each depend on multisig's wasm. That means
-the dependency wasm has to exist before the dependent crate can be
-compiled at all, even natively:
+matters for options_market**: it cross-calls price_oracle and vault via
+soroban-sdk's `contractimport!` against their *compiled wasm* (not a
+normal source dependency — that would link the other contract's own
+functions into the caller's wasm and collide with functions of the same
+name, like `pause`/`transfer_admin`). So those two wasm files have to
+exist before options_market can be compiled at all, even natively.
+Multisig is cross-called through `zenith-common` with `invoke_contract`
+instead, so nothing needs multisig's wasm to compile:
 
 ```sh
-cd multisig
-cargo build --target wasm32-unknown-unknown --release   # do this FIRST — price_oracle, vault, and options_market all need it
-
-cd ../price_oracle
-cargo build --target wasm32-unknown-unknown --release   # do this SECOND — options_market needs it, and price_oracle itself needs multisig's wasm to already exist
+cd price_oracle
+cargo build --target wasm32-unknown-unknown --release   # options_market needs it
 
 cd ../vault
-cargo build --target wasm32-unknown-unknown --release   # do this THIRD — options_market needs it too, and vault itself needs multisig's wasm to already exist
+cargo build --target wasm32-unknown-unknown --release   # options_market needs it too
 
 cd ../options_market   # now this crate can build/test/etc.
 cargo build                                   # native build, fast iteration
@@ -77,15 +83,18 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
-`vault` only needs multisig's wasm built first, no other dependency of
-its own (options_market depending on vault's wasm doesn't run the other
-way). `multisig` itself has no dependency on anything else and can be
-built/tested independently, in any order relative to the others.
+`multisig`, `price_oracle`, `vault` and `common` can be built/tested
+independently, in any order.
 
-CI (`.github/workflows/ci.yml`) builds the required dependency wasm(s)
-first whenever a job is about to touch options_market, price_oracle,
-or vault, then runs the same four checks against every push and PR,
-for all four crates.
+CI (`.github/workflows/ci.yml`) builds price_oracle's and vault's wasm
+first whenever a job is about to touch options_market, then runs the
+same four checks against every push and PR, for every crate. On PRs a
+`spec-diff` job (`tools/spec-diff/check.sh <base-ref>`) builds every
+contract at the base branch and at the PR, fails if any existing
+function, type or error in a contract's spec was removed or changed
+(additions are fine; intentional signature changes must be listed in
+`tools/spec-diff/allow.txt`), and prints each contract's wasm size
+delta.
 
 Every event any of these four contracts publishes has a test that
 decodes its actual payload via `TryFromVal` (topics and data), not
@@ -140,19 +149,19 @@ documented per field.
 |---|---|
 | `initialize(admin, oracle, collateral_token, fee_recipient)` | One-time setup. Panics with `AlreadyInitialized` if called twice. |
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
-| `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
+| `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the current admin's own signature. |
 | `set_fee_rate(new_bps)` | Sets the protocol fee (basis points). Capped at `MAX_FEE_RATE_BPS` (1000 = 10%). |
-| `set_fee_rate_via_multisig(multisig_contract, action_id, new_bps)` | Permissionless alternative to `set_fee_rate`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Still enforces `MAX_FEE_RATE_BPS` — approval changes who can call it, not what rate is valid. |
+| `set_fee_rate_via_multisig(multisig_contract, action_id, new_bps)` | Permissionless alternative to `set_fee_rate`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Still enforces `MAX_FEE_RATE_BPS` — approval changes who can call it, not what rate is valid. |
 | `pause()` / `unpause()` | Emergency stop. Blocks `create_series`, `update_premium`, `buy_option`, `write_option`. Does **not** block `exercise`, `set_settlement_price`, or `reclaim_collateral` — a pause winds existing positions down, it doesn't trap funds. |
-| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
+| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `upgrade(new_wasm_hash)` | Swaps the contract's executable via Soroban's deployer, keeping the same address, ID, and storage. |
-| `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
+| `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
 | `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out. Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. |
-| `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Same validation and per-underlying cap apply. |
+| `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Same validation and per-underlying cap apply. |
 | `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. |
-| `update_premium_via_multisig(multisig_contract, action_id, series_id, new_premium, new_implied_vol)` | Permissionless alternative to `update_premium`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
+| `update_premium_via_multisig(multisig_contract, action_id, series_id, new_premium, new_implied_vol)` | Permissionless alternative to `update_premium`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. |
 | `cancel_series(series_id)` | Cancels an Active series. Position holders then call `claim_refund` individually — the admin doesn't push funds to everyone in one call, since that would scale badly against Soroban's per-call resource limits. |
-| `cancel_series_via_multisig(multisig_contract, action_id, series_id)` | Permissionless alternative to `cancel_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Cancelling disrupts every open position in a series, so gating it behind M-of-N is at least as warranted as pause. |
+| `cancel_series_via_multisig(multisig_contract, action_id, series_id)` | Permissionless alternative to `cancel_series`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Cancelling disrupts every open position in a series, so gating it behind M-of-N is at least as warranted as pause. |
 
 ### Oracle
 
@@ -213,15 +222,15 @@ documented per field.
 |---|---|
 | `initialize(admin)` | One-time setup. Defaults `max_staleness` to 1 hour and `min_reports` to 1. |
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
-| `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
+| `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the current admin's own signature. |
 | `add_feeder(feeder)` / `remove_feeder(feeder)` | Authorize/revoke a price reporter. Capped at `MAX_FEEDERS` (16). A removed feeder's past reports stay readable via `get_latest_report` (audit trail) but no longer count toward the aggregate. |
-| `add_feeder_via_multisig(multisig_contract, action_id, feeder)` / `remove_feeder_via_multisig(...)` | Permissionless alternatives: cross-call a deployed `multisig` and check `is_approved(action_id)` instead of requiring the admin's own signature. Still enforce `FeederAlreadyAdded`/`TooManyFeeders`/`FeederNotFound` — approval changes who can call these, not the underlying invariants. |
+| `add_feeder_via_multisig(multisig_contract, action_id, feeder)` / `remove_feeder_via_multisig(...)` | Permissionless alternatives: cross-call a deployed `multisig` and check `is_executable(action_id, class)` instead of requiring the admin's own signature. Still enforce `FeederAlreadyAdded`/`TooManyFeeders`/`FeederNotFound` — approval changes who can call these, not the underlying invariants. |
 | `set_max_staleness(seconds)` | How old a report can be and still count toward `get_price`. Rejects zero. |
-| `set_max_staleness_via_multisig(multisig_contract, action_id, seconds)` | Permissionless alternative: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Still rejects zero — approval changes who can call it, not what a valid staleness bound is. |
+| `set_max_staleness_via_multisig(multisig_contract, action_id, seconds)` | Permissionless alternative: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Still rejects zero — approval changes who can call it, not what a valid staleness bound is. |
 | `set_min_reports(count)` | How many CURRENTLY-fresh feeder reports `get_price` requires before it returns an aggregate at all. Without this, a single fresh report is enough the moment every other feeder's report goes stale or gets removed — that one feeder then fully determines the price with no averaging effect. Rejects zero. |
-| `set_min_reports_via_multisig(multisig_contract, action_id, count)` | Permissionless alternative: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Still rejects zero. |
+| `set_min_reports_via_multisig(multisig_contract, action_id, count)` | Permissionless alternative: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Still rejects zero. |
 | `pause()` / `unpause()` | Emergency stop. Blocks `add_feeder`, `remove_feeder`, `report_price`. Does **not** block `get_price` — a pause freezes changes to the feed, it doesn't hide the last-known price. |
-| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
+| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 
 ### Feeders
 
@@ -267,32 +276,52 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 
 | Function | Description |
 |---|---|
-| `initialize(admin, token)` | One-time setup. |
+| `initialize(admin, token, max_pause_duration)` | One-time setup. `max_pause_duration` (seconds, non-zero) is immutable afterward — see "Pause and the escape hatch". |
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
-| `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
-| `pause()` / `unpause()` | Emergency stop. Blocks **both** `deposit` and `withdraw` — unlike options_market's pause (which leaves settlement paths open), there's no "existing position needs an exit" concern independent of the vault itself. |
-| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
+| `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the current admin's own signature. |
+| `pause()` / `unpause()` | Emergency stop. Blocks **both** `deposit` and `withdraw` (and `transfer_tag`, `set_beneficiary`). Time-bounded: see "Pause and the escape hatch" below. |
+| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `withdraw(tag, to, amount)` | Pays `amount` of `tag`'s escrowed balance to `to`. Panics with `InsufficientEscrowBalance` if `tag` doesn't have that much earmarked, regardless of the vault's total token balance. Admin-gated — in the intended integration, `admin` is set to a calling contract's own address, so a contract-to-contract call satisfies the auth check through the call itself. |
-| `withdraw_via_multisig(multisig_contract, action_id, tag, to, amount)` | Permissionless alternative to `withdraw`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Meant for manual recovery/migration when the calling contract itself can't produce that signature. Still enforces `InsufficientEscrowBalance`. |
+| `withdraw_via_multisig(multisig_contract, action_id, tag, to, amount)` | Permissionless alternative to `withdraw`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Meant for manual recovery/migration when the calling contract itself can't produce that signature. Still enforces `InsufficientEscrowBalance`. |
 | `sweep_untagged(to)` | Recovers tokens that landed on the vault directly, bypassing `deposit` (e.g. a stray transfer). Computes the actual token balance minus `get_total_escrowed`'s ledger sum and transfers exactly that difference; panics with `NoUntaggedFunds` if there's nothing to recover. |
-| `sweep_untagged_via_multisig(multisig_contract, action_id, to)` | Permissionless alternative to `sweep_untagged`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
+| `sweep_untagged_via_multisig(multisig_contract, action_id, to)` | Permissionless alternative to `sweep_untagged`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. |
 | `transfer_tag(from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement at all — meant for the roll_position case (close + reopen in one breath, collateral doesn't need to leave and come back). `TotalEscrowed` is unaffected. |
-| `transfer_tag_via_multisig(multisig_contract, action_id, from_tag, to_tag, amount)` | Permissionless alternative to `transfer_tag`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
+| `transfer_tag_via_multisig(multisig_contract, action_id, from_tag, to_tag, amount)` | Permissionless alternative to `transfer_tag`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. |
 
 ### Depositors
 
 | Function | Description |
 |---|---|
-| `deposit(from, tag, amount)` | Pulls `amount` from `from` and credits `tag`'s ledger. Requires `from`'s own signature. |
+| `deposit(from, tag, amount)` | Pulls `amount` from `from` and credits `tag`'s ledger. Requires `from`'s own signature. The first depositor to a tag becomes its owner. |
+| `set_beneficiary(tag, beneficiary)` | Registers who may `emergency_withdraw` the tag. Requires the tag owner's signature; rejected while paused, so a beneficiary can't be redirected once the escape-hatch clock is running. |
+| `emergency_withdraw(tag, beneficiary)` | Escape hatch: once the vault has been paused for more than `max_pause_duration`, the tag's registered beneficiary (signing) receives the tag's whole balance. Emits `emergency_withdrawn`. |
+
+### Pause and the escape hatch
+
+A pause is an incident tool, not a custody seizure. `pause` records
+`PausedAt`; once the vault has counted as paused for **more than**
+`max_pause_duration` (fixed at `initialize`), each tag's registered
+beneficiary can `emergency_withdraw` that tag's balance without the
+admin. Pause time is **cumulative**: unpausing adds the elapsed pause to
+an accrued total, and that total only resets after the vault has stayed
+unpaused for a full `max_pause_duration` — so a brief unpause/re-pause
+can't restart the clock. Tags without a registered beneficiary have no
+hatch. For options_market's series-tagged escrow, the market contract is
+the tag owner and would have to register beneficiaries itself (out of
+scope here; possible follow-up with per-position tags).
 
 ### Views
 
-`balance_of(tag)`, `get_total_escrowed`, `get_admin`, `get_token`, `is_paused`.
+`balance_of(tag)`, `get_total_escrowed`, `get_admin`, `get_token`, `is_paused`,
+`get_tag_owner(tag)`, `get_beneficiary(tag)`, `get_max_pause_duration`,
+`get_paused_at`, `get_pause_duration` (seconds counted toward the limit now).
 
 ### Events
 
 `admin_transferred`, `paused`, `unpaused`, `deposited`, `withdrawn`,
-`swept_untagged`, `tag_transferred`.
+`swept_untagged`, `tag_transferred`, `beneficiary_set`,
+`emergency_withdrawn` (topics `(emergency_withdrawn, beneficiary, tag)`,
+data `amount`).
 
 ### Errors
 
@@ -304,23 +333,103 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 | 4 | `ContractPaused` |
 | 5 | `NoUntaggedFunds` |
 | 6 | `Unauthorized` |
+| 7 | `InvalidPauseDuration` |
+| 8 | `EmergencyNotAvailable` |
+| 9 | `NotBeneficiary` |
+| 10 | `TagNotOwned` |
 
 ## `multisig` reference
 
-Signers, threshold, and `approval_ttl` are all fixed at `initialize` and
-immutable — there's deliberately no in-protocol way to change the signer
+Signers, threshold, `approval_ttl`, timelock `delays` and the optional
+custom-account config are all fixed at `initialize` and immutable — there's deliberately no in-protocol way to change the signer
 set, so a compromised signer can never add another compromised signer.
 
 | Function | Description |
 |---|---|
-| `initialize(signers, threshold, approval_ttl)` | One-time setup. Rejects a zero threshold, a threshold above the signer count, or a duplicate signer. `approval_ttl` is in seconds; zero means approvals never expire (the original behavior). |
+| `initialize(signers, threshold, approval_ttl, delays, account)` | One-time setup. Rejects a zero threshold, a threshold above the signer count, or a duplicate signer. `approval_ttl` is in seconds; zero means approvals never expire (the original behavior). `delays: Delays { standard, critical }` (seconds; `standard <= critical`). `account: Option<AccountConfig { signers: Vec<BytesN<32>>, threshold, allowed_contracts }>` enables custom-account mode. |
 | `approve(signer, action_id)` | Records `signer`'s approval, stamped with the current ledger timestamp. Requires the signer's own signature and current signer-set membership. Rejects a signer voting twice on the same `action_id` while their existing approval is still fresh — an EXPIRED approval is treated as no approval at all, so re-approving after expiry just refreshes the timestamp instead of erroring. |
 | `revoke(signer, action_id)` | Withdraws `signer`'s own still-fresh vote. Rejects revoking an approval that's already expired — there's nothing left to withdraw. |
 | `reset(action_id)` | Clears every signer's approval of `action_id`, so a repeat action reusing the same id starts from a clean slate. Only callable once `action_id` is already approved. |
 
 ### Views
 
-`is_signer`, `get_signer_count`, `get_threshold`, `get_approval_ttl`, `has_approved(action_id, signer)` (false if expired), `get_approval_count(action_id)` (counts only currently-unexpired approvals), `is_approved(action_id)`.
+`is_signer`, `get_signer_count`, `get_threshold`, `get_approval_ttl`, `has_approved(action_id, signer)` (false if expired), `get_approval_count(action_id)` (counts only currently-unexpired approvals), `is_approved(action_id)`, `is_executable(action_id, class)`, `get_threshold_reached_at(action_id)`, `get_delays`, `get_delay(class)`, `get_account_config`.
+
+### Timelock tiers
+
+Every `_via_multisig` entrypoint declares an `ActionClass`, and checks
+`is_executable(action_id, class)`: the action must be approved **and**
+have stayed at threshold for that class's delay. The approval that
+crosses the threshold records `threshold_reached_at`; a revoke that
+drops below clears it, and if an approval expires during the delay the
+action drops below threshold and the approval that restores it restarts
+the timer. `reset` clears it too. Delays are immutable (set at
+`initialize`). Admin-signed (non-multisig) calls are not timelocked.
+
+| Class | Delay | Functions |
+|---|---|---|
+| `Emergency` | none | `pause_via_multisig` (all three contracts) |
+| `Standard` | `delays.standard` (e.g. 24h) | `unpause_via_multisig` (all); options_market `set_fee_rate`, `create_series`, `update_premium`, `cancel_series`; price_oracle `set_max_staleness`, `set_min_reports`, `add_feeder`, `remove_feeder` (all `_via_multisig`) |
+| `Critical` | `delays.critical` (e.g. 72h) | `transfer_admin_via_multisig` (all); options_market `upgrade`; vault `withdraw`, `transfer_tag`, `sweep_untagged` (all `_via_multisig`) |
+
+### Custom account (`__check_auth`)
+
+With an `AccountConfig`, the multisig's own address works as a plain
+`admin: Address` in any contract: every existing `admin.require_auth()`
+is satisfied by a transaction auth entry carrying
+`Vec<AccountSignature { public_key, signature }>` — at least
+`threshold` ed25519 signatures over the auth payload from distinct
+configured keys, **sorted strictly ascending by public key** (duplicates
+and unsorted lists are rejected, as are non-signer keys). If
+`allowed_contracts` is non-empty, the account only authorizes calls into
+those contracts and never contract creation.
+
+**Which mode to use:** custom-account mode needs no `_via_multisig`
+code, works with every admin-gated function (and can hold funds and sign
+token transfers), but signatures are collected off-chain and there is
+**no timelock**. Approval mode (`approve` + `_via_multisig`) is
+on-chain, auditable vote-by-vote, and enforces the timelock tiers above
+— prefer it for upgrades and admin transfers.
+
+CLI walkthrough for signing an admin transaction (here `pause` on
+options_market whose `admin` is the multisig account):
+
+```sh
+# 1. Build + simulate the call; the simulation returns the auth entry
+#    the multisig address must sign.
+stellar contract invoke --id <market-id> --source <fee-payer> --network testnet \
+  --build-only -- pause > pause.tx
+stellar tx simulate --network testnet < pause.tx > pause.sim.tx
+```
+
+```js
+// 2. Each signer signs the entry's payload; assemble sorted signatures.
+import { xdr, hash, Keypair } from "@stellar/stellar-sdk";
+const creds = entry.credentials().address(); // entry: the simulated SorobanAuthorizationEntry
+creds.signatureExpirationLedger(validUntil);
+const payload = hash(xdr.HashIdPreimage.envelopeTypeSorobanAuthorization(
+  new xdr.HashIdPreimageSorobanAuthorization({
+    networkId: hash(Buffer.from(networkPassphrase)),
+    nonce: creds.nonce(),
+    signatureExpirationLedger: validUntil,
+    invocation: entry.rootInvocation(),
+  })).toXDR());
+const sigs = signers // Keypair[] holding M of the configured keys
+  .sort((a, b) => Buffer.compare(a.rawPublicKey(), b.rawPublicKey()))
+  .map((kp) => xdr.ScVal.scvMap([
+    new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("public_key"), val: xdr.ScVal.scvBytes(kp.rawPublicKey()) }),
+    new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("signature"), val: xdr.ScVal.scvBytes(kp.sign(payload)) }),
+  ]));
+creds.signature(xdr.ScVal.scvVec(sigs));
+```
+
+```sh
+# 3. Re-simulate with the signed entry (for accurate fees), sign as the
+#    fee payer, and submit.
+stellar tx simulate --network testnet < pause.signed.tx \
+  | stellar tx sign --sign-with-key <fee-payer> --network testnet \
+  | stellar tx send --network testnet
+```
 
 ### Events
 
@@ -336,6 +445,11 @@ set, so a compromised signer can never add another compromised signer.
 | 4 | `NotASigner` |
 | 5 | `AlreadyApproved` |
 | 6 | `NotYetApproved` |
+| 7 | `InvalidDelays` |
+| 8 | `AccountNotConfigured` |
+| 9 | `UnsortedSignatures` |
+| 10 | `InsufficientSignatures` |
+| 11 | `ContextNotAllowed` |
 
 ## Known gaps
 
@@ -397,8 +511,9 @@ set, so a compromised signer can never add another compromised signer.
   is no admin, and therefore no Multisig deployment trusted by this
   contract, until it runs. Every `_via_multisig` function is additive
   (the original admin-gated version is unchanged) and checks
-  `is_approved(action_id)` on a deployed Multisig instead of a single
-  signature, with the same validation the original enforces — approval
+  `is_executable(action_id, class)` on a deployed Multisig instead of a
+  single signature, sharing the same `x_inner` implementation (and so
+  the same validation) as the original — approval
   only changes who can call a function, never what a valid call to it
   looks like. Callers still choose their own stable `action_id` scheme
   per function, since Multisig never interprets what an id means.

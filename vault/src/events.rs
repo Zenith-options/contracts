@@ -36,3 +36,15 @@ pub fn tag_transferred(env: &Env, from_tag: u64, to_tag: u64, amount: i128) {
         amount,
     );
 }
+
+pub fn beneficiary_set(env: &Env, tag: u64, beneficiary: Address) {
+    env.events()
+        .publish((Symbol::new(env, "beneficiary_set"), tag), beneficiary);
+}
+
+pub fn emergency_withdrawn(env: &Env, tag: u64, beneficiary: Address, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "emergency_withdrawn"), beneficiary, tag),
+        amount,
+    );
+}

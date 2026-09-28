@@ -10,4 +10,9 @@ pub enum Error {
     NotASigner = 4,
     AlreadyApproved = 5,
     NotYetApproved = 6,
+    InvalidDelays = 7,
+    AccountNotConfigured = 8,
+    UnsortedSignatures = 9,
+    InsufficientSignatures = 10,
+    ContextNotAllowed = 11,
 }
