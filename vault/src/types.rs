@@ -13,4 +13,12 @@ pub enum DataKey {
     /// undifferentiated balance.
     Escrow(u64),
     TotalEscrowed,
+    /// Enumerable index of every tag with a nonzero escrow balance,
+    /// maintained with swap-remove so add/remove are both O(1):
+    /// `TagAt(i)` is the tag at position `i` in `0..TagCount`, and
+    /// `TagPos(tag)` is that tag's position, for the reverse lookup a
+    /// swap-remove needs.
+    TagCount,
+    TagAt(u32),
+    TagPos(u64),
 }

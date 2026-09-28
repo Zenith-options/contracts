@@ -10,4 +10,5 @@ pub enum Error {
     ContractPaused = 4,
     NoUntaggedFunds = 5,
     Unauthorized = 6,
+    InvalidBatchSize = 7,
 }

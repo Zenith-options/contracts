@@ -11,7 +11,7 @@
 //! 7" is always answerable instead of inferred from the token contract's
 //! raw balance.
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, Map, Vec};
 
 #[cfg(test)]
 mod test;
@@ -33,6 +33,158 @@ fn require_not_paused(env: &Env) {
     if paused {
         panic_with_error!(env, Error::ContractPaused);
     }
+}
+
+/// Max entries in one withdraw_batch/transfer_tag_batch call.
+pub const MAX_BATCH: u32 = 50;
+/// Max tags returned by one get_tags/verify_ledger page.
+pub const MAX_PAGE: u32 = 100;
+
+fn escrow_of(env: &Env, tag: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Escrow(tag))
+        .unwrap_or(0)
+}
+
+fn tag_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TagCount)
+        .unwrap_or(0)
+}
+
+/// The only place a tag's escrow balance is written. Keeps the ActiveTags
+/// index in sync: a tag joins it on its first nonzero balance and leaves
+/// it (swap-remove, O(1)) when its balance returns to zero.
+fn set_escrow(env: &Env, tag: u64, new_balance: i128) {
+    let old_balance = escrow_of(env, tag);
+    let store = env.storage().persistent();
+    if new_balance == 0 {
+        store.remove(&DataKey::Escrow(tag));
+        if old_balance != 0 {
+            let pos: u32 = store.get(&DataKey::TagPos(tag)).unwrap();
+            let last = tag_count(env) - 1;
+            if pos != last {
+                let last_tag: u64 = store.get(&DataKey::TagAt(last)).unwrap();
+                store.set(&DataKey::TagAt(pos), &last_tag);
+                store.set(&DataKey::TagPos(last_tag), &pos);
+            }
+            store.remove(&DataKey::TagAt(last));
+            store.remove(&DataKey::TagPos(tag));
+            env.storage().instance().set(&DataKey::TagCount, &last);
+        }
+    } else {
+        store.set(&DataKey::Escrow(tag), &new_balance);
+        if old_balance == 0 {
+            let n = tag_count(env);
+            store.set(&DataKey::TagAt(n), &tag);
+            store.set(&DataKey::TagPos(tag), &n);
+            env.storage()
+                .instance()
+                .set(&DataKey::TagCount, &(n.checked_add(1).unwrap()));
+        }
+    }
+}
+
+fn add_total(env: &Env, delta: i128) {
+    let total: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TotalEscrowed)
+        .unwrap();
+    env.storage()
+        .instance()
+        .set(&DataKey::TotalEscrowed, &total.checked_add(delta).unwrap());
+}
+
+fn page_bounds(env: &Env, cursor: u32, limit: u32) -> (u32, u32) {
+    let n = tag_count(env);
+    let start = cursor.min(n);
+    let end = start.saturating_add(limit.min(MAX_PAGE)).min(n);
+    (start, end)
+}
+
+/// Post-condition on every mutating entrypoint, compiled in only with
+/// `--features invariants`: the ActiveTags index is consistent, and
+/// `sum(Escrow(tag)) == TotalEscrowed <= token.balance(vault)`. O(tags),
+/// so it's for tests/fuzzing, never production wasm.
+#[cfg(feature = "invariants")]
+fn check_invariants(env: &Env) {
+    let store = env.storage().persistent();
+    let mut sum: i128 = 0;
+    for i in 0..tag_count(env) {
+        let tag: u64 = store.get(&DataKey::TagAt(i)).unwrap();
+        let pos: u32 = store.get(&DataKey::TagPos(tag)).unwrap();
+        let bal = escrow_of(env, tag);
+        if pos != i || bal <= 0 {
+            panic!("vault invariant violated: tag index");
+        }
+        sum = sum.checked_add(bal).unwrap();
+    }
+    let total: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TotalEscrowed)
+        .unwrap();
+    let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+    let actual = token::Client::new(env, &token_address).balance(&env.current_contract_address());
+    if sum != total || total > actual {
+        panic!("vault invariant violated: ledger sum");
+    }
+}
+
+#[cfg(not(feature = "invariants"))]
+fn check_invariants(_env: &Env) {}
+
+/// Shared core of withdraw/withdraw_via_multisig; auth is the caller's job.
+fn withdraw_one(env: &Env, tag: u64, to: Address, amount: i128) {
+    if amount <= 0 {
+        panic_with_error!(env, Error::InvalidAmount);
+    }
+    let balance = escrow_of(env, tag);
+    if balance < amount {
+        panic_with_error!(env, Error::InsufficientEscrowBalance);
+    }
+    set_escrow(env, tag, balance.checked_sub(amount).unwrap());
+    add_total(env, -amount);
+
+    let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+    token::Client::new(env, &token_address).transfer(&env.current_contract_address(), &to, &amount);
+
+    events::withdrawn(env, to, tag, amount);
+    check_invariants(env);
+}
+
+/// Shared core of transfer_tag/transfer_tag_via_multisig. TotalEscrowed is
+/// unaffected — nothing entered or left the vault, only which tag it's
+/// earmarked under changed.
+fn transfer_tag_one(env: &Env, from_tag: u64, to_tag: u64, amount: i128) {
+    if amount <= 0 {
+        panic_with_error!(env, Error::InvalidAmount);
+    }
+    let from_balance = escrow_of(env, from_tag);
+    if from_balance < amount {
+        panic_with_error!(env, Error::InsufficientEscrowBalance);
+    }
+    set_escrow(env, from_tag, from_balance.checked_sub(amount).unwrap());
+    let to_balance = escrow_of(env, to_tag);
+    set_escrow(env, to_tag, to_balance.checked_add(amount).unwrap());
+
+    events::tag_transferred(env, from_tag, to_tag, amount);
+    check_invariants(env);
+}
+
+fn check_batch_size(env: &Env, len: u32) {
+    if len == 0 || len > MAX_BATCH {
+        panic_with_error!(env, Error::InvalidBatchSize);
+    }
+}
+
+/// Working balance for `tag` inside a batch: the in-flight value if the
+/// batch already touched it, otherwise what's in storage.
+fn working_balance(env: &Env, working: &Map<u64, i128>, tag: u64) -> i128 {
+    working.get(tag).unwrap_or_else(|| escrow_of(env, tag))
 }
 
 #[contract]
@@ -148,22 +300,11 @@ impl Vault {
             &amount,
         );
 
-        let key = DataKey::Escrow(tag);
-        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&key, &balance.checked_add(amount).unwrap());
-
-        let total: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalEscrowed)
-            .unwrap();
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalEscrowed, &total.checked_add(amount).unwrap());
+        set_escrow(&env, tag, escrow_of(&env, tag).checked_add(amount).unwrap());
+        add_total(&env, amount);
 
         events::deposited(&env, from, tag, amount);
+        check_invariants(&env);
     }
 
     /// Pays `amount` of `tag`'s escrowed balance out to `to`, debiting the
@@ -184,36 +325,7 @@ impl Vault {
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
-        }
-
-        let key = DataKey::Escrow(tag);
-        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if balance < amount {
-            panic_with_error!(&env, Error::InsufficientEscrowBalance);
-        }
-        env.storage()
-            .persistent()
-            .set(&key, &balance.checked_sub(amount).unwrap());
-
-        let total: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalEscrowed)
-            .unwrap();
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalEscrowed, &total.checked_sub(amount).unwrap());
-
-        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token_address).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
-
-        events::withdrawn(&env, to, tag, amount);
+        withdraw_one(&env, tag, to, amount);
     }
 
     /// Permissionless alternative to withdraw: cross-calls a deployed
@@ -237,36 +349,7 @@ impl Vault {
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
         }
-        if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
-        }
-
-        let key = DataKey::Escrow(tag);
-        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        if balance < amount {
-            panic_with_error!(&env, Error::InsufficientEscrowBalance);
-        }
-        env.storage()
-            .persistent()
-            .set(&key, &balance.checked_sub(amount).unwrap());
-
-        let total: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalEscrowed)
-            .unwrap();
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalEscrowed, &total.checked_sub(amount).unwrap());
-
-        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token_address).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
-
-        events::withdrawn(&env, to, tag, amount);
+        withdraw_one(&env, tag, to, amount);
     }
 
     /// Moves `amount` of escrow from `from_tag` to `to_tag` without any
@@ -280,28 +363,7 @@ impl Vault {
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
-        if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
-        }
-
-        let from_key = DataKey::Escrow(from_tag);
-        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
-        if from_balance < amount {
-            panic_with_error!(&env, Error::InsufficientEscrowBalance);
-        }
-        env.storage()
-            .persistent()
-            .set(&from_key, &from_balance.checked_sub(amount).unwrap());
-
-        let to_key = DataKey::Escrow(to_tag);
-        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&to_key, &to_balance.checked_add(amount).unwrap());
-
-        // TotalEscrowed is unaffected — nothing entered or left the vault,
-        // only which tag it's earmarked under changed.
-        events::tag_transferred(&env, from_tag, to_tag, amount);
+        transfer_tag_one(&env, from_tag, to_tag, amount);
     }
 
     /// Permissionless alternative to transfer_tag: cross-calls a deployed
@@ -320,33 +382,119 @@ impl Vault {
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
         }
-        if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
+        transfer_tag_one(&env, from_tag, to_tag, amount);
+    }
+
+    /// Batched withdraw: one admin auth check for the whole batch, every
+    /// entry validated (against in-flight balances, so the same tag twice
+    /// is handled correctly) before any storage write or token transfer,
+    /// and one token transfer per distinct recipient. All-or-nothing.
+    /// Emits one `withdrawn` event per entry, same as sequential withdraws.
+    pub fn withdraw_batch(env: Env, ops: Vec<(u64, Address, i128)>) {
+        require_not_paused(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        check_batch_size(&env, ops.len());
+
+        let mut working: Map<u64, i128> = Map::new(&env);
+        let mut payouts: Map<Address, i128> = Map::new(&env);
+        let mut total_out: i128 = 0;
+        for (tag, to, amount) in ops.iter() {
+            if amount <= 0 {
+                panic_with_error!(&env, Error::InvalidAmount);
+            }
+            let balance = working_balance(&env, &working, tag);
+            if balance < amount {
+                panic_with_error!(&env, Error::InsufficientEscrowBalance);
+            }
+            working.set(tag, balance - amount);
+            let owed = payouts.get(to.clone()).unwrap_or(0);
+            payouts.set(to, owed.checked_add(amount).unwrap());
+            total_out = total_out.checked_add(amount).unwrap();
         }
 
-        let from_key = DataKey::Escrow(from_tag);
-        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
-        if from_balance < amount {
-            panic_with_error!(&env, Error::InsufficientEscrowBalance);
+        for (tag, balance) in working.iter() {
+            set_escrow(&env, tag, balance);
         }
-        env.storage()
-            .persistent()
-            .set(&from_key, &from_balance.checked_sub(amount).unwrap());
+        add_total(&env, -total_out);
 
-        let to_key = DataKey::Escrow(to_tag);
-        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&to_key, &to_balance.checked_add(amount).unwrap());
+        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_client = token::Client::new(&env, &token_address);
+        for (to, amount) in payouts.iter() {
+            token_client.transfer(&env.current_contract_address(), &to, &amount);
+        }
+        for (tag, to, amount) in ops.iter() {
+            events::withdrawn(&env, to, tag, amount);
+        }
+        check_invariants(&env);
+    }
 
-        events::tag_transferred(&env, from_tag, to_tag, amount);
+    /// Batched transfer_tag: one admin auth check, every entry validated
+    /// against in-flight balances before any write, all-or-nothing. No
+    /// token movement. Emits one `tag_transferred` event per entry.
+    pub fn transfer_tag_batch(env: Env, ops: Vec<(u64, u64, i128)>) {
+        require_not_paused(&env);
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        check_batch_size(&env, ops.len());
+
+        let mut working: Map<u64, i128> = Map::new(&env);
+        for (from_tag, to_tag, amount) in ops.iter() {
+            if amount <= 0 {
+                panic_with_error!(&env, Error::InvalidAmount);
+            }
+            let from_balance = working_balance(&env, &working, from_tag);
+            if from_balance < amount {
+                panic_with_error!(&env, Error::InsufficientEscrowBalance);
+            }
+            working.set(from_tag, from_balance - amount);
+            let to_balance = working_balance(&env, &working, to_tag);
+            working.set(to_tag, to_balance.checked_add(amount).unwrap());
+        }
+
+        for (tag, balance) in working.iter() {
+            set_escrow(&env, tag, balance);
+        }
+        for (from_tag, to_tag, amount) in ops.iter() {
+            events::tag_transferred(&env, from_tag, to_tag, amount);
+        }
+        check_invariants(&env);
+    }
+
+    /// Number of tags currently holding a nonzero escrow balance.
+    pub fn get_tag_count(env: Env) -> u32 {
+        tag_count(&env)
+    }
+
+    /// Page of the ActiveTags index: tags at positions
+    /// `cursor..cursor+limit` (limit capped at MAX_PAGE). Order is not
+    /// stable across mutations (swap-remove), so paginate against a
+    /// single ledger snapshot.
+    pub fn get_tags(env: Env, cursor: u32, limit: u32) -> Vec<u64> {
+        let (start, end) = page_bounds(&env, cursor, limit);
+        let mut tags = Vec::new(&env);
+        for i in start..end {
+            tags.push_back(env.storage().persistent().get(&DataKey::TagAt(i)).unwrap());
+        }
+        tags
+    }
+
+    /// Sum of escrow balances for the tags at positions
+    /// `cursor..cursor+limit`, plus the cursor to pass next. Paging until
+    /// `next_cursor == get_tag_count()` and adding the partial sums must
+    /// equal get_total_escrowed() — see the README's reconciliation example.
+    pub fn verify_ledger(env: Env, cursor: u32, limit: u32) -> (i128, u32) {
+        let (start, end) = page_bounds(&env, cursor, limit);
+        let mut partial_sum: i128 = 0;
+        for i in start..end {
+            let tag: u64 = env.storage().persistent().get(&DataKey::TagAt(i)).unwrap();
+            partial_sum = partial_sum.checked_add(escrow_of(&env, tag)).unwrap();
+        }
+        (partial_sum, end)
     }
 
     pub fn balance_of(env: Env, tag: u64) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Escrow(tag))
-            .unwrap_or(0)
+        escrow_of(&env, tag)
     }
 
     pub fn get_total_escrowed(env: Env) -> i128 {
@@ -393,6 +541,7 @@ impl Vault {
 
         token_client.transfer(&env.current_contract_address(), &to, &untagged);
         events::swept_untagged(&env, to, untagged);
+        check_invariants(&env);
         untagged
     }
 
@@ -427,6 +576,7 @@ impl Vault {
 
         token_client.transfer(&env.current_contract_address(), &to, &untagged);
         events::swept_untagged(&env, to, untagged);
+        check_invariants(&env);
         untagged
     }
 }

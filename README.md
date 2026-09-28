@@ -31,6 +31,9 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   from other tags' deposits. `options_market::escrow_series_to_vault` /
   `claim_refund_from_vault` now wire this in for the specific gap it was
   built for — see "Known gaps" below for the scope of that integration.
+- [`timelock/`](timelock) — a delayed-execution admin (proposer /
+  executor / canceller roles, predecessor dependencies) meant to hold the
+  admin role on the other contracts so users always get an exit window.
 - [`multisig/`](multisig) — M-of-N approval tracking for opaque,
   caller-defined actions, motivated by every other contract here having
   a single `admin: Address` as its sole point of control. A fixed
@@ -278,6 +281,8 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 | `sweep_untagged_via_multisig(multisig_contract, action_id, to)` | Permissionless alternative to `sweep_untagged`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
 | `transfer_tag(from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement at all — meant for the roll_position case (close + reopen in one breath, collateral doesn't need to leave and come back). `TotalEscrowed` is unaffected. |
 | `transfer_tag_via_multisig(multisig_contract, action_id, from_tag, to_tag, amount)` | Permissionless alternative to `transfer_tag`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
+| `withdraw_batch(ops: Vec<(tag, to, amount)>)` | Batched `withdraw`: one admin auth check, up to `MAX_BATCH` (50) entries, every entry validated against in-flight balances (the same tag may repeat) before anything is written, one token transfer per distinct recipient, all-or-nothing. One `withdrawn` event per entry. ~4x cheaper than sequential calls (10 entries: 0.92M vs 3.80M CPU instructions, 175KB vs 844KB memory). |
+| `transfer_tag_batch(ops: Vec<(from_tag, to_tag, amount)>)` | Batched `transfer_tag`, same validation and all-or-nothing semantics. One `tag_transferred` event per entry. |
 
 ### Depositors
 
@@ -287,7 +292,33 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 
 ### Views
 
-`balance_of(tag)`, `get_total_escrowed`, `get_admin`, `get_token`, `is_paused`.
+`balance_of(tag)`, `get_total_escrowed`, `get_admin`, `get_token`, `is_paused`,
+`get_tag_count`, `get_tags(cursor, limit)`, `verify_ledger(cursor, limit) -> (partial_sum, next_cursor)`.
+
+`get_tags`/`verify_ledger` page through the ActiveTags index (every tag
+with a nonzero balance; `limit` capped at 100). The index uses
+swap-remove, so read all pages against one ledger snapshot.
+
+### Ledger reconciliation
+
+The vault's invariant is `sum(Escrow(tag)) == TotalEscrowed <= token.balance(vault)`.
+Monitors can check it over RPC:
+
+```sh
+count=$(stellar contract invoke --id $VAULT -- get_tag_count)
+cursor=0; sum=0
+while [ "$cursor" -lt "$count" ]; do
+  read partial cursor < <(stellar contract invoke --id $VAULT -- \
+    verify_ledger --cursor $cursor --limit 100 | tr -d '[]",' )
+  sum=$((sum + partial))
+done
+total=$(stellar contract invoke --id $VAULT -- get_total_escrowed | tr -d '"')
+[ "$sum" = "$total" ] && echo "ledger OK ($sum)" || echo "MISMATCH: $sum != $total"
+```
+
+Building with `--features invariants` compiles a full post-condition check
+into every mutating entrypoint (tests/fuzzing only, never production wasm);
+CI runs the suite that way, including a 10,000-op random fuzz test.
 
 ### Events
 
@@ -304,6 +335,7 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 | 4 | `ContractPaused` |
 | 5 | `NoUntaggedFunds` |
 | 6 | `Unauthorized` |
+| 7 | `InvalidBatchSize` |
 
 ## `multisig` reference
 
@@ -336,6 +368,44 @@ set, so a compromised signer can never add another compromised signer.
 | 4 | `NotASigner` |
 | 5 | `AlreadyApproved` |
 | 6 | `NotYetApproved` |
+
+## `timelock` reference
+
+Meant to hold the admin role on every other Zenith contract, so any
+parameter or code change is visible on-chain for at least `min_delay`
+seconds before it can run. Modelled on OpenZeppelin's TimelockController.
+
+| Function | Description |
+|---|---|
+| `initialize(min_delay, proposers, executors, cancellers)` | One-time setup. Empty `executors` means anyone may execute a ready operation. There is no admin afterwards. |
+| `schedule(proposer, calls, predecessor, salt, delay) -> id` | Proposer-only. `calls` is a `Vec<Call { target, function, args }>`; `delay >= min_delay`. The id is `sha256(xdr((calls, predecessor, salt)))` (see `hash_operation`). Rejects an id that's already pending or done. |
+| `execute(executor, calls, predecessor, salt)` | Executor-only (unless open). Requires the operation ready and `predecessor` (if any) done. Runs every call in order via `invoke_contract`; any revert reverts the whole batch. |
+| `cancel(canceller, id)` | Canceller-only. Removes a pending operation. |
+
+**Self-administration.** Soroban forbids re-entry, so a `Call` whose
+`target` is the timelock itself is dispatched internally by `execute`:
+`update_delay(u64)`, `grant_role(Role, Address)`, `revoke_role(Role, Address)`,
+`set_open_executor(bool)`. These changes are therefore only reachable
+through a delayed operation.
+
+**Views:** `get_timestamp(id)` (0 unknown, 1 done, else ready-at),
+`is_operation`, `is_operation_pending`, `is_operation_ready`,
+`is_operation_done`, `get_min_delay`, `has_role(role, account)`,
+`is_open_executor`, `hash_operation`.
+
+**Events:** `scheduled`, `executed`, `cancelled`, `min_delay_changed`, `role_changed`.
+
+**Errors:** 1 `AlreadyInitialized`, 2 `Unauthorized`, 3 `InsufficientDelay`,
+4 `AlreadyScheduled`, 5 `NotReady`, 6 `PredecessorNotDone`, 7 `NotPending`,
+8 `UnknownSelfCall`, 9 `EmptyOperation`.
+
+### Operations guide
+
+1. Deploy the timelock, then `transfer_admin(timelock)` on each contract.
+2. A proposer schedules the change, e.g. `calls = [Call { target: options_market, function: "set_fee_rate", args: [25u32] }]`, with a unique `salt`, and announces the id.
+3. During the delay users can exit; a canceller can `cancel(id)`.
+4. Once `is_operation_ready(id)`, an executor calls `execute` with the exact same `calls`/`predecessor`/`salt`.
+5. Use `predecessor` to force ordering (e.g. a migration after an `upgrade`).
 
 ## Known gaps
 

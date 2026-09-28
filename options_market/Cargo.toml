@@ -5,7 +5,9 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# rlib alongside cdylib so timelock can depend on this crate for its
+# cross-contract integration test — same pattern as vault's Cargo.toml.
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 opt-level = "z"
