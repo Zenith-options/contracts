@@ -1,0 +1,29 @@
+[package]
+name = "zenith-governor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+
+[dependencies]
+soroban-sdk = { version = "21.0.0" }
+
+[dev-dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+# Dev/test-only: a REAL timelock instance for lifecycle tests. Production
+# code calls it through the interface in src/interfaces.rs instead.
+timelock = { package = "zenith-timelock", path = "../timelock", features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
