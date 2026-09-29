@@ -1,15 +1,22 @@
 #![no_std]
 
-//! Zenith Vault — a per-tag escrow ledger for a single token.
+//! Zenith Vault — a per-(token, tag) escrow ledger.
 //!
 //! Built to close a gap discovered while testing options_market: that
 //! contract holds every writer's collateral and every buyer's premium in
 //! one undifferentiated token balance, with no accounting of which
 //! balance is actually earmarked for which position. This contract is
 //! that missing accounting layer — deposit/withdraw against a caller-
-//! defined `tag` (e.g. a position_id), so "how much is earmarked for tag
+//! defined `tag` (e.g. a series_id), so "how much is earmarked for tag
 //! 7" is always answerable instead of inferred from the token contract's
 //! raw balance.
+//!
+//! One deployment holds any number of allowlisted tokens and serves any
+//! number of integrator contracts. Tags are namespaced by their owner
+//! (`Tag { owner, kind, id }`), so integrators can never collide, and
+//! only a tag's owner may withdraw from or reassign it. The admin keeps
+//! configuration powers only; moving escrow without the owner's signature
+//! requires multisig approval (`*_via_multisig`).
 
 use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, Vec};
 
@@ -23,7 +30,8 @@ mod ttl;
 mod types;
 
 use error::Error;
-use types::DataKey;
+pub use types::Tag;
+use types::{DataKey, LegacyKey};
 
 fn require_not_paused(env: &Env) {
     let paused: bool = env
@@ -34,6 +42,236 @@ fn require_not_paused(env: &Env) {
     if paused {
         panic_with_error!(env, Error::ContractPaused);
     }
+}
+
+fn admin(env: &Env) -> Address {
+    env.storage().instance().get(&DataKey::Admin).unwrap()
+}
+
+fn default_token(env: &Env) -> Address {
+    env.storage().instance().get(&DataKey::Token).unwrap()
+}
+
+fn require_multisig_approved(env: &Env, multisig_contract: &Address, action_id: u64) {
+    let multisig = multisig_client::Client::new(env, multisig_contract);
+    if !multisig.is_approved(&action_id) {
+        panic_with_error!(env, Error::Unauthorized);
+    }
+}
+
+fn require_positive(env: &Env, amount: i128) {
+    if amount <= 0 {
+        panic_with_error!(env, Error::InvalidAmount);
+    }
+}
+
+fn escrow_of(env: &Env, token: &Address, tag: &Tag) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Escrow(token.clone(), tag.clone()))
+        .unwrap_or(0)
+}
+
+fn set_escrow(env: &Env, token: &Address, tag: &Tag, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Escrow(token.clone(), tag.clone()), &amount);
+}
+
+fn total_of(env: &Env, token: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalEscrowed(token.clone()))
+        .unwrap_or(0)
+}
+
+fn set_total(env: &Env, token: &Address, total: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TotalEscrowed(token.clone()), &total);
+}
+
+fn tag_owner(env: &Env, tag: &Tag) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TagOwner(tag.clone()))
+}
+
+fn legacy_owner(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::LegacyOwner)
+        .unwrap_or_else(|| admin(env))
+}
+
+fn legacy_tag(env: &Env, id: u64) -> Tag {
+    Tag {
+        owner: legacy_owner(env),
+        kind: symbol_short!("legacy"),
+        id,
+    }
+}
+
+/// Requires the recorded owner of `tag` to authorize. A tag that was
+/// never deposited into has no owner yet, so nothing can be taken out of
+/// it anyway — its (zero) balance check fails right after.
+fn require_tag_owner(env: &Env, tag: &Tag) {
+    if let Some(owner) = tag_owner(env, tag) {
+        owner.require_auth();
+    } else {
+        panic_with_error!(env, Error::InsufficientEscrowBalance);
+    }
+}
+
+/// Records `tag`'s owner on its first use. Only a registered integrator
+/// (or the legacy namespace owner) may create tags, and only inside its
+/// own namespace — `tag.owner` must authorize creation, so nobody can
+/// open a tag in another integrator's namespace.
+fn ensure_tag_created(env: &Env, tag: &Tag, owner_already_authed: bool) {
+    if tag_owner(env, tag).is_some() {
+        return;
+    }
+    let registered: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::Integrator(tag.owner.clone()))
+        .unwrap_or(false);
+    if !registered && tag.owner != legacy_owner(env) {
+        panic_with_error!(env, Error::UnregisteredIntegrator);
+    }
+    if !owner_already_authed {
+        tag.owner.require_auth();
+    }
+    env.storage()
+        .persistent()
+        .set(&DataKey::TagOwner(tag.clone()), &tag.owner);
+}
+
+fn shortfall_given(env: &Env, token: &Address, actual_balance: i128) -> i128 {
+    total_of(env, token).saturating_sub(actual_balance).max(0)
+}
+
+fn do_deposit(env: &Env, from: Address, token: Address, tag: Tag, amount: i128) -> i128 {
+    require_not_paused(env);
+    from.require_auth();
+    require_positive(env, amount);
+    let allowed: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::AllowedToken(token.clone()))
+        .unwrap_or(false);
+    if !allowed {
+        panic_with_error!(env, Error::TokenNotAllowed);
+    }
+    ensure_tag_created(env, &tag, from == tag.owner);
+
+    // Credit what actually arrived, not what was requested: a
+    // fee-on-transfer (or otherwise non-standard) token would otherwise
+    // leave the ledger claiming more than the vault holds.
+    let this = env.current_contract_address();
+    let token_client = token::Client::new(env, &token);
+    let before = token_client.balance(&this);
+    token_client.transfer(&from, &this, &amount);
+    let received = token_client.balance(&this).checked_sub(before).unwrap();
+    require_positive(env, received);
+
+    let balance = escrow_of(env, &token, &tag).checked_add(received).unwrap();
+    set_escrow(env, &token, &tag, balance);
+    set_total(
+        env,
+        &token,
+        total_of(env, &token).checked_add(received).unwrap(),
+    );
+
+    events::deposited(env, token, tag, from, received);
+    received
+}
+
+/// Debits `tag` and pays `to`. Callers handle authorization.
+fn do_withdraw(env: &Env, token: Address, tag: Tag, to: Address, amount: i128) {
+    require_not_paused(env);
+    require_positive(env, amount);
+
+    let balance = escrow_of(env, &token, &tag);
+    if balance < amount {
+        panic_with_error!(env, Error::InsufficientEscrowBalance);
+    }
+
+    let this = env.current_contract_address();
+    let token_client = token::Client::new(env, &token);
+    let actual_balance = token_client.balance(&this);
+    let shortfall = shortfall_given(env, &token, actual_balance);
+    if shortfall > 0 {
+        events::shortfall_detected(env, token.clone(), shortfall);
+    }
+    if actual_balance < amount {
+        panic_with_error!(env, Error::InsufficientVaultBalance);
+    }
+
+    set_escrow(env, &token, &tag, balance.checked_sub(amount).unwrap());
+    set_total(
+        env,
+        &token,
+        total_of(env, &token).checked_sub(amount).unwrap(),
+    );
+    token_client.transfer(&this, &to, &amount);
+
+    events::withdrawn(env, token, tag, to, amount);
+}
+
+/// Pure ledger reassignment. Callers handle authorization.
+fn do_transfer_tag(env: &Env, token: Address, from_tag: Tag, to_tag: Tag, amount: i128) {
+    require_not_paused(env);
+    require_positive(env, amount);
+
+    let from_balance = escrow_of(env, &token, &from_tag);
+    if from_balance < amount {
+        panic_with_error!(env, Error::InsufficientEscrowBalance);
+    }
+    set_escrow(
+        env,
+        &token,
+        &from_tag,
+        from_balance.checked_sub(amount).unwrap(),
+    );
+    let to_balance = escrow_of(env, &token, &to_tag).checked_add(amount).unwrap();
+    set_escrow(env, &token, &to_tag, to_balance);
+
+    // TotalEscrowed is unaffected — nothing entered or left the vault,
+    // only which tag it's earmarked under changed.
+    events::tag_transferred(env, token, from_tag, to_tag, amount);
+}
+
+fn do_sweep(env: &Env, token: Address, to: Address) -> i128 {
+    let this = env.current_contract_address();
+    let token_client = token::Client::new(env, &token);
+    let actual_balance = token_client.balance(&this);
+
+    // A clawback (or any token-level balance decrease) can leave the
+    // balance BELOW the ledger. That's a shortfall, not untagged funds —
+    // report it as NoUntaggedFunds instead of an arithmetic trap.
+    let untagged = actual_balance.saturating_sub(total_of(env, &token));
+    if untagged <= 0 {
+        panic_with_error!(env, Error::NoUntaggedFunds);
+    }
+
+    token_client.transfer(&this, &to, &untagged);
+    events::swept_untagged(env, token, to, untagged);
+    untagged
+}
+
+fn set_token_allowed_inner(env: &Env, token: Address, allowed: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::AllowedToken(token.clone()), &allowed);
+    events::token_allowed(env, token, allowed);
+}
+
+fn set_integrator_inner(env: &Env, integrator: Address, allowed: bool) {
+    env.storage()
+        .instance()
+        .set(&DataKey::Integrator(integrator.clone()), &allowed);
+    events::integrator_set(env, integrator, allowed);
 }
 
 #[contract]
@@ -59,16 +297,14 @@ impl Vault {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalEscrowed, &0i128);
+        env.storage().instance().set(&DataKey::LegacyOwner, &admin);
+        set_token_allowed_inner(&env, token, true);
     }
 
     /// Hands off control to a new address. Requires the CURRENT admin's
-    /// signature, not the incoming one. Since `admin` also gates every
-    /// withdraw, this is how the calling contract a vault serves would
-    /// change (e.g. after an options_market upgrade to a new contract
-    /// address).
+    /// signature, not the incoming one. The admin configures the vault
+    /// (token allowlist, integrator registry, pause, sweep) but owns no
+    /// integrator's tags, so this never hands over escrowed funds.
     pub fn transfer_admin(env: Env, new_admin: Address) {
         ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -97,12 +333,10 @@ impl Vault {
         events::admin_transferred(&env, admin, new_admin);
     }
 
-    /// Emergency stop: blocks deposit and withdraw. Both sides, unlike
-    /// options_market's pause (which only blocks new exposure, not
-    /// winding existing positions down) — a vault holding real funds
-    /// should be freezable outright if something's gone wrong, since
-    /// there's no "existing position" here that needs an exit path
-    /// independent of the vault itself.
+    /// Emergency stop: blocks deposit, withdraw, and transfer_tag. Both
+    /// sides, unlike options_market's pause (which only blocks new
+    /// exposure, not winding existing positions down) — a vault holding
+    /// real funds should be freezable outright if something's gone wrong.
     pub fn pause(env: Env) {
         ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
@@ -149,6 +383,16 @@ impl Vault {
             .unwrap_or(false)
     }
 
+    // ─── token allowlist / integrator registry ─────────────────────────
+
+    /// Adds or removes `token` from the allowlist. Removing a token only
+    /// blocks NEW deposits of it: existing balances stay withdrawable,
+    /// transferable, and sweepable.
+    pub fn set_token_allowed(env: Env, token: Address, allowed: bool) {
+        admin(&env).require_auth();
+        set_token_allowed_inner(&env, token, allowed);
+    }
+
     /// Pulls `amount` of the vault's token from `from` into the vault's
     /// own balance, crediting `tag`'s escrow ledger. `from` must authorize
     /// the transfer — this contract never moves funds without the source
@@ -184,68 +428,93 @@ impl Vault {
         events::deposited(&env, from, tag, amount);
     }
 
-    /// Pays `amount` of `tag`'s escrowed balance out to `to`, debiting the
-    /// ledger. Gated on the admin's signature — set at initialize time to
-    /// whichever address is trusted to trigger payouts. In the intended
-    /// integration, that's the calling contract's own address (e.g.
-    /// options_market's), so a contract-to-contract call satisfies
-    /// require_auth() through the call itself, the same way any Soroban
-    /// contract authorizes its own outgoing calls, without needing a
-    /// human signature on every single settlement.
-    ///
-    /// Panics with InsufficientEscrowBalance if `tag` doesn't have that
-    /// much earmarked — this is the check that actually closes the gap:
-    /// a withdrawal can never draw down more than was specifically
-    /// deposited under this tag, regardless of what the vault's raw token
-    /// balance happens to be from OTHER tags' deposits.
-    pub fn withdraw(env: Env, tag: u64, to: Address, amount: i128) {
-        ttl::extend_instance(&env);
-        require_not_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
-        }
-
-        let key = DataKey::Escrow(tag);
-        let balance: i128 = ttl::get_persistent(&env, &key).unwrap_or(0);
-        if balance < amount {
-            panic_with_error!(&env, Error::InsufficientEscrowBalance);
-        }
-        ttl::set_persistent(&env, &key, &balance.checked_sub(amount).unwrap());
-
-        let total: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalEscrowed)
-            .unwrap();
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalEscrowed, &total.checked_sub(amount).unwrap());
-
-        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        token::Client::new(&env, &token_address).transfer(
-            &env.current_contract_address(),
-            &to,
-            &amount,
-        );
-
-        events::withdrawn(&env, to, tag, amount);
+    pub fn set_token_allowed_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        token: Address,
+        allowed: bool,
+    ) {
+        require_multisig_approved(&env, &multisig_contract, action_id);
+        set_token_allowed_inner(&env, token, allowed);
     }
 
-    /// Permissionless alternative to withdraw: cross-calls a deployed
-    /// Multisig and checks is_approved(action_id) instead of requiring
-    /// the admin's own signature. Useful for a manual-recovery or
-    /// migration path where the intended calling contract itself can't
-    /// produce the admin's signature (e.g. it's being replaced), so an
-    /// M-of-N-approved payout is the only way to move funds out. Same
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowedToken(token))
+            .unwrap_or(false)
+    }
+
+    /// Registers (or deregisters) an integrator allowed to create tags in
+    /// its own namespace. Deregistering blocks new tags only; tags it
+    /// already owns keep working.
+    pub fn set_integrator(env: Env, integrator: Address, allowed: bool) {
+        admin(&env).require_auth();
+        set_integrator_inner(&env, integrator, allowed);
+    }
+
+    pub fn set_integrator_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        integrator: Address,
+        allowed: bool,
+    ) {
+        require_multisig_approved(&env, &multisig_contract, action_id);
+        set_integrator_inner(&env, integrator, allowed);
+    }
+
+    pub fn is_integrator(env: Env, integrator: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Integrator(integrator))
+            .unwrap_or(false)
+    }
+
+    // ─── escrow ────────────────────────────────────────────────────────
+
+    /// Pulls `amount` of `token` from `from` into the vault, crediting
+    /// `(token, tag)`. `from` must authorize the transfer. The first
+    /// deposit into a tag records `tag.owner` as its owner; that requires
+    /// `tag.owner` to be a registered integrator and to authorize (which
+    /// it already has when it is also `from`). End users can therefore
+    /// deposit into a contract-owned tag only with that contract's auth.
+    ///
+    /// Credits the measured balance delta, not `amount`, and returns it:
+    /// with a fee-on-transfer token the tag is credited what actually
+    /// arrived. Costs two extra token balance reads per deposit.
+    pub fn deposit(env: Env, from: Address, token: Address, tag: Tag, amount: i128) -> i128 {
+        do_deposit(&env, from, token, tag, amount)
+    }
+
+    /// Pays `amount` of `(token, tag)`'s escrow to `to`. Requires the
+    /// tag owner's signature — in the intended integration that is the
+    /// calling contract itself, so the contract-to-contract call
+    /// satisfies require_auth() through the call itself.
+    ///
+    /// Panics with InsufficientEscrowBalance if `tag` doesn't have that
+    /// much earmarked, regardless of other tags' deposits. Emits
+    /// `shortfall_detected` if the vault's actual balance of `token` is
+    /// below its ledger (e.g. after a clawback), and panics with
+    /// InsufficientVaultBalance instead of a token error if it can't
+    /// cover this payout.
+    pub fn withdraw(env: Env, token: Address, tag: Tag, to: Address, amount: i128) {
+        require_tag_owner(&env, &tag);
+        do_withdraw(&env, token, tag, to, amount);
+    }
+    }
+
+    /// Emergency payout without the tag owner: requires multisig approval
+    /// (e.g. the owning contract is being replaced and can't sign). Same
     /// InsufficientEscrowBalance cap applies — approval changes who can
     /// call this, not how much any tag is entitled to.
     pub fn withdraw_via_multisig(
         env: Env,
         multisig_contract: Address,
         action_id: u64,
-        tag: u64,
+        token: Address,
+        tag: Tag,
         to: Address,
         amount: i128,
     ) {
@@ -285,47 +554,53 @@ impl Vault {
         events::withdrawn(&env, to, tag, amount);
     }
 
-    /// Moves `amount` of escrow from `from_tag` to `to_tag` without any
-    /// token movement at all — a pure ledger reassignment. Meant for
-    /// exactly the case options_market's roll_position represents: a
-    /// position closes and its replacement opens in the same breath, so
-    /// the collateral doesn't need to leave the vault and come back, it
-    /// just needs to be re-earmarked under the new position's tag.
-    /// Admin-gated, same as withdraw.
-    pub fn transfer_tag(env: Env, from_tag: u64, to_tag: u64, amount: i128) {
-        ttl::extend_instance(&env);
-        require_not_paused(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        if amount <= 0 {
-            panic_with_error!(&env, Error::InvalidAmount);
+    /// Moves `amount` of `token` escrow from `from_tag` to `to_tag` with
+    /// no token movement — e.g. options_market's roll_position. Requires
+    /// `from_tag`'s owner; if `to_tag` belongs to (or would be created
+    /// for) a different owner, that owner must authorize too.
+    pub fn transfer_tag(env: Env, token: Address, from_tag: Tag, to_tag: Tag, amount: i128) {
+        require_tag_owner(&env, &from_tag);
+        let from_owner = tag_owner(&env, &from_tag).unwrap();
+        match tag_owner(&env, &to_tag) {
+            Some(to_owner) => {
+                if to_owner != from_owner {
+                    to_owner.require_auth();
+                }
+            }
+            None => ensure_tag_created(&env, &to_tag, to_tag.owner == from_owner),
         }
-
-        let from_key = DataKey::Escrow(from_tag);
-        let from_balance: i128 = ttl::get_persistent(&env, &from_key).unwrap_or(0);
-        if from_balance < amount {
-            panic_with_error!(&env, Error::InsufficientEscrowBalance);
-        }
-        ttl::set_persistent(&env, &from_key, &from_balance.checked_sub(amount).unwrap());
-
-        let to_key = DataKey::Escrow(to_tag);
-        let to_balance: i128 = ttl::get_persistent(&env, &to_key).unwrap_or(0);
-        ttl::set_persistent(&env, &to_key, &to_balance.checked_add(amount).unwrap());
-
-        // TotalEscrowed is unaffected — nothing entered or left the vault,
-        // only which tag it's earmarked under changed.
-        events::tag_transferred(&env, from_tag, to_tag, amount);
+        do_transfer_tag(&env, token, from_tag, to_tag, amount);
     }
 
-    /// Permissionless alternative to transfer_tag: cross-calls a deployed
-    /// Multisig and checks is_approved(action_id) instead of requiring
-    /// the admin's own signature. Same rationale as withdraw_via_multisig.
+    /// Emergency alternative to transfer_tag, gated on multisig approval.
+    /// A `to_tag` that doesn't exist yet is recorded as owned by
+    /// `to_tag.owner`, so funds only ever land in their namespace owner's
+    /// control.
     pub fn transfer_tag_via_multisig(
         env: Env,
         multisig_contract: Address,
         action_id: u64,
-        from_tag: u64,
-        to_tag: u64,
+        token: Address,
+        from_tag: Tag,
+        to_tag: Tag,
+        amount: i128,
+    ) {
+        require_multisig_approved(&env, &multisig_contract, action_id);
+        do_transfer_tag(&env, token, from_tag, to_tag, amount);
+    }
+    }
+
+    /// Emergency alternative to transfer_tag, gated on multisig approval.
+    /// A `to_tag` that doesn't exist yet is recorded as owned by
+    /// `to_tag.owner`, so funds only ever land in their namespace owner's
+    /// control.
+    pub fn transfer_tag_via_multisig(
+        env: Env,
+        multisig_contract: Address,
+        action_id: u64,
+        token: Address,
+        from_tag: Tag,
+        to_tag: Tag,
         amount: i128,
     ) {
         ttl::extend_instance(&env);
@@ -338,38 +613,38 @@ impl Vault {
             panic_with_error!(&env, Error::InvalidAmount);
         }
 
-        let from_key = DataKey::Escrow(from_tag);
-        let from_balance: i128 = ttl::get_persistent(&env, &from_key).unwrap_or(0);
-        if from_balance < amount {
-            panic_with_error!(&env, Error::InsufficientEscrowBalance);
+        if tag_owner(&env, &to_tag).is_none() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::TagOwner(to_tag.clone()), &to_tag.owner);
         }
-        ttl::set_persistent(&env, &from_key, &from_balance.checked_sub(amount).unwrap());
-
-        let to_key = DataKey::Escrow(to_tag);
-        let to_balance: i128 = ttl::get_persistent(&env, &to_key).unwrap_or(0);
-        ttl::set_persistent(&env, &to_key, &to_balance.checked_add(amount).unwrap());
-
-        events::tag_transferred(&env, from_tag, to_tag, amount);
+        do_transfer_tag(&env, token, from_tag, to_tag, amount);
     }
 
-    pub fn balance_of(env: Env, tag: u64) -> i128 {
-        ttl::extend_instance(&env);
-        ttl::get_persistent(&env, &DataKey::Escrow(tag)).unwrap_or(0)
+    pub fn balance_of(env: Env, token: Address, tag: Tag) -> i128 {
+        escrow_of(&env, &token, &tag)
     }
 
-    pub fn get_total_escrowed(env: Env) -> i128 {
-        ttl::extend_instance(&env);
-        env.storage()
-            .instance()
-            .get(&DataKey::TotalEscrowed)
-            .unwrap()
+    pub fn get_total_escrowed(env: Env, token: Address) -> i128 {
+        total_of(&env, &token)
+    }
+
+    /// `max(0, TotalEscrowed(token) − actual balance)`: how much of the
+    /// ledger the vault can no longer back, e.g. after a SAC clawback.
+    pub fn get_shortfall(env: Env, token: Address) -> i128 {
+        let actual = token::Client::new(&env, &token).balance(&env.current_contract_address());
+        shortfall_given(&env, &token, actual)
+    }
+
+    pub fn get_tag_owner(env: Env, tag: Tag) -> Option<Address> {
+        tag_owner(&env, &tag)
     }
 
     pub fn get_admin(env: Env) -> Address {
-        ttl::extend_instance(&env);
-        env.storage().instance().get(&DataKey::Admin).unwrap()
+        admin(&env)
     }
 
+    /// The default token the `_legacy` wrappers operate on.
     pub fn get_token(env: Env) -> Address {
         ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::Token).unwrap()
@@ -408,14 +683,13 @@ impl Vault {
         untagged
     }
 
-    /// Permissionless alternative to sweep_untagged: cross-calls a
-    /// deployed Multisig and checks is_approved(action_id) instead of
-    /// requiring the admin's own signature. Same rationale as
-    /// withdraw_via_multisig.
+    /// Permissionless alternative to sweep_untagged, gated on multisig
+    /// approval.
     pub fn sweep_untagged_via_multisig(
         env: Env,
         multisig_contract: Address,
         action_id: u64,
+        token: Address,
         to: Address,
     ) -> i128 {
         ttl::extend_instance(&env);
@@ -423,23 +697,86 @@ impl Vault {
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
         }
+        do_sweep(&env, token, to)
+    }
 
-        let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let token_client = token::Client::new(&env, &token_address);
-        let actual_balance = token_client.balance(&env.current_contract_address());
-        let total_escrowed: i128 = env
+    // ─── legacy u64-tag wrappers (default token) ───────────────────────
+
+    /// The namespaced tag a legacy `u64` id maps to:
+    /// `(legacy owner, "legacy", id)`, where the legacy owner is the
+    /// admin at initialize time.
+    pub fn legacy_tag(env: Env, id: u64) -> Tag {
+        legacy_tag(&env, id)
+    }
+
+    pub fn deposit_legacy(env: Env, from: Address, id: u64, amount: i128) -> i128 {
+        let tag = legacy_tag(&env, id);
+        do_deposit(&env, from, default_token(&env), tag, amount)
+    }
+
+    pub fn withdraw_legacy(env: Env, id: u64, to: Address, amount: i128) {
+        let tag = legacy_tag(&env, id);
+        require_tag_owner(&env, &tag);
+        do_withdraw(&env, default_token(&env), tag, to, amount);
+    }
+
+    pub fn transfer_tag_legacy(env: Env, from_id: u64, to_id: u64, amount: i128) {
+        let from_tag = legacy_tag(&env, from_id);
+        let to_tag = legacy_tag(&env, to_id);
+        Self::transfer_tag(env.clone(), default_token(&env), from_tag, to_tag, amount);
+    }
+
+    pub fn balance_of_legacy(env: Env, id: u64) -> i128 {
+        escrow_of(&env, &default_token(&env), &legacy_tag(&env, id))
+    }
+
+    /// Moves pre-upgrade `Escrow(u64)` entries (single-token, bare-u64
+    /// tags) to `Escrow(default token, legacy_tag(id))`, owned by the
+    /// current admin. The old `TotalEscrowed` moves on the first call.
+    /// Idempotent: ids with no legacy entry are skipped.
+    pub fn migrate_legacy(env: Env, ids: Vec<u64>) {
+        let admin = admin(&env);
+        admin.require_auth();
+        if !env.storage().instance().has(&DataKey::LegacyOwner) {
+            env.storage().instance().set(&DataKey::LegacyOwner, &admin);
+        }
+        let token = default_token(&env);
+        if !env
             .storage()
             .instance()
-            .get(&DataKey::TotalEscrowed)
-            .unwrap();
-
-        let untagged = actual_balance.checked_sub(total_escrowed).unwrap();
-        if untagged <= 0 {
-            panic_with_error!(&env, Error::NoUntaggedFunds);
+            .has(&DataKey::AllowedToken(token.clone()))
+        {
+            set_token_allowed_inner(&env, token.clone(), true);
         }
 
-        token_client.transfer(&env.current_contract_address(), &to, &untagged);
-        events::swept_untagged(&env, to, untagged);
-        untagged
+        if let Some(old_total) = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&LegacyKey::TotalEscrowed)
+        {
+            set_total(
+                &env,
+                &token,
+                total_of(&env, &token).checked_add(old_total).unwrap(),
+            );
+            env.storage().instance().remove(&LegacyKey::TotalEscrowed);
+        }
+
+        for id in ids.iter() {
+            let key = LegacyKey::Escrow(id);
+            let Some(amount) = env.storage().persistent().get::<_, i128>(&key) else {
+                continue;
+            };
+            env.storage().persistent().remove(&key);
+            let tag = legacy_tag(&env, id);
+            if tag_owner(&env, &tag).is_none() {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::TagOwner(tag.clone()), &tag.owner);
+            }
+            let balance = escrow_of(&env, &token, &tag).checked_add(amount).unwrap();
+            set_escrow(&env, &token, &tag, balance);
+            events::legacy_migrated(&env, id, amount);
+        }
     }
 }

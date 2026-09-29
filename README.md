@@ -20,12 +20,13 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   price_oracle deployment to settle a series permissionlessly, as an
   alternative to the original `set_settlement_price`'s trusted-oracle-
   address flow.
-- [`vault/`](vault) — a per-tag escrow ledger for a single token,
+- [`vault/`](vault) — a per-(token, tag) escrow ledger for any number of
+  allowlisted tokens and integrator contracts,
   motivated by a gap discovered while testing options_market: that
   contract holds every writer's collateral and every buyer's premium in
   one undifferentiated balance, with no accounting of which balance is
   actually earmarked for which position. `deposit`/`withdraw` here are
-  scoped to a caller-defined `tag` (e.g. a position_id), so a withdrawal
+  scoped to a namespaced `tag` (e.g. `(options_market, "series", id)`), so a withdrawal
   can never draw down more than was specifically deposited under that
   tag — regardless of what the vault's raw token balance happens to be
   from other tags' deposits. `options_market::escrow_series_to_vault` /
@@ -304,38 +305,109 @@ have to poll every view function to track what changed.
 
 ## `vault` reference
 
-A per-tag escrow ledger for a single token, set at `initialize`.
+A per-(token, tag) escrow ledger. One deployment holds any number of
+allowlisted tokens and serves any number of integrator contracts
+(`options_market`, an LP pool, an insurance fund, ...). The token passed
+to `initialize` is the **default token** used by the `_legacy` wrappers.
+
+### Tag scheme
+
+A tag is a `#[contracttype] struct Tag { owner: Address, kind: Symbol, id: u64 }`,
+and the storage key is the full triple, so two integrators — or two id
+spaces inside one integrator — can never collide by construction.
+`options_market` uses `(self, "series", series_id)` for series escrow and
+reserves `(self, "position", position_id)` for per-position custody.
+
+A plain struct was chosen over a `BytesN<32>` hash of it: the key is only
+an address + a short symbol + a u64 larger than a hash, and in exchange
+storage keys and events stay self-describing (an indexer doesn't need a
+preimage registry to tell what a tag refers to).
+
+Legacy `u64` tags map to `(legacy owner, "legacy", id)`, where the legacy
+owner is the admin at `initialize` time (fixed, so a later
+`transfer_admin` can't orphan legacy balances).
+
+### Trust model
+
+- **Tag owners** (integrators) are the only ones who can move escrow.
+  A tag's owner is recorded as `TagOwner(tag) = tag.owner` on its first
+  deposit, and `withdraw` / `transfer_tag` require that owner's
+  `require_auth()`. In the intended integration the owner is a contract,
+  so its own cross-contract call satisfies the check without a human
+  signature. A bug in one integrator can therefore only ever reach its
+  own tags.
+- **Creating a tag** requires `tag.owner` to be in the integrator
+  registry (or be the legacy owner) and to authorize. End users can
+  deposit into a contract-owned tag only with that contract's auth, and
+  the contract still owns it. `transfer_tag` between different owners
+  requires **both** owners to authorize.
+- **The admin** configures the vault (token allowlist, integrator
+  registry, pause, sweeping untagged funds) but owns no integrator's
+  tags. Moving escrow without the owner is an **emergency-only** power,
+  available solely through multisig approval (`withdraw_via_multisig`,
+  `transfer_tag_via_multisig`), and still capped at each tag's balance.
 
 ### Admin
 
 | Function | Description |
 |---|---|
-| `initialize(admin, token)` | One-time setup. |
-| `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
+| `initialize(admin, token)` | One-time setup. `token` becomes the default token and is allowlisted. |
+| `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. Does not hand over any tag. |
 | `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
-| `pause()` / `unpause()` | Emergency stop. Blocks **both** `deposit` and `withdraw` — unlike options_market's pause (which leaves settlement paths open), there's no "existing position needs an exit" concern independent of the vault itself. |
-| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
-| `withdraw(tag, to, amount)` | Pays `amount` of `tag`'s escrowed balance to `to`. Panics with `InsufficientEscrowBalance` if `tag` doesn't have that much earmarked, regardless of the vault's total token balance. Admin-gated — in the intended integration, `admin` is set to a calling contract's own address, so a contract-to-contract call satisfies the auth check through the call itself. |
-| `withdraw_via_multisig(multisig_contract, action_id, tag, to, amount)` | Permissionless alternative to `withdraw`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Meant for manual recovery/migration when the calling contract itself can't produce that signature. Still enforces `InsufficientEscrowBalance`. |
-| `sweep_untagged(to)` | Recovers tokens that landed on the vault directly, bypassing `deposit` (e.g. a stray transfer). Computes the actual token balance minus `get_total_escrowed`'s ledger sum and transfers exactly that difference; panics with `NoUntaggedFunds` if there's nothing to recover. |
-| `sweep_untagged_via_multisig(multisig_contract, action_id, to)` | Permissionless alternative to `sweep_untagged`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
-| `transfer_tag(from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement at all — meant for the roll_position case (close + reopen in one breath, collateral doesn't need to leave and come back). `TotalEscrowed` is unaffected. |
-| `transfer_tag_via_multisig(multisig_contract, action_id, from_tag, to_tag, amount)` | Permissionless alternative to `transfer_tag`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
+| `pause()` / `unpause()` | Emergency stop. Blocks `deposit`, `withdraw` and `transfer_tag` — unlike options_market's pause (which leaves settlement paths open), there's no "existing position needs an exit" concern independent of the vault itself. |
+| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
+| `set_token_allowed(token, allowed)` / `set_token_allowed_via_multisig(multisig_contract, action_id, token, allowed)` | Manages the token allowlist. Removing a token only blocks **new** deposits; existing balances stay withdrawable, transferable and sweepable. |
+| `set_integrator(integrator, allowed)` / `set_integrator_via_multisig(multisig_contract, action_id, integrator, allowed)` | Manages the integrator registry (who may create tags). Deregistering blocks new tags only. |
+| `withdraw_via_multisig(multisig_contract, action_id, token, tag, to, amount)` | Emergency payout without the tag owner (e.g. the owning contract is being replaced). Still enforces `InsufficientEscrowBalance`. |
+| `transfer_tag_via_multisig(multisig_contract, action_id, token, from_tag, to_tag, amount)` | Emergency reassignment without the owners. A new `to_tag` is recorded as owned by `to_tag.owner`. |
+| `sweep_untagged(token, to)` / `sweep_untagged_via_multisig(multisig_contract, action_id, token, to)` | Recovers `token` that landed on the vault directly, bypassing `deposit`: the actual balance minus `get_total_escrowed(token)`. Panics with `NoUntaggedFunds` if there's nothing to recover — including when there is a shortfall instead. |
+| `migrate_legacy(ids)` | Moves pre-upgrade `Escrow(u64)` entries to `Escrow(default token, legacy_tag(id))`, owned by the current admin; the old `TotalEscrowed` moves to the default token's total on the first call. Idempotent. |
+
+### Tag owners
+
+| Function | Description |
+|---|---|
+| `withdraw(token, tag, to, amount)` | Pays `amount` of `(token, tag)`'s escrow to `to`. Requires the tag owner. Panics with `InsufficientEscrowBalance` if the tag doesn't have that much earmarked, and `InsufficientVaultBalance` (instead of a token error) if the vault's actual balance can't cover it. Emits `shortfall_detected` if the ledger is under-backed. |
+| `transfer_tag(token, from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement — meant for the roll_position case. Requires `from_tag`'s owner, and `to_tag`'s owner too if different. `TotalEscrowed` is unaffected. |
 
 ### Depositors
 
 | Function | Description |
 |---|---|
-| `deposit(from, tag, amount)` | Pulls `amount` from `from` and credits `tag`'s ledger. Requires `from`'s own signature. |
+| `deposit(from, token, tag, amount) -> i128` | Pulls `amount` of an allowlisted `token` from `from` and credits `(token, tag)`. Requires `from`'s signature (and, on a tag's first deposit, its owner's). Credits — and returns — the **measured** balance delta, not `amount`: a fee-on-transfer token credits only what arrived. Costs two extra `balance` reads per deposit. |
+
+### Legacy wrappers (default token, `u64` tags)
+
+`deposit_legacy(from, id, amount)`, `withdraw_legacy(id, to, amount)`,
+`transfer_tag_legacy(from_id, to_id, amount)`, `balance_of_legacy(id)`,
+`legacy_tag(id)`.
 
 ### Views
 
-`balance_of(tag)`, `get_total_escrowed`, `get_admin`, `get_token`, `is_paused`.
+`balance_of(token, tag)`, `get_total_escrowed(token)`,
+`get_shortfall(token)` (`max(0, TotalEscrowed(token) − balance)`),
+`get_tag_owner(tag)`, `is_token_allowed(token)`, `is_integrator(addr)`,
+`get_admin`, `get_token`, `is_paused`.
+
+### Clawback risk
+
+A SAC issuer with clawback enabled can reduce the vault's balance
+directly, leaving it below `TotalEscrowed`. The vault cannot prevent
+this; it makes it visible instead: `get_shortfall(token)` reports the gap,
+`withdraw` emits `shortfall_detected` whenever it sees one (at the cost
+of one extra `balance` read), payouts the vault can no longer cover fail
+with `InsufficientVaultBalance`, and `sweep_untagged` returns
+`NoUntaggedFunds` rather than trapping. Shortfall socialization across
+tags is out of scope — the last withdrawers of an under-backed token
+absorb it.
 
 ### Events
 
-`admin_transferred`, `paused`, `unpaused`, `deposited`, `withdrawn`,
-`swept_untagged`, `tag_transferred`.
+`admin_transferred`, `paused`, `unpaused`, `token_allowed`,
+`integrator_set`, `legacy_migrated`, and the token-scoped ones:
+`deposited` / `withdrawn` (topics `token`, full `tag`; data `(from|to, amount)`),
+`tag_transferred` (topic `token`; data `(from_tag, to_tag, amount)`),
+`swept_untagged` (topics `token`, `to`), `shortfall_detected` (topic `token`).
 
 ### Errors
 
@@ -347,6 +419,9 @@ A per-tag escrow ledger for a single token, set at `initialize`.
 | 4 | `ContractPaused` |
 | 5 | `NoUntaggedFunds` |
 | 6 | `Unauthorized` |
+| 7 | `TokenNotAllowed` |
+| 8 | `UnregisteredIntegrator` |
+| 9 | `InsufficientVaultBalance` |
 
 ## `multisig` reference
 
@@ -486,8 +561,9 @@ start, limit)` (paginated, `limit` capped at 50). Events:
   `upgrade`, `cancel_series`, `create_series`, `update_premium`.
   price_oracle: `pause`, `unpause`, `transfer_admin`,
   `set_max_staleness`, `set_min_reports`, `add_feeder`, `remove_feeder`.
-  vault: `pause`, `unpause`, `transfer_admin`, `withdraw`, `transfer_tag`,
-  `sweep_untagged`. `initialize` can't have one by construction — there
+  vault: `pause`, `unpause`, `transfer_admin`, `set_token_allowed`,
+  `set_integrator`, `sweep_untagged`, plus the emergency-only `withdraw`
+  and `transfer_tag` (whose normal path is tag-owner-gated, not admin). `initialize` can't have one by construction — there
   is no admin, and therefore no Multisig deployment trusted by this
   contract, until it runs. Every `_via_multisig` function is additive
   (the original admin-gated version is unchanged) and checks
