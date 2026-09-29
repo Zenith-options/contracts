@@ -22,11 +22,7 @@ on:
 # multisig build step above runs before the vault build step, not just
 # before options_market's.
 #
-# streams, staking, timelock and governor have no wasm prerequisites (the
-# governor reaches the timelock and voting token through contractclient
-# traits). integration_tests registers every contract natively, so like
-# options_market it needs multisig's, price_oracle's and vault's wasm first;
-# it has no wasm of its own and is left out of the wasm job.
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, integration_tests]
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -55,6 +51,11 @@ jobs:
         working-directory: ${{ matrix.crate }}
       - run: cargo test
         working-directory: ${{ matrix.crate }}
+      # Ledger invariant post-conditions compiled in, plus the slow
+      # 10,000-op fuzz test that's #[ignore]d in the default run.
+      - if: matrix.crate == 'vault'
+        run: cargo test --features invariants -- --include-ignored
+        working-directory: vault
 
   clippy:
     runs-on: ubuntu-latest
@@ -87,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow]
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow, integration_tests]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

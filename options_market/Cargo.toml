@@ -5,8 +5,10 @@ edition = "2021"
 publish = false
 
 [lib]
-# rlib alongside cdylib so integration_tests/ can register a real
-# options_market natively for the governance handover tests.
+# rlib alongside cdylib so timelock can depend on this crate for its
+# cross-contract integration test, and so integration_tests/ can register a
+# real options_market natively for the governance handover tests — same
+# pattern as vault's Cargo.toml.
 crate-type = ["cdylib", "rlib"]
 
 [profile.release]

@@ -1189,3 +1189,185 @@ fn archived_instance_restores_admin_and_token() {
     assert_eq!(h.client.get_admin(), h.admin);
     assert_eq!(h.client.get_token(), h.token);
 }
+
+// ── ActiveTags index / verify_ledger (#84) ──────────────────────────────────
+
+/// Full off-chain-style reconciliation: page through verify_ledger and
+/// check the partial sums add up to TotalEscrowed, and that get_tags
+/// agrees with balance_of for every indexed tag.
+fn reconcile(h: &Harness, page: u32) {
+    let count = h.client.get_tag_count();
+    let (mut cursor, mut sum) = (0u32, 0i128);
+    while cursor < count {
+        let (partial, next) = h.client.verify_ledger(&cursor, &page);
+        for tag in h.client.get_tags(&cursor, &page).iter() {
+            assert!(h.client.balance_of(&tag) > 0);
+        }
+        sum += partial;
+        cursor = next;
+    }
+    assert_eq!(cursor, count);
+    assert_eq!(sum, h.client.get_total_escrowed());
+    assert!(sum <= balance(h, &h.client.address));
+}
+
+#[test]
+fn tag_index_tracks_nonzero_balances_with_swap_remove() {
+    let h = setup();
+    let user = Address::generate(&h.env);
+    mint(&h, &user, 1_000);
+    h.client.deposit(&user, &1, &100);
+    h.client.deposit(&user, &2, &200);
+    h.client.deposit(&user, &3, &300);
+    assert_eq!(
+        h.client.get_tags(&0, &10),
+        soroban_sdk::vec![&h.env, 1, 2, 3]
+    );
+
+    h.client.withdraw(&1, &user, &100);
+    assert_eq!(h.client.get_tags(&0, &10), soroban_sdk::vec![&h.env, 3, 2]);
+
+    h.client.transfer_tag(&2, &4, &200);
+    assert_eq!(h.client.get_tags(&0, &10), soroban_sdk::vec![&h.env, 3, 4]);
+    assert_eq!(h.client.get_tag_count(), 2);
+    assert_eq!(h.client.verify_ledger(&0, &1), (300, 1));
+    assert_eq!(h.client.verify_ledger(&1, &1), (200, 2));
+    assert_eq!(h.client.verify_ledger(&5, &1), (0, 2));
+    reconcile(&h, 1);
+}
+
+/// Deterministic fuzz: 10,000 random deposit/withdraw/transfer_tag ops over a
+/// small tag space, reconciling the ledger after each batch of ops. Run with
+/// `--features invariants` to also check the post-condition inside every call.
+/// Slow (minutes), so ignored by default; CI runs it with
+/// `cargo test --features invariants -- --include-ignored`.
+#[test]
+#[ignore]
+fn fuzz_random_ops_preserve_ledger_invariant() {
+    let h = setup();
+    h.env.budget().reset_unlimited();
+    let user = Address::generate(&h.env);
+    mint(&h, &user, i128::MAX / 4);
+
+    let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut next = |m: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % m
+    };
+    for i in 0..10_000u32 {
+        let tag = next(16);
+        let amount = next(1_000) as i128 + 1;
+        match next(3) {
+            0 => h.client.deposit(&user, &tag, &amount),
+            1 => {
+                let bal = h.client.balance_of(&tag);
+                if bal > 0 {
+                    h.client.withdraw(&tag, &user, &(amount.min(bal)));
+                }
+            }
+            _ => {
+                let bal = h.client.balance_of(&tag);
+                if bal > 0 {
+                    h.client.transfer_tag(&tag, &next(16), &(amount.min(bal)));
+                }
+            }
+        }
+        if i % 500 == 0 {
+            h.env.budget().reset_unlimited();
+            reconcile(&h, 7);
+        }
+    }
+    reconcile(&h, 7);
+}
+
+// ── Batch withdraw / transfer_tag (#85) ─────────────────────────────────────
+
+#[test]
+fn withdraw_batch_matches_sequential_and_aggregates_recipients() {
+    let h = setup();
+    let user = Address::generate(&h.env);
+    let a = Address::generate(&h.env);
+    let b = Address::generate(&h.env);
+    mint(&h, &user, 1_000);
+    h.client.deposit(&user, &1, &500);
+    h.client.deposit(&user, &2, &500);
+
+    let ops = soroban_sdk::vec![
+        &h.env,
+        (1u64, a.clone(), 100i128),
+        (1u64, b.clone(), 150i128),
+        (2u64, a.clone(), 500i128),
+    ];
+    h.client.withdraw_batch(&ops);
+
+    assert_eq!(balance(&h, &a), 600);
+    assert_eq!(balance(&h, &b), 150);
+    assert_eq!(h.client.balance_of(&1), 250);
+    assert_eq!(h.client.balance_of(&2), 0);
+    assert_eq!(h.client.get_total_escrowed(), 250);
+    assert_eq!(h.client.get_tags(&0, &10), soroban_sdk::vec![&h.env, 1]);
+    // One `withdrawn` event per ledger entry, not per recipient.
+    let withdrawn = h
+        .env
+        .events()
+        .all()
+        .iter()
+        .filter(|(c, topics, _)| {
+            *c == h.client.address
+                && soroban_sdk::Symbol::try_from_val(&h.env, &topics.get(0).unwrap())
+                    == Ok(soroban_sdk::Symbol::new(&h.env, "withdrawn"))
+        })
+        .count();
+    assert_eq!(withdrawn, 3);
+    reconcile(&h, 10);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // InsufficientEscrowBalance
+fn withdraw_batch_detects_same_tag_overdraw_midway() {
+    let h = setup();
+    let user = Address::generate(&h.env);
+    mint(&h, &user, 100);
+    h.client.deposit(&user, &1, &100);
+    let ops = soroban_sdk::vec![
+        &h.env,
+        (1u64, user.clone(), 60i128),
+        (1u64, user.clone(), 60i128)
+    ];
+    h.client.withdraw_batch(&ops);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // InvalidBatchSize
+fn withdraw_batch_rejects_empty_batch() {
+    let h = setup();
+    h.client.withdraw_batch(&soroban_sdk::Vec::new(&h.env));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // InvalidBatchSize
+fn transfer_tag_batch_rejects_oversized_batch() {
+    let h = setup();
+    let mut ops = soroban_sdk::Vec::new(&h.env);
+    for i in 0..=crate::MAX_BATCH as u64 {
+        ops.push_back((i, i + 1, 1i128));
+    }
+    h.client.transfer_tag_batch(&ops);
+}
+
+#[test]
+fn transfer_tag_batch_chains_through_in_flight_balances() {
+    let h = setup();
+    let user = Address::generate(&h.env);
+    mint(&h, &user, 100);
+    h.client.deposit(&user, &1, &100);
+    let ops = soroban_sdk::vec![&h.env, (1u64, 2u64, 100i128), (2u64, 3u64, 40i128)];
+    h.client.transfer_tag_batch(&ops);
+    assert_eq!(h.client.balance_of(&1), 0);
+    assert_eq!(h.client.balance_of(&2), 60);
+    assert_eq!(h.client.balance_of(&3), 40);
+    assert_eq!(h.client.get_total_escrowed(), 100);
+    reconcile(&h, 10);
+}

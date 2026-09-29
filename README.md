@@ -32,6 +32,9 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   from other tags' deposits. `options_market::escrow_series_to_vault` /
   `claim_refund_from_vault` now wire this in for the specific gap it was
   built for — see "Known gaps" below for the scope of that integration.
+- [`timelock/`](timelock) — a delayed-execution admin (proposer /
+  executor / canceller roles, predecessor dependencies) meant to hold the
+  admin role on the other contracts so users always get an exit window.
 - [`multisig/`](multisig) — M-of-N approval tracking for opaque,
   caller-defined actions, motivated by every other contract here having
   a single `admin: Address` as its sole point of control. A fixed
@@ -355,20 +358,17 @@ owner is the admin at `initialize` time (fixed, so a later
 | `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. Does not hand over any tag. |
 | `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the current admin's own signature. |
 | `pause()` / `unpause()` | Emergency stop. Blocks `deposit`, `withdraw` and `transfer_tag` — unlike options_market's pause (which leaves settlement paths open), there's no "existing position needs an exit" concern independent of the vault itself. |
-| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
+| `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `set_token_allowed(token, allowed)` / `set_token_allowed_via_multisig(multisig_contract, action_id, token, allowed)` | Manages the token allowlist. Removing a token only blocks **new** deposits; existing balances stay withdrawable, transferable and sweepable. |
 | `set_integrator(integrator, allowed)` / `set_integrator_via_multisig(multisig_contract, action_id, integrator, allowed)` | Manages the integrator registry (who may create tags). Deregistering blocks new tags only. |
-| `withdraw_via_multisig(multisig_contract, action_id, token, tag, to, amount)` | Emergency payout without the tag owner (e.g. the owning contract is being replaced). Still enforces `InsufficientEscrowBalance`. |
-| `transfer_tag_via_multisig(multisig_contract, action_id, token, from_tag, to_tag, amount)` | Emergency reassignment without the owners. A new `to_tag` is recorded as owned by `to_tag.owner`. |
-| `sweep_untagged(token, to)` / `sweep_untagged_via_multisig(multisig_contract, action_id, token, to)` | Recovers `token` that landed on the vault directly, bypassing `deposit`: the actual balance minus `get_total_escrowed(token)`. Panics with `NoUntaggedFunds` if there's nothing to recover — including when there is a shortfall instead. |
-| `migrate_legacy(ids)` | Moves pre-upgrade `Escrow(u64)` entries to `Escrow(default token, legacy_tag(id))`, owned by the current admin; the old `TotalEscrowed` moves to the default token's total on the first call. Idempotent. |
-
-### Tag owners
-
-| Function | Description |
-|---|---|
 | `withdraw(token, tag, to, amount)` | Pays `amount` of `(token, tag)`'s escrow to `to`. Requires the tag owner. Panics with `InsufficientEscrowBalance` if the tag doesn't have that much earmarked, and `InsufficientVaultBalance` (instead of a token error) if the vault's actual balance can't cover it. Emits `shortfall_detected` if the ledger is under-backed. |
+| `withdraw_via_multisig(multisig_contract, action_id, token, tag, to, amount)` | Emergency payout without the tag owner (e.g. the owning contract is being replaced). Still enforces `InsufficientEscrowBalance`. |
+| `sweep_untagged(token, to)` / `sweep_untagged_via_multisig(multisig_contract, action_id, token, to)` | Recovers `token` that landed on the vault directly, bypassing `deposit`: the actual balance minus `get_total_escrowed(token)`. Panics with `NoUntaggedFunds` if there's nothing to recover — including when there is a shortfall instead. |
 | `transfer_tag(token, from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement — meant for the roll_position case. Requires `from_tag`'s owner, and `to_tag`'s owner too if different. `TotalEscrowed` is unaffected. |
+| `transfer_tag_via_multisig(multisig_contract, action_id, token, from_tag, to_tag, amount)` | Emergency reassignment without the owners. A new `to_tag` is recorded as owned by `to_tag.owner`. |
+| `withdraw_batch(ops: Vec<(token, tag, to, amount)>)` | Batched `withdraw`: one admin auth check, up to `MAX_BATCH` (50) entries, every entry validated against in-flight balances (the same tag may repeat) before anything is written, one token transfer per distinct recipient, all-or-nothing. One `withdrawn` event per entry. ~4x cheaper than sequential calls (10 entries: 0.92M vs 3.80M CPU instructions, 175KB vs 844KB memory). |
+| `transfer_tag_batch(ops: Vec<(token, from_tag, to_tag, amount)>)` | Batched `transfer_tag`, same validation and all-or-nothing semantics. One `tag_transferred` event per entry. |
+| `migrate_legacy(ids)` | Moves pre-upgrade `Escrow(u64)` entries to `Escrow(default token, legacy_tag(id))`, owned by the current admin; the old `TotalEscrowed` moves to the default token's total on the first call. Idempotent. |
 
 ### Depositors
 
@@ -387,7 +387,33 @@ owner is the admin at `initialize` time (fixed, so a later
 `balance_of(token, tag)`, `get_total_escrowed(token)`,
 `get_shortfall(token)` (`max(0, TotalEscrowed(token) − balance)`),
 `get_tag_owner(tag)`, `is_token_allowed(token)`, `is_integrator(addr)`,
-`get_admin`, `get_token`, `is_paused`.
+`get_admin`, `get_token`, `is_paused`,
+`get_tag_count`, `get_tags(cursor, limit)`, `verify_ledger(cursor, limit) -> (partial_sum, next_cursor)`.
+
+`get_tags`/`verify_ledger` page through the ActiveTags index (every tag
+with a nonzero balance; `limit` capped at 100). The index uses
+swap-remove, so read all pages against one ledger snapshot.
+
+### Ledger reconciliation
+
+The vault's invariant is `sum(Escrow(tag)) == TotalEscrowed <= token.balance(vault)`.
+Monitors can check it over RPC:
+
+```sh
+count=$(stellar contract invoke --id $VAULT -- get_tag_count)
+cursor=0; sum=0
+while [ "$cursor" -lt "$count" ]; do
+  read partial cursor < <(stellar contract invoke --id $VAULT -- \
+    verify_ledger --cursor $cursor --limit 100 | tr -d '[]",' )
+  sum=$((sum + partial))
+done
+total=$(stellar contract invoke --id $VAULT -- get_total_escrowed | tr -d '"')
+[ "$sum" = "$total" ] && echo "ledger OK ($sum)" || echo "MISMATCH: $sum != $total"
+```
+
+Building with `--features invariants` compiles a full post-condition check
+into every mutating entrypoint (tests/fuzzing only, never production wasm);
+CI runs the suite that way, including a 10,000-op random fuzz test.
 
 ### Clawback risk
 
@@ -454,6 +480,44 @@ set, so a compromised signer can never add another compromised signer.
 | 4 | `NotASigner` |
 | 5 | `AlreadyApproved` |
 | 6 | `NotYetApproved` |
+
+## `timelock` reference
+
+Meant to hold the admin role on every other Zenith contract, so any
+parameter or code change is visible on-chain for at least `min_delay`
+seconds before it can run. Modelled on OpenZeppelin's TimelockController.
+
+| Function | Description |
+|---|---|
+| `initialize(min_delay, proposers, executors, cancellers)` | One-time setup. Empty `executors` means anyone may execute a ready operation. There is no admin afterwards. |
+| `schedule(proposer, calls, predecessor, salt, delay) -> id` | Proposer-only. `calls` is a `Vec<Call { target, function, args }>`; `delay >= min_delay`. The id is `sha256(xdr((calls, predecessor, salt)))` (see `hash_operation`). Rejects an id that's already pending or done. |
+| `execute(executor, calls, predecessor, salt)` | Executor-only (unless open). Requires the operation ready and `predecessor` (if any) done. Runs every call in order via `invoke_contract`; any revert reverts the whole batch. |
+| `cancel(canceller, id)` | Canceller-only. Removes a pending operation. |
+
+**Self-administration.** Soroban forbids re-entry, so a `Call` whose
+`target` is the timelock itself is dispatched internally by `execute`:
+`update_delay(u64)`, `grant_role(Role, Address)`, `revoke_role(Role, Address)`,
+`set_open_executor(bool)`. These changes are therefore only reachable
+through a delayed operation.
+
+**Views:** `get_timestamp(id)` (0 unknown, 1 done, else ready-at),
+`is_operation`, `is_operation_pending`, `is_operation_ready`,
+`is_operation_done`, `get_min_delay`, `has_role(role, account)`,
+`is_open_executor`, `hash_operation`.
+
+**Events:** `scheduled`, `executed`, `cancelled`, `min_delay_changed`, `role_changed`.
+
+**Errors:** 1 `AlreadyInitialized`, 2 `Unauthorized`, 3 `InsufficientDelay`,
+4 `AlreadyScheduled`, 5 `NotReady`, 6 `PredecessorNotDone`, 7 `NotPending`,
+8 `UnknownSelfCall`, 9 `EmptyOperation`.
+
+### Operations guide
+
+1. Deploy the timelock, then `transfer_admin(timelock)` on each contract.
+2. A proposer schedules the change, e.g. `calls = [Call { target: options_market, function: "set_fee_rate", args: [25u32] }]`, with a unique `salt`, and announces the id.
+3. During the delay users can exit; a canceller can `cancel(id)`.
+4. Once `is_operation_ready(id)`, an executor calls `execute` with the exact same `calls`/`predecessor`/`salt`.
+5. Use `predecessor` to force ordering (e.g. a migration after an `upgrade`).
 
 ## `params` reference
 
