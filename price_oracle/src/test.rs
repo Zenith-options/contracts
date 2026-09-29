@@ -6,7 +6,7 @@ use crate::{PriceOracle, PriceOracleClient};
 use multisig::{Multisig, MultisigClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
-    Address, Env, Symbol, TryFromVal,
+    Address, BytesN, Env, Symbol, TryFromVal,
 };
 
 struct Harness<'a> {
@@ -523,7 +523,7 @@ fn pause_via_multisig_pauses_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 1u64;
+    let action_id = aid(&h.env, 1);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -539,9 +539,9 @@ fn pause_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    multisig_client.approve(&signers[0], &1u64); // only 1 of 3
+    multisig_client.approve(&signers[0], &aid(&h.env, 1)); // only 1 of 3
 
-    h.client.pause_via_multisig(&multisig_id, &1u64);
+    h.client.pause_via_multisig(&multisig_id, &aid(&h.env, 1));
 }
 
 #[test]
@@ -553,7 +553,7 @@ fn unpause_via_multisig_unpauses_once_approved() {
     h.client.pause();
     assert!(h.client.is_paused());
 
-    let action_id = 3u64;
+    let action_id = aid(&h.env, 3);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -568,7 +568,8 @@ fn unpause_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client.pause();
-    h.client.unpause_via_multisig(&multisig_id, &99u64);
+    h.client
+        .unpause_via_multisig(&multisig_id, &aid(&h.env, 99));
 }
 
 #[test]
@@ -577,7 +578,7 @@ fn transfer_admin_via_multisig_hands_off_control_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 2u64;
+    let action_id = aid(&h.env, 2);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -595,7 +596,7 @@ fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
     let new_admin = Address::generate(&h.env);
 
     h.client
-        .transfer_admin_via_multisig(&multisig_id, &99u64, &new_admin);
+        .transfer_admin_via_multisig(&multisig_id, &aid(&h.env, 99), &new_admin);
 }
 
 #[test]
@@ -604,7 +605,7 @@ fn set_max_staleness_via_multisig_applies_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 4u64;
+    let action_id = aid(&h.env, 4);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -620,7 +621,7 @@ fn set_max_staleness_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .set_max_staleness_via_multisig(&multisig_id, &99u64, &7200);
+        .set_max_staleness_via_multisig(&multisig_id, &aid(&h.env, 99), &7200);
 }
 
 #[test]
@@ -630,7 +631,7 @@ fn set_max_staleness_via_multisig_still_rejects_zero_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 5u64;
+    let action_id = aid(&h.env, 5);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -644,7 +645,7 @@ fn set_min_reports_via_multisig_applies_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 6u64;
+    let action_id = aid(&h.env, 6);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -660,7 +661,7 @@ fn set_min_reports_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .set_min_reports_via_multisig(&multisig_id, &99u64, &3);
+        .set_min_reports_via_multisig(&multisig_id, &aid(&h.env, 99), &3);
 }
 
 #[test]
@@ -670,7 +671,7 @@ fn set_min_reports_via_multisig_still_rejects_zero_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 7u64;
+    let action_id = aid(&h.env, 7);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -686,7 +687,7 @@ fn add_feeder_via_multisig_authorizes_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 6u64;
+    let action_id = aid(&h.env, 6);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -704,7 +705,7 @@ fn add_feeder_via_multisig_rejects_when_not_yet_approved() {
     let feeder = Address::generate(&h.env);
 
     h.client
-        .add_feeder_via_multisig(&multisig_id, &99u64, &feeder);
+        .add_feeder_via_multisig(&multisig_id, &aid(&h.env, 99), &feeder);
 }
 
 #[test]
@@ -716,7 +717,7 @@ fn add_feeder_via_multisig_still_rejects_a_duplicate_once_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 7u64;
+    let action_id = aid(&h.env, 7);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -732,7 +733,7 @@ fn remove_feeder_via_multisig_revokes_once_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 8u64;
+    let action_id = aid(&h.env, 8);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -750,7 +751,11 @@ fn remove_feeder_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .remove_feeder_via_multisig(&multisig_id, &99u64, &feeder);
+        .remove_feeder_via_multisig(&multisig_id, &aid(&h.env, 99), &feeder);
+}
+
+fn aid(env: &Env, n: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[n; 32])
 }
 
 // ─── TTL policy (issue #98) and archival restore (issue #99) ────────────────

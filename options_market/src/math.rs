@@ -21,6 +21,10 @@ pub const MAX_SERIES_PER_UNDERLYING: u32 = 50;
 /// a single call, so a caller with a very large position count can't build
 /// a batch that blows through Soroban's per-call resource limits.
 pub const MAX_BATCH_SIZE: u32 = 25;
+/// Largest page any paginated view returns.
+pub const MAX_PAGE_LIMIT: u32 = 50;
+/// Most entries a paginated view reads per call, matching or not.
+pub const MAX_PAGE_SCAN: u32 = 200;
 
 /// Protocol fee on an amount, given a rate in basis points (1 bps = 0.01%).
 pub fn calc_fee(amount: i128, fee_rate_bps: i128) -> i128 {

@@ -208,8 +208,16 @@ documented per field.
 | `write_option(writer, series_id, contracts, collateral_amount, min_premium)` | Opens a Short position. Collateral: notional value for calls, 110% of strike for puts. Premium is paid out of the pool buyers have funded — `InsufficientPremiumPool` if no buyer has paid in enough yet (a write can't be paid a "premium" out of its own just-deposited collateral). `min_premium` is slippage protection: `PremiumBelowMinimum` if the net premium the writer would receive (after the protocol fee) is below it, so an `update_premium` cut or fee increase ordered ahead of the write can't underpay the writer. Pass `0` to opt out. |
 | `exercise(owner, position_id)` | Long-side payout after expiry, within the 24h settlement window, if in the money. The 24h settlement window is a soft deadline (longs remain claimable until the 90-day forfeiture window). |
 | `exercise_batch(owner, position_ids)` | Same as `exercise`, for every id in `position_ids` in one call — for an owner with several long positions who'd otherwise need one transaction per position. All-or-nothing (any single id failing `exercise`'s own checks aborts the whole batch) and capped at `MAX_BATCH_SIZE` (25). Returns the summed payout. |
+ 24h settlement window, if in the money. The 24h settlement window is a soft deadline (longs remain claimable until the 90-day forfeiture window). |
+| `exercise_batch(owner, position_ids)` | Same as `exercise`, for every id in `position_ids` in one call — for an owner with several long positions who'd otherwise need one transaction per position. All-or-nothing (any single id failing `exercise`'s own checks aborts the whole batch) and capped at `MAX_BATCH_SIZE` (25). Returns the summed payout. |
+| `buy_batch(buyer, orders)` | `buy_option` for up to `MAX_BATCH_SIZE` (25) `(series_id, contracts, max_premium)` orders — e.g. a strangle or ladder — with ONE premium pull and ONE fee transfer for the whole batch. Same per-order validation as `buy_option` (shared internals), orders applied in the given order (duplicate series allowed), all-or-nothing, one `option_bought` event per order. Returns the new position ids. ~51% less CPU than 5 separate `buy_option` calls in the test harness. |
+| `write_batch(writer, orders)` | `write_option` for up to 25 `(series_id, contracts, collateral_amount)` orders, with ONE collateral pull and ONE premium payout. Orders draw on the premium pool strictly in order; all-or-nothing; one `option_written` event per order. |
 | `settle_long(position_id)` | Permissionless auto-exercise / keeper settlement for in-the-money longs after settlement. Anyone can call; payout is unconditionally transferred to the position owner. |
 | `sweep_forfeited(position_id)` | Admin entrypoint to sweep unexercised ITM long payouts after the 90-day forfeiture deadline to the protocol treasury/fee recipient with a `payout_forfeited` event. |
+
+| `reclaim_collateral(writer, position_id)` | Short-side payout after settlement: locked collateral minus the max loss paid out to longs. |
+| `reclaim_batch(writer, position_ids)` | Batched `reclaim_collateral`, same all-or-nothing/`MAX_BATCH_SIZE` contract as `exercise_batch`. Returns the summed reclaim. |
+| `transfer_position(from, to, position_id)` | Moves an open position to `to` (`from` must own it and sign); both parties' position lists are updated and `to` inherits exercise / reclaim / r
 | `reclaim_collateral(writer, position_id)` | Short-side payout after settlement: locked collateral minus the max loss paid out to longs. |
 | `reclaim_batch(writer, position_ids)` | Batched `reclaim_collateral`, same all-or-nothing/`MAX_BATCH_SIZE` contract as `exercise_batch`. Returns the summed reclaim. |
 | `transfer_position(from, to, position_id)` | Moves an open position to `to` (`from` must own it and sign); both parties' position lists are updated and `to` inherits exercise / reclaim / refund rights. Shorts are transferable because their collateral is already locked here, so `to` only gains the leftover-collateral reclaim. Rejected for exercised/settled positions and while paused; `to == from` is a no-op. Emits `position_transferred(from, to; position_id)`. |
@@ -231,6 +239,21 @@ documented per field.
 (remaining not-yet-claimed refund liability for a series), `get_stats`
 (total premiums collected, total open interest, series count),
 `get_orphaned_liabilities`, `sync_orphaned_liabilities`.
+
+Paginated views (`limit` must be 1..=`MAX_PAGE_LIMIT` (50), else
+`InvalidPageLimit`). Each call reads at most `MAX_PAGE_SCAN` (200)
+entries, matching or not, so a page may come back short — keep paging
+until `next_cursor` is 0. Missing (e.g. archived) entries are skipped.
+At `limit = 50` in the test harness: `get_series_page` ≈ 2.0M CPU /
+187KB, `get_user_positions_page` ≈ 1.7M CPU / 162KB.
+
+| View | Description |
+|---|---|
+| `get_series_page(cursor, limit, filter)` | Series with id > `cursor`, in id order. `SeriesFilter { state, underlying, option_type }` — each a list of accepted values, empty = any. `state` is the stored state (stays `Active` past expiry until settled/cancelled). Returns `SeriesPage { items, next_cursor }`. |
+| `get_user_positions_page(user, cursor, limit, side)` | `user`'s positions from index `cursor` of their position list, optionally only `Long` or `Short`. Returns `PositionPage { items, next_cursor }`. |
+| `get_series_by_underlying(symbol)` | Every series id listed on `symbol`, oldest first (secondary index maintained on create; bounded by `MAX_SERIES_PER_UNDERLYING`). |
+| `get_position_value(position_id)` | **Indicative only — never used for settlement.** Intrinsic value at the settlement price if set, else the last recorded underlying price (0 if neither). Positive for longs, negative for shorts, 0 once exercised/settled. |
+| `get_account_summary(user)` | **Indicative only.** `AccountSummary { open_positions, long_value, short_liability, collateral_locked, net_value }` over `user`'s open positions. |
 
 ### Errors
 
@@ -455,20 +478,32 @@ Signers, threshold, and `approval_ttl` are all fixed at `initialize` and
 immutable — there's deliberately no in-protocol way to change the signer
 set, so a compromised signer can never add another compromised signer.
 
+Action ids are `BytesN<32>`. Every action has an on-chain registry entry,
+`ActionMeta { proposer, created_at, description_hash, status }`
+(`status`: `Pending`, `Executed`, `Reset`, `Expired`), created either by
+`register_action` or on its first approval. Pending actions live in a
+bounded index (at most `MAX_PENDING_ACTIONS` (100) overall and
+`MAX_PENDING_PER_SIGNER` (10) per proposer, against registry spam) that
+is swap-removed on execute, reset, or expiry.
+
 | Function | Description |
 |---|---|
 | `initialize(signers, threshold, approval_ttl)` | One-time setup. Rejects a zero threshold, a threshold above the signer count, or a duplicate signer. `approval_ttl` is in seconds; zero means approvals never expire (the original behavior). |
-| `approve(signer, action_id)` | Records `signer`'s approval, stamped with the current ledger timestamp. Requires the signer's own signature and current signer-set membership. Rejects a signer voting twice on the same `action_id` while their existing approval is still fresh — an EXPIRED approval is treated as no approval at all, so re-approving after expiry just refreshes the timestamp instead of erroring. |
+| `register_action(proposer, action_id, description_hash)` | Signer-only. Registers `action_id` with a `description_hash` (e.g. sha256 of an off-chain write-up) before anyone votes, so signers can verify on-chain what they approve. Rejects an id that's already pending or executed. |
+| `approve(signer, action_id)` | Records `signer`'s approval, stamped with the current ledger timestamp. Requires the signer's own signature and current signer-set membership. Registers the action (zero description hash) if it isn't pending yet. Rejects an executed action, and a signer voting twice while their existing approval is still fresh — an EXPIRED approval is treated as no approval at all, so re-approving after expiry just refreshes the timestamp. |
 | `revoke(signer, action_id)` | Withdraws `signer`'s own still-fresh vote. Rejects revoking an approval that's already expired — there's nothing left to withdraw. |
-| `reset(action_id)` | Clears every signer's approval of `action_id`, so a repeat action reusing the same id starts from a clean slate. Only callable once `action_id` is already approved. |
+| `reset(action_id)` | Clears every signer's approval of `action_id` and marks it `Reset` (removed from the pending index), so a repeat action reusing the same id starts from a clean slate. Only callable once `action_id` is already approved; not for executor proposals. |
+| `expire(action_id)` | Anyone. Marks a stale pending action `Expired` and drops it from the index: requires a nonzero `approval_ttl`, the action older than it, and no approval still fresh. |
+| `propose(proposer, target, function, args) -> proposal_id` | Signer-only. Stores `Proposal { target, function, args, nonce }` (at most `MAX_PROPOSAL_ARGS` (10) args) and registers it. `proposal_id` = sha256 of the proposal's XDR, which is also its description hash, so the id commits to the exact call. |
+| `execute(proposal_id)` | Anyone, once approved. Marks the proposal `Executed`, then calls `target.function(args)` via `invoke_contract` **as the multisig** — so a target whose admin is the multisig passes its `admin.require_auth()` with no other signature. Can never run twice; a failing target call reverts the whole transaction (the proposal stays pending). Returns the target's return value. |
 
 ### Views
 
-`is_signer`, `get_signer_count`, `get_threshold`, `get_approval_ttl`, `has_approved(action_id, signer)` (false if expired), `get_approval_count(action_id)` (counts only currently-unexpired approvals), `is_approved(action_id)`.
+`is_signer`, `get_signer_count`, `get_threshold`, `get_approval_ttl`, `has_approved(action_id, signer)` (false if expired), `get_approval_count(action_id)` (counts only currently-unexpired approvals), `is_approved(action_id)`, `get_action(action_id)` (`ActionMeta` or none), `get_pending_actions(cursor, limit)` (up to `limit` ≤ 50 pending ids from index `cursor`; order isn't stable across writes because removal is swap-remove), `get_pending_count`, `get_proposal(proposal_id)`.
 
 ### Events
 
-`approved`, `revoked`, `reset`.
+`registered`, `approved`, `revoked` (topics: name, address, action id), `reset`, `expired`, `executed` (topics: name, action id). Every event's data is the action's description hash.
 
 ### Errors
 
@@ -480,6 +515,20 @@ set, so a compromised signer can never add another compromised signer.
 | 4 | `NotASigner` |
 | 5 | `AlreadyApproved` |
 | 6 | `NotYetApproved` |
+| 7 | `ActionAlreadyRegistered` |
+| 8 | `ActionNotPending` |
+| 9 | `TooManyPendingActions` |
+| 10 | `ProposalNotFound` |
+| 11 | `ProposalTooLarge` |
+| 12 | `InvalidPageLimit` |
+| 13 | `NotExpired` |
+
+### Migrating from `_via_multisig` to executor mode
+
+1. Deploy and `initialize` a multisig with the intended signers and threshold.
+2. On each target contract, `transfer_admin(<multisig address>)` — from then on the multisig is the admin, and every admin function keeps its single `admin.require_auth()` path.
+3. For each admin action: a signer calls `propose(signer, target, fn_name, args)`, signers `approve(signer, proposal_id)` until threshold, then anyone calls `execute(proposal_id)`.
+4. The existing `_via_multisig` entrypoints and `is_approved` keep working unchanged (with `BytesN<32>` action ids), so consumers can move over one function at a time; their removal is a follow-up deprecation.
 
 ## `timelock` reference
 
