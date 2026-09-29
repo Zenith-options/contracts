@@ -1,0 +1,9 @@
+[package]
+name = "spec-diff"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+soroban-spec = "=21.7.7"
+stellar-xdr = { version = "=21.2.0", features = ["curr", "std"] }

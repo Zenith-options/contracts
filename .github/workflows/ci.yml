@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow, integration_tests]
+        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, integration_tests, tools/spec-diff]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow, integration_tests]
+        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, integration_tests]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -122,3 +122,20 @@ jobs:
         working-directory: params
       - run: cargo build --target wasm32-unknown-unknown --release
         working-directory: ${{ matrix.crate }}
+
+  # Public-ABI guard: every existing function, type and error in each
+  # contract's spec must survive unchanged (additions are fine) unless
+  # the PR lists it in tools/spec-diff/allow.txt. Also prints the wasm
+  # size delta against the base branch.
+  spec-diff:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: tools/spec-diff/check.sh origin/${{ github.base_ref }}
