@@ -1373,8 +1373,9 @@ fn upgrade_reaches_the_host_deployer_past_the_admin_check() {
 #[test]
 fn create_series_tracks_the_count_per_underlying() {
     let h = setup();
-    for _ in 0..50 {
-        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Distinct strikes: each listing must be a unique spec (DuplicateSeries).
+    for i in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000 + i, 40_000_000);
     }
     assert_eq!(
         h.client
@@ -1387,17 +1388,19 @@ fn create_series_tracks_the_count_per_underlying() {
 #[should_panic(expected = "Error(Contract, #20)")] // TooManySeriesForUnderlying
 fn create_series_rejects_the_51st_series_for_the_same_underlying() {
     let h = setup();
-    for _ in 0..50 {
-        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Distinct strikes: each listing must be a unique spec (DuplicateSeries).
+    for i in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000 + i, 40_000_000);
     }
-    make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    make_series(&h, OptionType::Call, 700_000_050, 40_000_000);
 }
 
 #[test]
 fn series_cap_is_tracked_independently_per_underlying() {
     let h = setup();
-    for _ in 0..50 {
-        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Distinct strikes: each listing must be a unique spec (DuplicateSeries).
+    for i in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000 + i, 40_000_000);
     }
 
     // XLM is now at the cap, but a different underlying should be unaffected.
@@ -1415,6 +1418,145 @@ fn series_cap_is_tracked_independently_per_underlying() {
         h.client
             .get_series_count_for_underlying(&Symbol::new(&h.env, "BTC")),
         1
+    );
+}
+
+// ─── duplicate series (#63) ─────────────────────────────────────────────────
+
+fn list(h: &Harness, underlying: &str, option_type: OptionType, strike: i128, expiry: u64) -> u64 {
+    h.client.create_series(
+        &Symbol::new(&h.env, underlying),
+        &option_type,
+        &strike,
+        &expiry,
+        &40_000_000,
+        &450_000_000i128,
+    )
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")] // DuplicateSeries
+fn create_series_rejects_a_duplicate_spec() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    // Same underlying/type/strike/expiry; a different premium doesn't make it
+    // a different contract.
+    h.client.create_series(
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &55_000_000,
+        &500_000_000i128,
+    );
+}
+
+#[test]
+fn create_series_accepts_specs_differing_in_any_one_field() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let base = list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    let ids = [
+        base,
+        list(&h, "BTC", OptionType::Call, 700_000_000, expiry),
+        list(&h, "XLM", OptionType::Put, 700_000_000, expiry),
+        list(&h, "XLM", OptionType::Call, 700_000_001, expiry),
+        list(&h, "XLM", OptionType::Call, 700_000_000, expiry + 1),
+    ];
+    for (i, a) in ids.iter().enumerate() {
+        for b in ids.iter().skip(i + 1) {
+            assert_ne!(a, b);
+        }
+    }
+}
+
+#[test]
+fn get_series_id_resolves_the_spec_index() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let xlm = Symbol::new(&h.env, "XLM");
+    assert_eq!(
+        h.client
+            .get_series_id(&xlm, &OptionType::Call, &700_000_000, &expiry),
+        None
+    );
+    let id = list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    assert_eq!(
+        h.client
+            .get_series_id(&xlm, &OptionType::Call, &700_000_000, &expiry),
+        Some(id)
+    );
+    assert_eq!(
+        h.client
+            .get_series_id(&xlm, &OptionType::Put, &700_000_000, &expiry),
+        None
+    );
+}
+
+#[test]
+fn a_rejected_duplicate_leaves_no_state_behind() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let xlm = Symbol::new(&h.env, "XLM");
+    let id = list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+
+    let res = h.client.try_create_series(
+        &xlm,
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000i128,
+    );
+    assert_eq!(res, Err(Ok(Error::DuplicateSeries.into())));
+    // The per-underlying count and the series counter didn't move.
+    assert_eq!(h.client.get_series_count_for_underlying(&xlm), 1);
+    assert_eq!(
+        list(&h, "XLM", OptionType::Call, 700_000_001, expiry),
+        id + 1
+    );
+}
+
+#[test]
+fn a_cancelled_series_still_reserves_its_spec() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let id = list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    h.client.cancel_series(&id);
+
+    let res = h.client.try_create_series(
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000i128,
+    );
+    assert_eq!(res, Err(Ok(Error::DuplicateSeries.into())));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")] // DuplicateSeries
+fn create_series_via_multisig_rejects_a_spec_listed_by_the_admin() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 9u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    h.client.create_series_via_multisig(
+        &multisig_id,
+        &action_id,
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000,
     );
 }
 

@@ -147,7 +147,7 @@ documented per field.
 | `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `upgrade(new_wasm_hash)` | Swaps the contract's executable via Soroban's deployer, keeping the same address, ID, and storage. |
 | `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
-| `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out. Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. |
+| `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out. Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. Each `(underlying, option_type, strike_price, expiry)` spec can be listed once, ever (a cancelled or settled series still owns it): a second listing fails with `DuplicateSeries`. |
 | `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Same validation and per-underlying cap apply. |
 | `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. |
 | `update_premium_via_multisig(multisig_contract, action_id, series_id, new_premium, new_implied_vol)` | Permissionless alternative to `update_premium`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
@@ -185,7 +185,7 @@ documented per field.
 ### Views
 
 `get_admin`, `is_paused`, `get_fee_rate`, `get_premium_pool`,
-`get_series_count_for_underlying`, `get_series`, `get_position`,
+`get_series_count_for_underlying`, `get_series_id`, `get_series`, `get_position`,
 `get_user_positions`, `get_underlying_price`, `get_series_escrow`
 (remaining not-yet-claimed refund liability for a series), `get_stats`
 (total premiums collected, total open interest, series count),
@@ -208,6 +208,7 @@ documented per field.
 | 11 | `ExerciseWindowClosed` | | 23 | `InvalidBatchSize` |
 | 12 | `ZeroContracts` | | 24 | `NothingToEscrow` |
 | | | | 25 | `NotEligibleForForfeiture` |
+| | | | 26 | `DuplicateSeries` |
 
 ## `price_oracle` reference
 

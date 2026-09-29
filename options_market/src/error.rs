@@ -30,4 +30,5 @@ pub enum Error {
     NothingToEscrow = 24,
     PremiumBelowMinimum = 25,
     NotEligibleForForfeiture = 26,
+    DuplicateSeries = 27,
 }
