@@ -24,12 +24,13 @@ mod vault_client;
 
 use error::Error;
 use math::{
-    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, MAX_BATCH_SIZE, MAX_FEE_RATE_BPS,
-    MAX_SERIES_PER_UNDERLYING, MIN_COLLATERAL_RATIO, PRICE_PRECISION, RATE_PRECISION,
-    SETTLEMENT_WINDOW,
+    calc_fee, calc_payout, DEFAULT_FEE_RATE_BPS, FORFEITURE_WINDOW, MAX_BATCH_SIZE,
+    MAX_FEE_RATE_BPS, MAX_SERIES_PER_UNDERLYING, MIN_COLLATERAL_RATIO, PRICE_PRECISION,
+    RATE_PRECISION, SETTLEMENT_WINDOW,
 };
 use storage::{
-    add_user_position, fee_rate_bps, next_position_id, require_active_series, require_not_paused,
+    add_orphaned_liability, add_user_position, claim_series_index, deduct_orphaned_liability,
+    fee_rate_bps, next_position_id, require_active_series, require_not_paused,
 };
 use types::{DataKey, OptionPosition, OptionSeries, OptionType, PositionSide, SeriesState};
 
@@ -269,6 +270,14 @@ impl OptionsMarket {
             .get(&DataKey::SeriesCounter)
             .unwrap();
         let series_id = counter.checked_add(1).unwrap();
+        claim_series_index(
+            &env,
+            &underlying,
+            &option_type,
+            strike_price,
+            expiry,
+            series_id,
+        );
 
         let series = OptionSeries {
             series_id,
@@ -347,6 +356,14 @@ impl OptionsMarket {
             .get(&DataKey::SeriesCounter)
             .unwrap();
         let series_id = counter.checked_add(1).unwrap();
+        claim_series_index(
+            &env,
+            &underlying,
+            &option_type,
+            strike_price,
+            expiry,
+            series_id,
+        );
 
         let series = OptionSeries {
             series_id,
@@ -839,12 +856,18 @@ impl OptionsMarket {
     /// Write (sell) options — lock collateral, receive premium
     /// For calls: collateral = contracts × underlying price (covered call)
     /// For puts:  collateral = contracts × strike price × 110% (cash-secured put)
+    /// `min_premium` is slippage protection: the write fails with
+    /// `PremiumBelowMinimum` if the net premium the writer would receive
+    /// (after the protocol fee) is below it, so an `update_premium` cut or a
+    /// `set_fee_rate` increase ordered ahead of the write can't lock the
+    /// writer's collateral for less than they agreed to. Pass 0 to opt out.
     pub fn write_option(
         env: Env,
         writer: Address,
         series_id: u64,
         contracts: i128,
         collateral_amount: i128,
+        min_premium: i128,
     ) -> u64 {
         require_not_paused(&env);
         writer.require_auth();
@@ -920,6 +943,10 @@ impl OptionsMarket {
         let fee = calc_fee(total_premium, fee_rate_bps(&env));
         let writer_premium = total_premium - fee;
 
+        if writer_premium < min_premium {
+            panic_with_error!(&env, Error::PremiumBelowMinimum);
+        }
+
         let pool: i128 = env
             .storage()
             .instance()
@@ -984,6 +1011,98 @@ impl OptionsMarket {
         pos_id
     }
 
+    // ── Position Management ───────────────────────────────────────────────────
+
+    /// Split `split_contracts` off position `position_id` into a new position
+    /// with the same series, side, owner and `opened_at` (issue #52).
+    ///
+    /// `premium_paid`, `fee_paid` and `collateral_locked` are divided in
+    /// proportion to `split_contracts / contracts`, rounded down for the new
+    /// position, with the remainder left in the original. Every field's total
+    /// across the two positions equals the original exactly, so open interest
+    /// and `SeriesEscrow` are unchanged and a cancelled series refunds the
+    /// same total either way.
+    ///
+    /// Rounding note: payouts are computed per position, so exercising two
+    /// halves can pay (and reclaiming two short halves can keep) at most one
+    /// unit less (more) per split than the unsplit position would.
+    ///
+    /// Fails with `InvalidSplitAmount` unless `0 < split_contracts <
+    /// contracts`, and with `AlreadyExercised` / `AlreadySettled` for a closed
+    /// position. Returns the new position id.
+    pub fn split_position(
+        env: Env,
+        owner: Address,
+        position_id: u64,
+        split_contracts: i128,
+    ) -> u64 {
+        require_not_paused(&env);
+        owner.require_auth();
+
+        let mut position: OptionPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+        if position.owner != owner {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if position.is_exercised {
+            panic_with_error!(&env, Error::AlreadyExercised);
+        }
+        if position.is_settled {
+            panic_with_error!(&env, Error::AlreadySettled);
+        }
+        if split_contracts <= 0 || split_contracts >= position.contracts {
+            panic_with_error!(&env, Error::InvalidSplitAmount);
+        }
+
+        let share = |amount: i128| -> i128 {
+            amount
+                .checked_mul(split_contracts)
+                .unwrap()
+                .checked_div(position.contracts)
+                .unwrap()
+        };
+        let premium_part = share(position.premium_paid);
+        let fee_part = share(position.fee_paid);
+        let collateral_part = share(position.collateral_locked);
+
+        let new_id = next_position_id(&env);
+        let new_position = OptionPosition {
+            position_id: new_id,
+            series_id: position.series_id,
+            owner: owner.clone(),
+            side: position.side.clone(),
+            contracts: split_contracts,
+            premium_paid: premium_part,
+            fee_paid: fee_part,
+            collateral_locked: collateral_part,
+            is_exercised: false,
+            is_settled: false,
+            opened_at: position.opened_at,
+        };
+
+        position.contracts = position.contracts.checked_sub(split_contracts).unwrap();
+        position.premium_paid = position.premium_paid.checked_sub(premium_part).unwrap();
+        position.fee_paid = position.fee_paid.checked_sub(fee_part).unwrap();
+        position.collateral_locked = position
+            .collateral_locked
+            .checked_sub(collateral_part)
+            .unwrap();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(position_id), &position);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(new_id), &new_position);
+        add_user_position(&env, &owner, new_id);
+
+        events::position_split(&env, owner, position_id, new_id, split_contracts);
+        new_id
+    }
+
     // ── Exercise ──────────────────────────────────────────────────────────────
 
     /// Exercise a long position before or at expiry (European = only at expiry)
@@ -1028,6 +1147,37 @@ impl OptionsMarket {
         total_payout
     }
 
+    /// Permissionless keeper settlement and auto-exercise for in-the-money longs.
+    /// Can be called by keepers, bots, or any third party after settlement.
+    /// Payout is unconditionally transferred directly to the position owner.
+    pub fn settle_long(env: Env, position_id: u64) -> i128 {
+        require_not_paused(&env);
+        let collateral_token: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::CollateralToken)
+            .unwrap();
+        let usdc = token::Client::new(&env, &collateral_token);
+
+        let position: OptionPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+
+        let payout = Self::exercise_one(&env, &position.owner, position_id, &usdc);
+
+        let series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(position.series_id))
+            .unwrap();
+        let settlement_price = series.settlement_price.unwrap_or(0);
+        events::option_auto_exercised(&env, position.owner, position_id, settlement_price, payout);
+
+        payout
+    }
+
     /// Shared core of exercise()/exercise_batch(): validates one position,
     /// pays out its intrinsic value, marks it exercised, and returns the
     /// payout. Assumes `owner`'s authorization was already checked by the
@@ -1058,11 +1208,11 @@ impl OptionsMarket {
 
         let now = env.ledger().timestamp();
 
-        // European: exercise only after expiry and within settlement window
+        // European: exercise only after expiry; soft window until forfeiture deadline
         if now < series.expiry {
             panic_with_error!(env, Error::SeriesNotExpired);
         }
-        if now > series.expiry + SETTLEMENT_WINDOW {
+        if now > series.expiry + FORFEITURE_WINDOW {
             panic_with_error!(env, Error::ExerciseWindowClosed);
         }
 
@@ -1089,6 +1239,8 @@ impl OptionsMarket {
         env.storage()
             .persistent()
             .set(&DataKey::Position(position_id), &position);
+
+        deduct_orphaned_liability(env, payout);
 
         events::option_exercised(env, owner.clone(), position_id, settlement_price, payout);
         payout
@@ -1243,6 +1395,10 @@ impl OptionsMarket {
             usdc.transfer(&env.current_contract_address(), writer, &reclaim);
         }
 
+        if max_loss > 0 {
+            add_orphaned_liability(env, max_loss);
+        }
+
         position.is_settled = true;
         env.storage()
             .persistent()
@@ -1281,6 +1437,23 @@ impl OptionsMarket {
             .persistent()
             .get(&DataKey::SeriesCountForUnderlying(underlying))
             .unwrap_or(0)
+    }
+
+    /// Series id listed for this exact (underlying, option_type, strike,
+    /// expiry) spec, or `None` if no such series exists.
+    pub fn get_series_id(
+        env: Env,
+        underlying: Symbol,
+        option_type: OptionType,
+        strike_price: i128,
+        expiry: u64,
+    ) -> Option<u64> {
+        env.storage().persistent().get(&DataKey::SeriesIndex(
+            underlying,
+            option_type,
+            strike_price,
+            expiry,
+        ))
     }
 
     pub fn get_series(env: Env, series_id: u64) -> Option<OptionSeries> {
@@ -1323,5 +1496,94 @@ impl OptionsMarket {
             .get(&DataKey::SeriesCounter)
             .unwrap_or(0);
         (premiums, oi, series_count)
+    }
+
+    /// Sweeps unexercised ITM long payout after the 90-day forfeiture window
+    /// to the protocol treasury/fee recipient with a payout_forfeited event.
+    pub fn sweep_forfeited(env: Env, position_id: u64) -> i128 {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let mut position: OptionPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+
+        if position.side != PositionSide::Long {
+            panic_with_error!(&env, Error::WrongSide);
+        }
+        if position.is_exercised {
+            panic_with_error!(&env, Error::AlreadyExercised);
+        }
+
+        let series: OptionSeries = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Series(position.series_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::SeriesNotFound));
+
+        if series.state != SeriesState::Settled {
+            panic_with_error!(&env, Error::SeriesNotExpired);
+        }
+
+        let now = env.ledger().timestamp();
+        if now <= series.expiry + FORFEITURE_WINDOW {
+            panic_with_error!(&env, Error::NotEligibleForForfeiture);
+        }
+
+        let settlement_price = series
+            .settlement_price
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PriceNotSet));
+
+        let payout = calc_payout(
+            &series.option_type,
+            series.strike_price,
+            settlement_price,
+            position.contracts,
+        );
+
+        if payout > 0 {
+            let collateral_token: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::CollateralToken)
+                .unwrap();
+            let fee_recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .unwrap_or_else(|| admin.clone());
+            let usdc = token::Client::new(&env, &collateral_token);
+
+            usdc.transfer(&env.current_contract_address(), &fee_recipient, &payout);
+        }
+
+        position.is_exercised = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Position(position_id), &position);
+
+        deduct_orphaned_liability(&env, payout);
+        events::payout_forfeited(&env, position.owner.clone(), position_id, payout);
+
+        payout
+    }
+
+    /// Running total of unexercised ITM obligations across settled positions
+    pub fn get_orphaned_liabilities(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OrphanedLiabilities)
+            .unwrap_or(0)
+    }
+
+    /// Admin entrypoint to initialize/synchronize historical orphaned liabilities
+    pub fn sync_orphaned_liabilities(env: Env, amount: i128) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::OrphanedLiabilities, &amount);
     }
 }

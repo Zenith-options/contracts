@@ -290,7 +290,7 @@ fn write_covered_call_locks_collateral_equal_to_notional() {
 
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &required);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &required, &0);
     let position = h.client.get_position(&pos_id).unwrap();
 
     assert!(position.side == PositionSide::Short);
@@ -313,7 +313,7 @@ fn write_cash_secured_put_requires_110_percent_of_strike() {
 
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &required);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &required, &0);
     let position = h.client.get_position(&pos_id).unwrap();
     assert_eq!(position.collateral_locked, required);
 }
@@ -327,7 +327,7 @@ fn write_option_rejects_undercollateralized_offer() {
     mint(&h, &writer, 700_000_000);
     // Offers exactly 100% of strike for a put, which needs 110%.
     h.client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 }
 
 #[test]
@@ -341,7 +341,7 @@ fn write_option_rejects_a_write_with_no_buyer_premium_to_draw_from() {
     // empty — write_option must not pay the writer out of its own
     // just-deposited collateral, which isn't a premium anyone paid.
     h.client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 }
 
 #[test]
@@ -356,10 +356,282 @@ fn write_option_succeeds_once_the_pool_partially_covers_it() {
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
     h.client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     // The writer's premium exactly drained the pool the lone buyer funded.
     assert_eq!(h.client.get_premium_pool(), 0);
+}
+
+// ─── write_option min_premium slippage protection (#46) ─────────────────────
+
+// Net premium a 1-contract write on a 40 USDC-premium series pays out at the
+// default 0.5% protocol fee.
+const NET_WRITER_PREMIUM: i128 = 39_800_000;
+
+#[test]
+fn write_option_rejects_a_premium_cut_ordered_ahead_of_the_write() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+
+    // Same ledger: the admin's update_premium lands before the pending write
+    // that was signed against the old 40 USDC quote.
+    h.client
+        .update_premium(&series_id, &20_000_000, &500_000_000);
+
+    let res = h.client.try_write_option(
+        &writer,
+        &series_id,
+        &USDC_DECIMALS,
+        &700_000_000,
+        &NET_WRITER_PREMIUM,
+    );
+    assert_eq!(res, Err(Ok(Error::PremiumBelowMinimum.into())));
+    // No collateral was locked and no premium was drawn from the pool.
+    assert_eq!(balance(&h, &writer), 700_000_000);
+    assert_eq!(h.client.get_premium_pool(), NET_WRITER_PREMIUM);
+}
+
+#[test]
+fn write_option_rejects_a_fee_increase_ordered_ahead_of_the_write() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+
+    // Premium unchanged, but a 1% fee cuts the writer's net to 39.6 USDC.
+    h.client.set_fee_rate(&100);
+
+    let res = h.client.try_write_option(
+        &writer,
+        &series_id,
+        &USDC_DECIMALS,
+        &700_000_000,
+        &NET_WRITER_PREMIUM,
+    );
+    assert_eq!(res, Err(Ok(Error::PremiumBelowMinimum.into())));
+}
+
+#[test]
+fn write_option_min_premium_boundary_is_inclusive() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+
+    // One stroop above the net premium is rejected...
+    let res = h.client.try_write_option(
+        &writer,
+        &series_id,
+        &USDC_DECIMALS,
+        &700_000_000,
+        &(NET_WRITER_PREMIUM + 1),
+    );
+    assert_eq!(res, Err(Ok(Error::PremiumBelowMinimum.into())));
+
+    // ...while exactly the net premium is accepted and paid in full.
+    let pos_id = h.client.write_option(
+        &writer,
+        &series_id,
+        &USDC_DECIMALS,
+        &700_000_000,
+        &NET_WRITER_PREMIUM,
+    );
+    let position = h.client.get_position(&pos_id).unwrap();
+    assert_eq!(position.premium_paid, NET_WRITER_PREMIUM);
+    assert_eq!(balance(&h, &writer), NET_WRITER_PREMIUM);
+
+// ─── split_position (#52) ───────────────────────────────────────────────────
+
+fn buy(h: &Harness, series_id: u64, contracts: i128) -> (Address, u64) {
+    let buyer = Address::generate(&h.env);
+    mint(h, &buyer, 10_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &contracts, &(10_000 * USDC_DECIMALS));
+    (buyer, pos_id)
+}
+
+#[test]
+fn split_long_divides_every_field_and_preserves_totals() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 3 * USDC_DECIMALS);
+    let before = h.client.get_position(&pos_id).unwrap();
+    let escrow_before = h.client.get_series_escrow(&series_id);
+    let (_, oi_before, _) = h.client.get_stats();
+
+    let new_id = h.client.split_position(&buyer, &pos_id, &USDC_DECIMALS);
+    let orig = h.client.get_position(&pos_id).unwrap();
+    let new = h.client.get_position(&new_id).unwrap();
+
+    // 1 of 3 contracts: exactly a third of premium and fee.
+    assert_eq!(new.contracts, USDC_DECIMALS);
+    assert_eq!(new.premium_paid, 40_000_000);
+    assert_eq!(new.fee_paid, 200_000);
+    assert_eq!(orig.contracts, 2 * USDC_DECIMALS);
+    assert_eq!(orig.premium_paid, 80_000_000);
+    assert_eq!(orig.fee_paid, 400_000);
+
+    assert_eq!(new.series_id, before.series_id);
+    assert!(new.side == PositionSide::Long);
+    assert_eq!(new.owner, buyer);
+    assert_eq!(new.opened_at, before.opened_at);
+    assert!(h.client.get_user_positions(&buyer).contains(new_id));
+
+    // Nothing series-level moved.
+    assert_eq!(h.client.get_series_escrow(&series_id), escrow_before);
+    let (_, oi_after, _) = h.client.get_stats();
+    assert_eq!(oi_after, oi_before);
+    assert_eq!(
+        h.client.get_series(&series_id).unwrap().open_interest,
+        3 * USDC_DECIMALS
+    );
+}
+
+#[test]
+fn uneven_split_rounds_down_and_leaves_the_remainder_in_the_original() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Put, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, 3 * USDC_DECIMALS);
+    let writer = Address::generate(&h.env);
+    let required = 3 * 700_000_000 * 11 / 10;
+    mint(&h, &writer, required);
+    let pos_id = h
+        .client
+        .write_option(&writer, &series_id, &(3 * USDC_DECIMALS), &required);
+    let before = h.client.get_position(&pos_id).unwrap();
+
+    let split = 7; // 7 base units of a 30_000_000-unit position
+    let new_id = h.client.split_position(&writer, &pos_id, &split);
+    let orig = h.client.get_position(&pos_id).unwrap();
+    let new = h.client.get_position(&new_id).unwrap();
+
+    let floor = |x: i128| x * split / before.contracts;
+    assert_eq!(new.collateral_locked, floor(before.collateral_locked));
+    assert_eq!(new.premium_paid, floor(before.premium_paid));
+    assert_eq!(
+        orig.collateral_locked + new.collateral_locked,
+        before.collateral_locked
+    );
+    assert_eq!(orig.premium_paid + new.premium_paid, before.premium_paid);
+    assert_eq!(orig.fee_paid + new.fee_paid, before.fee_paid);
+    assert_eq!(orig.contracts + new.contracts, before.contracts);
+}
+
+#[test]
+fn split_halves_refund_the_same_total_on_cancellation() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    let new_id = h.client.split_position(&buyer, &pos_id, &USDC_DECIMALS);
+
+    h.client.cancel_series(&series_id);
+    let before = balance(&h, &buyer);
+    h.client.claim_refund(&buyer, &pos_id);
+    h.client.claim_refund(&buyer, &new_id);
+
+    // Unsplit refund: 80 USDC premium net of the 0.5% fee.
+    assert_eq!(balance(&h, &buyer) - before, 80_000_000 - 400_000);
+    assert_eq!(h.client.get_series_escrow(&series_id), 0);
+}
+
+#[test]
+fn split_halves_exercise_for_the_full_intrinsic_value() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    let new_id = h.client.split_position(&buyer, &pos_id, &USDC_DECIMALS);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &pos_id);
+    h.client.exercise(&buyer, &new_id);
+    // (750 - 700) * 2 contracts.
+    assert_eq!(balance(&h, &buyer) - before, 100_000_000);
+}
+
+#[test]
+fn split_rejects_amounts_outside_the_open_range() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    for bad in [0, -1, 2 * USDC_DECIMALS, 3 * USDC_DECIMALS] {
+        assert_eq!(
+            h.client.try_split_position(&buyer, &pos_id, &bad),
+            Err(Ok(Error::InvalidSplitAmount.into())),
+            "split of {bad} should be rejected"
+        );
+    }
+    assert_eq!(
+        h.client.get_position(&pos_id).unwrap().contracts,
+        2 * USDC_DECIMALS
+    );
+}
+
+#[test]
+fn split_rejects_a_non_owner() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (_buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    let stranger = Address::generate(&h.env);
+    assert_eq!(
+        h.client
+            .try_split_position(&stranger, &pos_id, &USDC_DECIMALS),
+        Err(Ok(Error::Unauthorized.into()))
+    );
+}
+
+#[test]
+fn split_rejects_closed_positions() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, exercised) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    let (buyer2, still_open) = buy(&h, series_id, 2 * USDC_DECIMALS);
+
+    // Settled via refund on a cancelled series.
+    let other_series = make_series(&h, OptionType::Put, 700_000_000, 40_000_000);
+    let (buyer3, cancelled_pos) = buy(&h, other_series, 2 * USDC_DECIMALS);
+    h.client.cancel_series(&other_series);
+    h.client.claim_refund(&buyer3, &cancelled_pos);
+    assert_eq!(
+        h.client
+            .try_split_position(&buyer3, &cancelled_pos, &USDC_DECIMALS),
+        Err(Ok(Error::AlreadySettled.into()))
+    );
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+    h.client.exercise(&buyer, &exercised);
+    assert_eq!(
+        h.client
+            .try_split_position(&buyer, &exercised, &USDC_DECIMALS),
+        Err(Ok(Error::AlreadyExercised.into()))
+    );
+    // An unexercised position in the same expired series can still split.
+    h.client
+        .split_position(&buyer2, &still_open, &USDC_DECIMALS);
+}
+
+#[test]
+fn split_is_blocked_while_paused() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let (buyer, pos_id) = buy(&h, series_id, 2 * USDC_DECIMALS);
+    h.client.pause();
+    assert_eq!(
+        h.client.try_split_position(&buyer, &pos_id, &USDC_DECIMALS),
+        Err(Ok(Error::ContractPaused.into()))
+    );
+}
 }
 
 // ─── settlement + exercise ──────────────────────────────────────────────────
@@ -459,7 +731,7 @@ fn exercise_rejects_a_short_position() {
     mint(&h, &writer, 700_000_000);
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(750_000_000));
@@ -605,7 +877,7 @@ fn reclaim_collateral_returns_locked_minus_max_loss() {
     mint(&h, &writer, 700_000_000);
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(750_000_000)); // ITM by 50
@@ -634,7 +906,7 @@ fn reclaim_collateral_returns_everything_when_otm() {
     mint(&h, &writer, 700_000_000);
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM
@@ -678,7 +950,7 @@ fn reclaim_collateral_twice_is_rejected() {
     mint(&h, &writer, 700_000_000);
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(650_000_000));
@@ -698,10 +970,10 @@ fn reclaim_batch_pays_out_every_position_in_the_list() {
     mint(&h, &writer, 1_400_000_000);
     let pos_a = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
     let pos_b = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(750_000_000)); // ITM by 50 each
@@ -736,7 +1008,7 @@ fn reclaim_batch_is_all_or_nothing() {
     mint(&h, &writer, 700_000_000);
     let valid_pos = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
     let never_created_pos_id = 9_999u64;
 
     advance_past_expiry(&h, series_id);
@@ -822,7 +1094,7 @@ fn full_lifecycle_covered_call_itm() {
     mint(&h, &writer, 700_000_000);
     let writer_pos = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     let series: OptionSeries = h.client.get_series(&series_id).unwrap();
     assert_eq!(series.open_interest, 2 * USDC_DECIMALS); // one long + one short
@@ -906,7 +1178,7 @@ fn write_option_is_rejected_while_paused() {
     let writer = Address::generate(&h.env);
     mint(&h, &writer, 700_000_000);
     h.client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 }
 
 /// A pause must not trap funds already at risk: an existing writer can still
@@ -920,7 +1192,7 @@ fn pause_does_not_block_settlement_of_existing_positions() {
     mint(&h, &writer, 700_000_000);
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     h.client.pause();
 
@@ -963,7 +1235,7 @@ fn cancelled_series_refunds_writer_full_collateral() {
     mint(&h, &writer, 700_000_000);
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     h.client.cancel_series(&series_id);
 
@@ -1080,7 +1352,7 @@ fn escrow_then_claim_refund_from_vault_pays_writer_full_collateral() {
     mint(&h, &writer, 700_000_000);
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     h.client.cancel_series(&series_id);
     h.client.escrow_series_to_vault(&vault_id, &series_id);
@@ -1289,8 +1561,9 @@ fn upgrade_reaches_the_host_deployer_past_the_admin_check() {
 #[test]
 fn create_series_tracks_the_count_per_underlying() {
     let h = setup();
-    for _ in 0..50 {
-        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Distinct strikes: each listing must be a unique spec (DuplicateSeries).
+    for i in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000 + i, 40_000_000);
     }
     assert_eq!(
         h.client
@@ -1303,17 +1576,19 @@ fn create_series_tracks_the_count_per_underlying() {
 #[should_panic(expected = "Error(Contract, #20)")] // TooManySeriesForUnderlying
 fn create_series_rejects_the_51st_series_for_the_same_underlying() {
     let h = setup();
-    for _ in 0..50 {
-        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Distinct strikes: each listing must be a unique spec (DuplicateSeries).
+    for i in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000 + i, 40_000_000);
     }
-    make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    make_series(&h, OptionType::Call, 700_000_050, 40_000_000);
 }
 
 #[test]
 fn series_cap_is_tracked_independently_per_underlying() {
     let h = setup();
-    for _ in 0..50 {
-        make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    // Distinct strikes: each listing must be a unique spec (DuplicateSeries).
+    for i in 0..50 {
+        make_series(&h, OptionType::Call, 700_000_000 + i, 40_000_000);
     }
 
     // XLM is now at the cap, but a different underlying should be unaffected.
@@ -1398,6 +1673,23 @@ fn update_premium_rejects_a_zero_or_negative_premium() {
     for premium in [0, -1] {
         assert_eq!(
             h.client
+             
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &55_000_000,
+        &500_000_000i128,
+    );
+}
+
+#[test]
+fn update_premium_rejects_a_zero_or_negative_premium() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    for premium in [0, -1] {
+        assert_eq!(
+            h.client
                 .try_update_premium(&series_id, &premium, &450_000_000),
             Err(Ok(Error::InvalidSeriesParams.into())),
             "premium {premium} should be rejected"
@@ -1417,6 +1709,135 @@ fn update_premium_via_multisig_rejects_a_zero_premium() {
     let multisig_id = approved_multisig(&h, 9);
     h.client
         .update_premium_via_multisig(&multisig_id, &9u64, &series_id, &0, &450_000_000);
+}
+
+#[test]
+fn create_series_accepts_specs_differing_in_any_one_field() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let base = list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    let ids = [
+        base,
+        list(&h, "BTC", OptionType::Call, 700_000_000, expiry),
+        list(&h, "XLM", OptionType::Put, 700_000_000, expiry),
+        list(&h, "XLM", OptionType::Call, 700_000_001, expiry),
+        list(&h, "XLM", OptionType::Call, 700_000_000, expiry + 1),
+    ];
+    for (i, a) in ids.iter().enumerate() {
+        for b in ids.iter().skip(i + 1) {
+            assert_ne!(a, b);
+        }
+    }
+}
+
+#[test]
+fn get_series_id_resolves_the_spec_index() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let xlm = Symbol::new(&h.env, "XLM");
+    assert_eq!(
+        h.client
+            .get_series_id(&xlm, &OptionType::Call, &700_000_000, &expiry),
+        None
+    );
+    let id = list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    assert_eq!(
+        h.client
+            .get_series_id(&xlm, &OptionType::Call, &700_000_000, &expiry),
+        Some(id)
+    );
+    assert_eq!(
+        h.client
+            .get_series_id(&xlm, &OptionType::Put, &700_000_000, &expiry),
+        None
+    );
+}
+
+#[test]
+fn a_rejected_duplicate_leaves_no_state_behind() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let xlm = Symbol::new(&h.env, "XLM");
+    let id = list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+
+    let res = h.client.try_create_series(
+        &xlm,
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000i128,
+    );
+    assert_eq!(res, Err(Ok(Error::DuplicateSeries.into())));
+    // The per-underlying count and the series counter didn't move.
+    assert_eq!(h.client.get_series_count_for_underlying(&xlm), 1);
+    assert_eq!(
+        list(&h, "XLM", OptionType::Call, 700_000_001, expiry),
+        id + 1
+    );
+}
+
+#[test]
+fn a_cancelled_series_still_reserves_its_spec() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    let id = list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    h.client.cancel_series(&id);
+
+    let res = h.client.try_create_series(
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000i128,
+    );
+    assert_eq!(res, Err(Ok(Error::DuplicateSeries.into())));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")] // DuplicateSeries
+fn create_series_via_multisig_rejects_a_spec_listed_by_the_admin() {
+    let h = setup();
+    let (multisig_id, signers) = setup_multisig(&h);
+    let multisig_client = MultisigClient::new(&h.env, &multisig_id);
+    let action_id = 9u64;
+    multisig_client.approve(&signers[0], &action_id);
+    multisig_client.approve(&signers[1], &action_id);
+
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    h.client.create_series_via_multisig(
+        &multisig_id,
+        &action_id,
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &40_000_000,
+        &450_000_000,
+    );
+}
+
+#[test]
+fn create_series_rejects_a_duplicate_spec_with_a_different_premium() {
+    let h = setup();
+    let expiry = h.env.ledger().timestamp() + 30 * 86_400;
+    list(&h, "XLM", OptionType::Call, 700_000_000, expiry);
+    // Same underlying/type/strike/expiry; a different premium doesn't make it
+    // a different contract.
+    h.client.create_series(
+        &Symbol::new(&h.env, "XLM"),
+        &OptionType::Call,
+        &700_000_000,
+        &expiry,
+        &55_000_000,
+        &500_000_000i128,
+    );
+}
+
+#[test]
+
 }
 
 // ─── cross-contract: set_settlement_price_from_oracle ──────────────────────
@@ -1914,7 +2335,7 @@ fn option_written_event_carries_position_and_collateral_data() {
 
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     let events = h.env.events().all();
     let (_, topics, data) = events.last().unwrap();
@@ -2008,7 +2429,7 @@ fn collateral_reclaimed_event_carries_position_and_amount() {
     mint(&h, &writer, 700_000_000);
     let pos_id = h
         .client
-        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000, &0);
 
     advance_past_expiry(&h, series_id);
     h.client.set_settlement_price(&series_id, &(650_000_000)); // OTM for the call
@@ -2020,3 +2441,111 @@ fn collateral_reclaimed_event_carries_position_and_amount() {
     assert_eq!(event_pos_id, pos_id);
     assert_eq!(reclaim, 700_000_000); // full collateral back, OTM means no payout owed
 }
+
+#[test]
+fn offline_long_can_still_exercise_after_settlement_window() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let series = h.client.get_series(&series_id).unwrap();
+    // Advance past expiry and past the 24h settlement window (e.g. + 2 days)
+    h.env.ledger().set_timestamp(series.expiry + 2 * 86_400);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &pos_id);
+    let after = balance(&h, &buyer);
+    assert_eq!(after - before, 50_000_000); // 50 USDC intrinsic payout
+}
+
+#[test]
+fn keeper_can_settle_long_permissionlessly() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    let payout = h.client.settle_long(&pos_id);
+    let after = balance(&h, &buyer);
+
+    assert_eq!(payout, 50_000_000);
+    assert_eq!(after - before, 50_000_000);
+
+    let pos = h.client.get_position(&pos_id).unwrap();
+    assert!(pos.is_exercised);
+}
+
+#[test]
+fn unclaimed_long_sweeps_to_treasury_after_forfeiture_deadline() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let series = h.client.get_series(&series_id).unwrap();
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    // Advance 91 days past expiry (past 90d FORFEITURE_WINDOW)
+    h.env
+        .ledger()
+        .set_timestamp(series.expiry + 91 * 86_400);
+
+    let treasury_before = balance(&h, &h.fee_recipient);
+    let swept = h.client.sweep_forfeited(&pos_id);
+    let treasury_after = balance(&h, &h.fee_recipient);
+
+    assert_eq!(swept, 50_000_000);
+    assert_eq!(treasury_after - treasury_before, 50_000_000);
+
+    let pos = h.client.get_position(&pos_id).unwrap();
+    assert!(pos.is_exercised);
+}
+
+#[test]
+fn get_orphaned_liabilities_tracks_unexercised_funds() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let short_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+
+    assert_eq!(h.client.get_orphaned_liabilities(), 0);
+
+    // Writer reclaims: max_loss = 50_000_000, reclaim = 650_000_000
+    h.client.reclaim_collateral(&writer, &short_id);
+    assert_eq!(h.client.get_orphaned_liabilities(), 50_000_000);
+
+    // Admin can also sync/adjust if needed
+    h.client.sync_orphaned_liabilities(&0);
+    assert_eq!(h.client.get_orphaned_liabilities(), 0);
+}
+
