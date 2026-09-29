@@ -1,10 +1,12 @@
 #![cfg(test)]
 
+extern crate std;
+
 use crate::{PriceOracle, PriceOracleClient};
 use multisig::{Multisig, MultisigClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
-    Address, Env, Symbol, TryFromVal,
+    Address, BytesN, Env, Symbol, TryFromVal,
 };
 
 struct Harness<'a> {
@@ -526,7 +528,7 @@ fn pause_via_multisig_pauses_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 1u64;
+    let action_id = aid(&h.env, 1);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -542,9 +544,9 @@ fn pause_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    multisig_client.approve(&signers[0], &1u64); // only 1 of 3
+    multisig_client.approve(&signers[0], &aid(&h.env, 1)); // only 1 of 3
 
-    h.client.pause_via_multisig(&multisig_id, &1u64);
+    h.client.pause_via_multisig(&multisig_id, &aid(&h.env, 1));
 }
 
 #[test]
@@ -556,7 +558,7 @@ fn unpause_via_multisig_unpauses_once_approved() {
     h.client.pause();
     assert!(h.client.is_paused());
 
-    let action_id = 3u64;
+    let action_id = aid(&h.env, 3);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -571,7 +573,8 @@ fn unpause_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client.pause();
-    h.client.unpause_via_multisig(&multisig_id, &99u64);
+    h.client
+        .unpause_via_multisig(&multisig_id, &aid(&h.env, 99));
 }
 
 #[test]
@@ -580,7 +583,7 @@ fn transfer_admin_via_multisig_hands_off_control_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 2u64;
+    let action_id = aid(&h.env, 2);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -598,7 +601,7 @@ fn transfer_admin_via_multisig_rejects_when_not_yet_approved() {
     let new_admin = Address::generate(&h.env);
 
     h.client
-        .transfer_admin_via_multisig(&multisig_id, &99u64, &new_admin);
+        .transfer_admin_via_multisig(&multisig_id, &aid(&h.env, 99), &new_admin);
 }
 
 #[test]
@@ -607,7 +610,7 @@ fn set_max_staleness_via_multisig_applies_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 4u64;
+    let action_id = aid(&h.env, 4);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -623,7 +626,7 @@ fn set_max_staleness_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .set_max_staleness_via_multisig(&multisig_id, &99u64, &7200);
+        .set_max_staleness_via_multisig(&multisig_id, &aid(&h.env, 99), &7200);
 }
 
 #[test]
@@ -633,7 +636,7 @@ fn set_max_staleness_via_multisig_still_rejects_zero_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 5u64;
+    let action_id = aid(&h.env, 5);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -647,7 +650,7 @@ fn set_min_reports_via_multisig_applies_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 6u64;
+    let action_id = aid(&h.env, 6);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -663,7 +666,7 @@ fn set_min_reports_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .set_min_reports_via_multisig(&multisig_id, &99u64, &3);
+        .set_min_reports_via_multisig(&multisig_id, &aid(&h.env, 99), &3);
 }
 
 #[test]
@@ -673,7 +676,7 @@ fn set_min_reports_via_multisig_still_rejects_zero_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 7u64;
+    let action_id = aid(&h.env, 7);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -689,7 +692,7 @@ fn add_feeder_via_multisig_authorizes_once_approved() {
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
 
-    let action_id = 6u64;
+    let action_id = aid(&h.env, 6);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -707,7 +710,7 @@ fn add_feeder_via_multisig_rejects_when_not_yet_approved() {
     let feeder = Address::generate(&h.env);
 
     h.client
-        .add_feeder_via_multisig(&multisig_id, &99u64, &feeder);
+        .add_feeder_via_multisig(&multisig_id, &aid(&h.env, 99), &feeder);
 }
 
 #[test]
@@ -719,7 +722,7 @@ fn add_feeder_via_multisig_still_rejects_a_duplicate_once_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 7u64;
+    let action_id = aid(&h.env, 7);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -735,7 +738,7 @@ fn remove_feeder_via_multisig_revokes_once_approved() {
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
-    let action_id = 8u64;
+    let action_id = aid(&h.env, 8);
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
@@ -753,5 +756,145 @@ fn remove_feeder_via_multisig_rejects_when_not_yet_approved() {
     let (multisig_id, _signers) = setup_multisig(&h);
 
     h.client
-        .remove_feeder_via_multisig(&multisig_id, &99u64, &feeder);
+        .remove_feeder_via_multisig(&multisig_id, &aid(&h.env, 99), &feeder);
+}
+
+fn aid(env: &Env, n: u8) -> BytesN<32> {
+    BytesN::from_array(env, &[n; 32])
+}
+
+// ─── TTL policy (issue #98) and archival restore (issue #99) ────────────────
+
+fn advance_ledgers(env: &Env, ledgers: u32) {
+    use soroban_sdk::testutils::Ledger as _;
+    env.ledger().with_mut(|l| l.sequence_number += ledgers);
+}
+
+/// Whether `key` (a persistent entry, or the instance when `None`) of
+/// `contract` is still live. Accessing an archived entry through a
+/// client aborts the test rather than returning an error, so archival is
+/// checked straight against the ledger storage instead.
+fn is_live(env: &Env, contract: &Address, key: Option<crate::types::DataKey>) -> bool {
+    use soroban_sdk::xdr::{LedgerKey, ScAddress, ScVal};
+    use soroban_sdk::IntoVal;
+    let key = match key {
+        Some(key) => {
+            let val: soroban_sdk::Val = key.into_val(env);
+            ScVal::try_from_val(env, &val).unwrap()
+        }
+        None => ScVal::LedgerKeyContractInstance,
+    };
+    let contract = ScAddress::from(contract);
+    let seq = env.ledger().sequence();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (ledger_key, entry) in storage.map.clone() {
+                if let LedgerKey::ContractData(data) = ledger_key.as_ref() {
+                    if data.contract == contract && data.key == key {
+                        return Ok(
+                            matches!(entry, Some((_, Some(live_until))) if live_until >= seq),
+                        );
+                    }
+                }
+            }
+            Ok(false)
+        })
+        .unwrap()
+}
+
+/// Simulates a `RestoreFootprint` operation over every archived
+/// persistent entry: like the real operation, it brings the entry back
+/// with its stored value untouched and a fresh
+/// `min_persistent_entry_ttl` lifetime.
+fn restore_archived(env: &Env) {
+    use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::xdr::{ContractDataDurability, LedgerKey};
+    let seq = env.ledger().sequence();
+    let live_until = seq + env.ledger().get().min_persistent_entry_ttl - 1;
+    let budget = env.host().budget_cloned();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (key, entry) in storage.map.clone() {
+                let Some((entry, Some(old_live_until))) = entry else {
+                    continue;
+                };
+                if old_live_until >= seq {
+                    continue;
+                }
+                if let LedgerKey::ContractData(data) = key.as_ref() {
+                    if data.durability == ContractDataDurability::Temporary {
+                        continue;
+                    }
+                }
+                storage.put(&key, &entry, Some(live_until), &budget)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn ttl_policy_keeps_read_prices_live() {
+    use crate::{ttl, types::DataKey};
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    let xlm = Symbol::new(&h.env, "XLM");
+    h.client.add_feeder(&feeder);
+    h.client.report_price(&feeder, &xlm, &1_000_000);
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client.get_latest_report(&xlm, &feeder);
+    }
+    assert!(is_live(
+        &h.env,
+        &h.client.address,
+        Some(DataKey::PriceReport(xlm.clone(), feeder.clone()))
+    ));
+    assert_eq!(
+        h.client.get_latest_report(&xlm, &feeder).unwrap().0,
+        1_000_000
+    );
+}
+
+#[test]
+fn archived_price_report_restores_identically() {
+    use crate::{ttl, types::DataKey};
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    let xlm = Symbol::new(&h.env, "XLM");
+    h.client.add_feeder(&feeder);
+    h.client.report_price(&feeder, &xlm, &1_000_000);
+    let before = h.client.get_price(&xlm);
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client.is_paused();
+    }
+    assert!(!is_live(
+        &h.env,
+        &h.client.address,
+        Some(DataKey::PriceReport(xlm.clone(), feeder.clone()))
+    ));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.get_price(&xlm), before);
+    assert_eq!(
+        h.client.get_latest_report(&xlm, &feeder).unwrap().0,
+        1_000_000
+    );
+}
+
+#[test]
+fn archived_instance_restores_feeders_and_admin() {
+    use crate::ttl;
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    advance_ledgers(&h.env, ttl::INSTANCE_BUMP_AMOUNT + 1);
+    assert!(!is_live(&h.env, &h.client.address, None));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.get_admin(), h.admin);
+    assert!(h.client.is_feeder(&feeder));
 }

@@ -15,4 +15,11 @@ pub enum Error {
     UnsortedSignatures = 9,
     InsufficientSignatures = 10,
     ContextNotAllowed = 11,
+    ActionAlreadyRegistered = 12,
+    ActionNotPending = 13,
+    TooManyPendingActions = 14,
+    ProposalNotFound = 15,
+    ProposalTooLarge = 16,
+    InvalidPageLimit = 17,
+    NotExpired = 18,
 }

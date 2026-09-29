@@ -20,17 +20,21 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   price_oracle deployment to settle a series permissionlessly, as an
   alternative to the original `set_settlement_price`'s trusted-oracle-
   address flow.
-- [`vault/`](vault) — a per-tag escrow ledger for a single token,
+- [`vault/`](vault) — a per-(token, tag) escrow ledger for any number of
+  allowlisted tokens and integrator contracts,
   motivated by a gap discovered while testing options_market: that
   contract holds every writer's collateral and every buyer's premium in
   one undifferentiated balance, with no accounting of which balance is
   actually earmarked for which position. `deposit`/`withdraw` here are
-  scoped to a caller-defined `tag` (e.g. a position_id), so a withdrawal
+  scoped to a namespaced `tag` (e.g. `(options_market, "series", id)`), so a withdrawal
   can never draw down more than was specifically deposited under that
   tag — regardless of what the vault's raw token balance happens to be
   from other tags' deposits. `options_market::escrow_series_to_vault` /
   `claim_refund_from_vault` now wire this in for the specific gap it was
   built for — see "Known gaps" below for the scope of that integration.
+- [`timelock/`](timelock) — a delayed-execution admin (proposer /
+  executor / canceller roles, predecessor dependencies) meant to hold the
+  admin role on the other contracts so users always get an exit window.
 - [`multisig/`](multisig) — M-of-N approval tracking for opaque,
   caller-defined actions, motivated by every other contract here having
   a single `admin: Address` as its sole point of control. A fixed
@@ -55,6 +59,16 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   `x_inner(env, Auth, ...)` called by both its admin-gated entrypoint
   and its `_via_multisig` twin, so no validation is duplicated between
   twins.
+- [`params/`](params) — a timelock-controlled registry of protocol
+  parameters, each with hard `[min, max]` bounds. `options_market`
+  reads its fee rate and settlement window from it (cached locally,
+  refreshed only when the registry version moves). See
+  "`params` reference" below for the parameter catalog.
+- [`grants_escrow/`](grants_escrow) — milestone-based escrow for
+  community grants and bounties: funded upfront, released per milestone
+  on reviewer quorum, reclaimable by the funder after a missed deadline
+  plus grace period. Operations guide:
+  [`docs/grants_escrow.md`](docs/grants_escrow.md).
 
 ## Building and testing
 
@@ -75,6 +89,9 @@ cargo build --target wasm32-unknown-unknown --release   # options_market needs i
 cd ../vault
 cargo build --target wasm32-unknown-unknown --release   # options_market needs it too
 
+cd ../params
+cargo build --target wasm32-unknown-unknown --release   # options_market needs it too (no dependencies of its own)
+
 cd ../options_market   # now this crate can build/test/etc.
 cargo build                                   # native build, fast iteration
 cargo test                                    # unit tests (soroban-sdk testutils)
@@ -83,18 +100,35 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
-`multisig`, `price_oracle`, `vault` and `common` can be built/tested
-independently, in any order.
+`params` and `grants_escrow` have no wasm dependencies of their own.
+`vault` only needs multisig's wasm built first, no other dependency of
+its own (options_market depending on vault's wasm doesn't run the other
+way). `multisig` itself has no dependency on anything else and can be
+built/tested independently, in any order relative to the others.
 
-CI (`.github/workflows/ci.yml`) builds price_oracle's and vault's wasm
-first whenever a job is about to touch options_market, then runs the
-same four checks against every push and PR, for every crate. On PRs a
+CI (`.github/workflows/ci.yml`) builds the required dependency wasm(s)
+first whenever a job is about to touch options_market, price_oracle,
+or vault, then runs the same four checks against every push and PR,
+for every crate. On PRs a
 `spec-diff` job (`tools/spec-diff/check.sh <base-ref>`) builds every
 contract at the base branch and at the PR, fails if any existing
 function, type or error in a contract's spec was removed or changed
 (additions are fine; intentional signature changes must be listed in
 `tools/spec-diff/allow.txt`), and prints each contract's wasm size
 delta.
+
+Every event any of these four contracts publishes has a test that
+decodes its actual payload via `TryFromVal` (topics and data), not
+just a test that confirms an event fired — the intent being that
+anything an off-chain indexer would need to parse out of an event is
+pinned down by a test, so a change to a tuple's field order or type
+shows up as a test failure rather than as a silently broken indexer.
+
+## Deploying
+
+```sh
+soroban contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/
 
 Every event any of these four contracts publishes has a test that
 decodes its actual payload via `TryFromVal` (topics and data), not
@@ -136,6 +170,27 @@ soroban contract invoke --id <contract-id> --source <admin> --network testnet --
   initialize --admin <admin-address>
 ```
 
+## Storage TTL policy
+
+Every contract extends its **instance** storage at the top of every
+entrypoint, and extends a **persistent** entry whenever it reads or
+writes it (`ttl.rs` in each crate). `extend_ttl` only charges rent once
+an entry's remaining TTL drops below the threshold, so the steady-state
+cost of a read is one TTL check. No contract uses temporary storage.
+Ledgers are ~5s, so one day ≈ 17,280 ledgers.
+
+| Class | Keys | Threshold | Extend to | Who pays |
+|---|---|---|---|---|
+| Instance | options_market: `Admin`, `Oracle`, `CollateralToken`, `FeeRecipient`, counters, `TotalPremiumsCollected`, `TotalOpenInterest`, `Paused`, `FeeRateBps`, `SeriesCountForUnderlying`, `PremiumPool`, `ParamsRegistry`, `ParamsVersion`, `SettlementWindow` · price_oracle: `Admin`, `Paused`, `MaxStaleness`, `MinReports`, `Feeders` · vault: `Admin`, `Token`, `Paused`, `TotalEscrowed` · multisig: `Signers`, `Threshold`, `ApprovalTtl` · params: `Timelock`, `Version` · grants_escrow: `GrantCounter` | 23 days | 30 days | Whoever invokes any entrypoint |
+| Persistent | options_market: `Series`, `Position`, `UserPositions`, `UnderlyingPrice`, `SeriesEscrow` · price_oracle: `PriceReport`, `AggregatedPrice` · vault: `Escrow` · multisig: `Approval` · params: `Param`, `PendingBounds` · grants_escrow: `Grant`, `Approval`, `GranteeGrants` | 60 days | 90 days | Whoever reads/writes the entry; keepers via `bump` |
+
+Every contract also exposes a permissionless `bump(keys: Vec<DataKey>)`
+that extends the instance plus each named persistent entry that exists,
+so a keeper can keep long-lived but idle entries (a long-dated series,
+a dormant position, an idle vault tag) from archiving. Entries that do
+archive anyway can be restored — see the
+[archival runbook](docs/runbooks/archival.md) and `scripts/restore/`.
+
 ## `options_market` reference
 
 All amounts are fixed-point at `PRICE_PRECISION` (1e7) unless noted —
@@ -155,11 +210,11 @@ documented per field.
 | `pause()` / `unpause()` | Emergency stop. Blocks `create_series`, `update_premium`, `buy_option`, `write_option`. Does **not** block `exercise`, `set_settlement_price`, or `reclaim_collateral` — a pause winds existing positions down, it doesn't trap funds. |
 | `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `upgrade(new_wasm_hash)` | Swaps the contract's executable via Soroban's deployer, keeping the same address, ID, and storage. |
-| `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
-| `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out. Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. |
-| `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Same validation and per-underlying cap apply. |
-| `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. |
-| `update_premium_via_multisig(multisig_contract, action_id, series_id, new_premium, new_implied_vol)` | Permissionless alternative to `update_premium`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. |
+| `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
+| `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out; `premium` must be > 0 (`InvalidSeriesParams`). Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. Each `(underlying, option_type, strike_price, expiry)` spec can be listed once, ever (a cancelled or settled series still owns it): a second listing fails with `DuplicateSeries`. |
+| `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Same validation and per-underlying cap apply. |
+| `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. `new_premium` must be > 0 (`InvalidSeriesParams`). |
+| `update_premium_via_multisig(multisig_contract, action_id, series_id, new_premium, new_implied_vol)` | Permissionless alternative to `update_premium`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
 | `cancel_series(series_id)` | Cancels an Active series. Position holders then call `claim_refund` individually — the admin doesn't push funds to everyone in one call, since that would scale badly against Soroban's per-call resource limits. |
 | `cancel_series_via_multisig(multisig_contract, action_id, series_id)` | Permissionless alternative to `cancel_series`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Cancelling disrupts every open position in a series, so gating it behind M-of-N is at least as warranted as pause. |
 
@@ -175,11 +230,23 @@ documented per field.
 | Function | Description |
 |---|---|
 | `buy_option(buyer, series_id, contracts, max_premium)` | Opens a Long position. `max_premium` is slippage protection. Premium (net of the protocol fee) funds the pool `write_option` pays writers from. |
-| `write_option(writer, series_id, contracts, collateral_amount)` | Opens a Short position. Collateral: notional value for calls, 110% of strike for puts. Premium is paid out of the pool buyers have funded — `InsufficientPremiumPool` if no buyer has paid in enough yet (a write can't be paid a "premium" out of its own just-deposited collateral). |
-| `exercise(owner, position_id)` | Long-side payout after expiry, within the 24h settlement window, if in the money. |
+| `write_option(writer, series_id, contracts, collateral_amount, min_premium)` | Opens a Short position. Collateral: notional value for calls, 110% of strike for puts. Premium is paid out of the pool buyers have funded — `InsufficientPremiumPool` if no buyer has paid in enough yet (a write can't be paid a "premium" out of its own just-deposited collateral). `min_premium` is slippage protection: `PremiumBelowMinimum` if the net premium the writer would receive (after the protocol fee) is below it, so an `update_premium` cut or fee increase ordered ahead of the write can't underpay the writer. Pass `0` to opt out. |
+| `exercise(owner, position_id)` | Long-side payout after expiry, within the 24h settlement window, if in the money. The 24h settlement window is a soft deadline (longs remain claimable until the 90-day forfeiture window). |
 | `exercise_batch(owner, position_ids)` | Same as `exercise`, for every id in `position_ids` in one call — for an owner with several long positions who'd otherwise need one transaction per position. All-or-nothing (any single id failing `exercise`'s own checks aborts the whole batch) and capped at `MAX_BATCH_SIZE` (25). Returns the summed payout. |
+ 24h settlement window, if in the money. The 24h settlement window is a soft deadline (longs remain claimable until the 90-day forfeiture window). |
+| `exercise_batch(owner, position_ids)` | Same as `exercise`, for every id in `position_ids` in one call — for an owner with several long positions who'd otherwise need one transaction per position. All-or-nothing (any single id failing `exercise`'s own checks aborts the whole batch) and capped at `MAX_BATCH_SIZE` (25). Returns the summed payout. |
+| `buy_batch(buyer, orders)` | `buy_option` for up to `MAX_BATCH_SIZE` (25) `(series_id, contracts, max_premium)` orders — e.g. a strangle or ladder — with ONE premium pull and ONE fee transfer for the whole batch. Same per-order validation as `buy_option` (shared internals), orders applied in the given order (duplicate series allowed), all-or-nothing, one `option_bought` event per order. Returns the new position ids. ~51% less CPU than 5 separate `buy_option` calls in the test harness. |
+| `write_batch(writer, orders)` | `write_option` for up to 25 `(series_id, contracts, collateral_amount)` orders, with ONE collateral pull and ONE premium payout. Orders draw on the premium pool strictly in order; all-or-nothing; one `option_written` event per order. |
+| `settle_long(position_id)` | Permissionless auto-exercise / keeper settlement for in-the-money longs after settlement. Anyone can call; payout is unconditionally transferred to the position owner. |
+| `sweep_forfeited(position_id)` | Admin entrypoint to sweep unexercised ITM long payouts after the 90-day forfeiture deadline to the protocol treasury/fee recipient with a `payout_forfeited` event. |
+
 | `reclaim_collateral(writer, position_id)` | Short-side payout after settlement: locked collateral minus the max loss paid out to longs. |
 | `reclaim_batch(writer, position_ids)` | Batched `reclaim_collateral`, same all-or-nothing/`MAX_BATCH_SIZE` contract as `exercise_batch`. Returns the summed reclaim. |
+| `transfer_position(from, to, position_id)` | Moves an open position to `to` (`from` must own it and sign); both parties' position lists are updated and `to` inherits exercise / reclaim / r
+| `reclaim_collateral(writer, position_id)` | Short-side payout after settlement: locked collateral minus the max loss paid out to longs. |
+| `reclaim_batch(writer, position_ids)` | Batched `reclaim_collateral`, same all-or-nothing/`MAX_BATCH_SIZE` contract as `exercise_batch`. Returns the summed reclaim. |
+| `transfer_position(from, to, position_id)` | Moves an open position to `to` (`from` must own it and sign); both parties' position lists are updated and `to` inherits exercise / reclaim / refund rights. Shorts are transferable because their collateral is already locked here, so `to` only gains the leftover-collateral reclaim. Rejected for exercised/settled positions and while paused; `to == from` is a no-op. Emits `position_transferred(from, to; position_id)`. |
+| `split_position(owner, position_id, split_contracts)` | Splits `split_contracts` (`0 < split < contracts`, else `InvalidSplitAmount`) off an open position into a new position with the same series, side and owner. `premium_paid`, `fee_paid` and `collateral_locked` are divided pro rata, rounded down for the new position with the remainder kept in the original, so every total (and `SeriesEscrow`, open interest) is unchanged. Blocked while paused and for exercised/settled positions. Returns the new position id. |
 | `claim_refund(owner, position_id)` | On a Cancelled series: buyers get their premium back (net of the fee already sent to `fee_recipient`), writers get their full collateral back. Paid directly from options_market's own balance. |
 | `claim_refund_from_vault(vault_contract, owner, position_id)` | Same eligibility checks and refund formula as `claim_refund`, but pays out of a deployed `vault`'s `series_id`-tagged escrow instead — see "Vault integration" below. Requires `escrow_series_to_vault` to have moved this series' liability into `vault` first. |
 
@@ -192,10 +259,26 @@ documented per field.
 ### Views
 
 `get_admin`, `is_paused`, `get_fee_rate`, `get_premium_pool`,
-`get_series_count_for_underlying`, `get_series`, `get_position`,
+`get_series_count_for_underlying`, `get_series_id`, `get_series`, `get_position`,
 `get_user_positions`, `get_underlying_price`, `get_series_escrow`
 (remaining not-yet-claimed refund liability for a series), `get_stats`
-(total premiums collected, total open interest, series count).
+(total premiums collected, total open interest, series count),
+`get_orphaned_liabilities`, `sync_orphaned_liabilities`.
+
+Paginated views (`limit` must be 1..=`MAX_PAGE_LIMIT` (50), else
+`InvalidPageLimit`). Each call reads at most `MAX_PAGE_SCAN` (200)
+entries, matching or not, so a page may come back short — keep paging
+until `next_cursor` is 0. Missing (e.g. archived) entries are skipped.
+At `limit = 50` in the test harness: `get_series_page` ≈ 2.0M CPU /
+187KB, `get_user_positions_page` ≈ 1.7M CPU / 162KB.
+
+| View | Description |
+|---|---|
+| `get_series_page(cursor, limit, filter)` | Series with id > `cursor`, in id order. `SeriesFilter { state, underlying, option_type }` — each a list of accepted values, empty = any. `state` is the stored state (stays `Active` past expiry until settled/cancelled). Returns `SeriesPage { items, next_cursor }`. |
+| `get_user_positions_page(user, cursor, limit, side)` | `user`'s positions from index `cursor` of their position list, optionally only `Long` or `Short`. Returns `PositionPage { items, next_cursor }`. |
+| `get_series_by_underlying(symbol)` | Every series id listed on `symbol`, oldest first (secondary index maintained on create; bounded by `MAX_SERIES_PER_UNDERLYING`). |
+| `get_position_value(position_id)` | **Indicative only — never used for settlement.** Intrinsic value at the settlement price if set, else the last recorded underlying price (0 if neither). Positive for longs, negative for shorts, 0 once exercised/settled. |
+| `get_account_summary(user)` | **Indicative only.** `AccountSummary { open_positions, long_value, short_liability, collateral_locked, net_value }` over `user`'s open positions. |
 
 ### Errors
 
@@ -213,6 +296,9 @@ documented per field.
 | 10 | `AlreadySettled` | | 22 | `InvalidSeriesParams` |
 | 11 | `ExerciseWindowClosed` | | 23 | `InvalidBatchSize` |
 | 12 | `ZeroContracts` | | 24 | `NothingToEscrow` |
+| | | | 25 | `NotEligibleForForfeiture` |
+| | | | 26 | `DuplicateSeries` |
+| | | | 27 | `InvalidSplitAmount` |
 
 ## `price_oracle` reference
 
@@ -270,31 +356,81 @@ have to poll every view function to track what changed.
 
 ## `vault` reference
 
-A per-tag escrow ledger for a single token, set at `initialize`.
+A per-(token, tag) escrow ledger. One deployment holds any number of
+allowlisted tokens and serves any number of integrator contracts
+(`options_market`, an LP pool, an insurance fund, ...). The token passed
+to `initialize` is the **default token** used by the `_legacy` wrappers.
+
+### Tag scheme
+
+A tag is a `#[contracttype] struct Tag { owner: Address, kind: Symbol, id: u64 }`,
+and the storage key is the full triple, so two integrators — or two id
+spaces inside one integrator — can never collide by construction.
+`options_market` uses `(self, "series", series_id)` for series escrow and
+reserves `(self, "position", position_id)` for per-position custody.
+
+A plain struct was chosen over a `BytesN<32>` hash of it: the key is only
+an address + a short symbol + a u64 larger than a hash, and in exchange
+storage keys and events stay self-describing (an indexer doesn't need a
+preimage registry to tell what a tag refers to).
+
+Legacy `u64` tags map to `(legacy owner, "legacy", id)`, where the legacy
+owner is the admin at `initialize` time (fixed, so a later
+`transfer_admin` can't orphan legacy balances).
+
+### Trust model
+
+- **Tag owners** (integrators) are the only ones who can move escrow.
+  A tag's owner is recorded as `TagOwner(tag) = tag.owner` on its first
+  deposit, and `withdraw` / `transfer_tag` require that owner's
+  `require_auth()`. In the intended integration the owner is a contract,
+  so its own cross-contract call satisfies the check without a human
+  signature. A bug in one integrator can therefore only ever reach its
+  own tags.
+- **Creating a tag** requires `tag.owner` to be in the integrator
+  registry (or be the legacy owner) and to authorize. End users can
+  deposit into a contract-owned tag only with that contract's auth, and
+  the contract still owns it. `transfer_tag` between different owners
+  requires **both** owners to authorize.
+- **The admin** configures the vault (token allowlist, integrator
+  registry, pause, sweeping untagged funds) but owns no integrator's
+  tags. Moving escrow without the owner is an **emergency-only** power,
+  available solely through multisig approval (`withdraw_via_multisig`,
+  `transfer_tag_via_multisig`), and still capped at each tag's balance.
 
 ### Admin
 
 | Function | Description |
 |---|---|
-| `initialize(admin, token, max_pause_duration)` | One-time setup. `max_pause_duration` (seconds, non-zero) is immutable afterward — see "Pause and the escape hatch". |
-| `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. |
+| `initialize(admin, token, max_pause_duration)` | One-time setup. `token` becomes the default token and is allowlisted. `max_pause_duration` (seconds, non-zero) is immutable afterward — see "Pause and the escape hatch". |
+| `transfer_admin(new_admin)` | Hands off control. Requires the **current** admin's signature. Does not hand over any tag. |
 | `transfer_admin_via_multisig(multisig_contract, action_id, new_admin)` | Permissionless alternative to `transfer_admin`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the current admin's own signature. |
 | `pause()` / `unpause()` | Emergency stop. Blocks **both** `deposit` and `withdraw` (and `transfer_tag`, `set_beneficiary`). Time-bounded: see "Pause and the escape hatch" below. |
 | `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
-| `withdraw(tag, to, amount)` | Pays `amount` of `tag`'s escrowed balance to `to`. Panics with `InsufficientEscrowBalance` if `tag` doesn't have that much earmarked, regardless of the vault's total token balance. Admin-gated — in the intended integration, `admin` is set to a calling contract's own address, so a contract-to-contract call satisfies the auth check through the call itself. |
-| `withdraw_via_multisig(multisig_contract, action_id, tag, to, amount)` | Permissionless alternative to `withdraw`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Meant for manual recovery/migration when the calling contract itself can't produce that signature. Still enforces `InsufficientEscrowBalance`. |
-| `sweep_untagged(to)` | Recovers tokens that landed on the vault directly, bypassing `deposit` (e.g. a stray transfer). Computes the actual token balance minus `get_total_escrowed`'s ledger sum and transfers exactly that difference; panics with `NoUntaggedFunds` if there's nothing to recover. |
-| `sweep_untagged_via_multisig(multisig_contract, action_id, to)` | Permissionless alternative to `sweep_untagged`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. |
-| `transfer_tag(from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement at all — meant for the roll_position case (close + reopen in one breath, collateral doesn't need to leave and come back). `TotalEscrowed` is unaffected. |
-| `transfer_tag_via_multisig(multisig_contract, action_id, from_tag, to_tag, amount)` | Permissionless alternative to `transfer_tag`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. |
+| `set_token_allowed(token, allowed)` / `set_token_allowed_via_multisig(multisig_contract, action_id, token, allowed)` | Manages the token allowlist. Removing a token only blocks **new** deposits; existing balances stay withdrawable, transferable and sweepable. |
+| `set_integrator(integrator, allowed)` / `set_integrator_via_multisig(multisig_contract, action_id, integrator, allowed)` | Manages the integrator registry (who may create tags). Deregistering blocks new tags only. |
+| `withdraw(token, tag, to, amount)` | Pays `amount` of `(token, tag)`'s escrow to `to`. Requires the tag owner. Panics with `InsufficientEscrowBalance` if the tag doesn't have that much earmarked, and `InsufficientVaultBalance` (instead of a token error) if the vault's actual balance can't cover it. Emits `shortfall_detected` if the ledger is under-backed. |
+| `withdraw_via_multisig(multisig_contract, action_id, token, tag, to, amount)` | Permissionless alternative to `withdraw`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Meant for manual recovery/migration when the calling contract itself can't produce that signature. Still enforces `InsufficientEscrowBalance`. |
+| `sweep_untagged(token, to)` / `sweep_untagged_via_multisig(multisig_contract, action_id, token, to)` | Recovers `token` that landed on the vault directly, bypassing `deposit`: the actual balance minus `get_total_escrowed(token)`. Panics with `NoUntaggedFunds` if there's nothing to recover — including when there is a shortfall instead. |
+| `transfer_tag(token, from_tag, to_tag, amount)` | Reassigns escrow between tags with no token movement — meant for the roll_position case. Requires `from_tag`'s owner, and `to_tag`'s owner too if different. `TotalEscrowed` is unaffected. |
+| `transfer_tag_via_multisig(multisig_contract, action_id, token, from_tag, to_tag, amount)` | Permissionless alternative to `transfer_tag`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. A new `to_tag` is recorded as owned by `to_tag.owner`. |
+| `withdraw_batch(ops: Vec<(token, tag, to, amount)>)` | Batched `withdraw`: one admin auth check, up to `MAX_BATCH` (50) entries, every entry validated against in-flight balances (the same tag may repeat) before anything is written, one token transfer per distinct recipient, all-or-nothing. One `withdrawn` event per entry. ~4x cheaper than sequential calls (10 entries: 0.92M vs 3.80M CPU instructions, 175KB vs 844KB memory). |
+| `transfer_tag_batch(ops: Vec<(token, from_tag, to_tag, amount)>)` | Batched `transfer_tag`, same validation and all-or-nothing semantics. One `tag_transferred` event per entry. |
+| `migrate_legacy(ids)` | Moves pre-upgrade `Escrow(u64)` entries to `Escrow(default token, legacy_tag(id))`, owned by the current admin; the old `TotalEscrowed` moves to the default token's total on the first call. Idempotent. |
 
 ### Depositors
 
 | Function | Description |
 |---|---|
-| `deposit(from, tag, amount)` | Pulls `amount` from `from` and credits `tag`'s ledger. Requires `from`'s own signature. The first depositor to a tag becomes its owner. |
+| `deposit(from, token, tag, amount) -> i128` | Pulls `amount` of an allowlisted `token` from `from` and credits `(token, tag)`. Requires `from`'s signature (and, on a tag's first deposit, its owner's). Credits — and returns — the **measured** balance delta, not `amount`: a fee-on-transfer token credits only what arrived. Costs two extra `balance` reads per deposit. |
 | `set_beneficiary(tag, beneficiary)` | Registers who may `emergency_withdraw` the tag. Requires the tag owner's signature; rejected while paused, so a beneficiary can't be redirected once the escape-hatch clock is running. |
 | `emergency_withdraw(tag, beneficiary)` | Escape hatch: once the vault has been paused for more than `max_pause_duration`, the tag's registered beneficiary (signing) receives the tag's whole balance. Emits `emergency_withdrawn`. |
+
+### Legacy wrappers (default token, `u64` tags)
+
+`deposit_legacy(from, id, amount)`, `withdraw_legacy(id, to, amount)`,
+`transfer_tag_legacy(from_id, to_id, amount)`, `balance_of_legacy(id)`,
+`legacy_tag(id)`.
 
 ### Pause and the escape hatch
 
@@ -312,16 +448,60 @@ scope here; possible follow-up with per-position tags).
 
 ### Views
 
-`balance_of(tag)`, `get_total_escrowed`, `get_admin`, `get_token`, `is_paused`,
-`get_tag_owner(tag)`, `get_beneficiary(tag)`, `get_max_pause_duration`,
+`balance_of(token, tag)`, `get_total_escrowed(token)`,
+`get_shortfall(token)` (`max(0, TotalEscrowed(token) − balance)`),
+`get_tag_owner(tag)`, `is_token_allowed(token)`, `is_integrator(addr)`,
+`get_admin`, `get_token`, `is_paused`,
+`get_tag_count`, `get_tags(cursor, limit)`, `verify_ledger(cursor, limit) -> (partial_sum, next_cursor)`,
+`get_beneficiary(tag)`, `get_max_pause_duration`,
 `get_paused_at`, `get_pause_duration` (seconds counted toward the limit now).
+
+`get_tags`/`verify_ledger` page through the ActiveTags index (every tag
+with a nonzero balance; `limit` capped at 100). The index uses
+swap-remove, so read all pages against one ledger snapshot.
+
+### Ledger reconciliation
+
+The vault's invariant is `sum(Escrow(tag)) == TotalEscrowed <= token.balance(vault)`.
+Monitors can check it over RPC:
+
+```sh
+count=$(stellar contract invoke --id $VAULT -- get_tag_count)
+cursor=0; sum=0
+while [ "$cursor" -lt "$count" ]; do
+  read partial cursor < <(stellar contract invoke --id $VAULT -- \
+    verify_ledger --cursor $cursor --limit 100 | tr -d '[]",' )
+  sum=$((sum + partial))
+done
+total=$(stellar contract invoke --id $VAULT -- get_total_escrowed | tr -d '"')
+[ "$sum" = "$total" ] && echo "ledger OK ($sum)" || echo "MISMATCH: $sum != $total"
+```
+
+Building with `--features invariants` compiles a full post-condition check
+into every mutating entrypoint (tests/fuzzing only, never production wasm);
+CI runs the suite that way, including a 10,000-op random fuzz test.
+
+### Clawback risk
+
+A SAC issuer with clawback enabled can reduce the vault's balance
+directly, leaving it below `TotalEscrowed`. The vault cannot prevent
+this; it makes it visible instead: `get_shortfall(token)` reports the gap,
+`withdraw` emits `shortfall_detected` whenever it sees one (at the cost
+of one extra `balance` read), payouts the vault can no longer cover fail
+with `InsufficientVaultBalance`, and `sweep_untagged` returns
+`NoUntaggedFunds` rather than trapping. Shortfall socialization across
+tags is out of scope — the last withdrawers of an under-backed token
+absorb it.
 
 ### Events
 
-`admin_transferred`, `paused`, `unpaused`, `deposited`, `withdrawn`,
-`swept_untagged`, `tag_transferred`, `beneficiary_set`,
+`admin_transferred`, `paused`, `unpaused`, `token_allowed`,
+`integrator_set`, `legacy_migrated`, `beneficiary_set`,
 `emergency_withdrawn` (topics `(emergency_withdrawn, beneficiary, tag)`,
-data `amount`).
+data `amount`), and the token-scoped ones:
+`deposited` / `withdrawn` (topics `token`, full `tag`; data `(from|to, amount)`),
+`tag_transferred` (topic `token`; data `(from_tag, to_tag, amount)`),
+`swept_untagged` (topics `token`, `to`), `shortfall_detected` (topic `token`).
 
 ### Errors
 
@@ -333,10 +513,9 @@ data `amount`).
 | 4 | `ContractPaused` |
 | 5 | `NoUntaggedFunds` |
 | 6 | `Unauthorized` |
-| 7 | `InvalidPauseDuration` |
-| 8 | `EmergencyNotAvailable` |
-| 9 | `NotBeneficiary` |
-| 10 | `TagNotOwned` |
+| 7 | `TokenNotAllowed` |
+| 8 | `UnregisteredIntegrator` |
+| 9 | `InsufficientVaultBalance` |
 
 ## `multisig` reference
 
@@ -344,16 +523,28 @@ Signers, threshold, `approval_ttl`, timelock `delays` and the optional
 custom-account config are all fixed at `initialize` and immutable — there's deliberately no in-protocol way to change the signer
 set, so a compromised signer can never add another compromised signer.
 
+Action ids are `BytesN<32>`. Every action has an on-chain registry entry,
+`ActionMeta { proposer, created_at, description_hash, status }`
+(`status`: `Pending`, `Executed`, `Reset`, `Expired`), created either by
+`register_action` or on its first approval. Pending actions live in a
+bounded index (at most `MAX_PENDING_ACTIONS` (100) overall and
+`MAX_PENDING_PER_SIGNER` (10) per proposer, against registry spam) that
+is swap-removed on execute, reset, or expiry.
+
 | Function | Description |
 |---|---|
 | `initialize(signers, threshold, approval_ttl, delays, account)` | One-time setup. Rejects a zero threshold, a threshold above the signer count, or a duplicate signer. `approval_ttl` is in seconds; zero means approvals never expire (the original behavior). `delays: Delays { standard, critical }` (seconds; `standard <= critical`). `account: Option<AccountConfig { signers: Vec<BytesN<32>>, threshold, allowed_contracts }>` enables custom-account mode. |
-| `approve(signer, action_id)` | Records `signer`'s approval, stamped with the current ledger timestamp. Requires the signer's own signature and current signer-set membership. Rejects a signer voting twice on the same `action_id` while their existing approval is still fresh — an EXPIRED approval is treated as no approval at all, so re-approving after expiry just refreshes the timestamp instead of erroring. |
+| `register_action(proposer, action_id, description_hash)` | Signer-only. Registers `action_id` with a `description_hash` (e.g. sha256 of an off-chain write-up) before anyone votes, so signers can verify on-chain what they approve. Rejects an id that's already pending or executed. |
+| `approve(signer, action_id)` | Records `signer`'s approval, stamped with the current ledger timestamp. Requires the signer's own signature and current signer-set membership. Registers the action (zero description hash) if it isn't pending yet. Rejects an executed action, and a signer voting twice while their existing approval is still fresh — an EXPIRED approval is treated as no approval at all, so re-approving after expiry just refreshes the timestamp. |
 | `revoke(signer, action_id)` | Withdraws `signer`'s own still-fresh vote. Rejects revoking an approval that's already expired — there's nothing left to withdraw. |
-| `reset(action_id)` | Clears every signer's approval of `action_id`, so a repeat action reusing the same id starts from a clean slate. Only callable once `action_id` is already approved. |
+| `reset(action_id)` | Clears every signer's approval of `action_id` and marks it `Reset` (removed from the pending index), so a repeat action reusing the same id starts from a clean slate. Only callable once `action_id` is already approved; not for executor proposals. |
+| `expire(action_id)` | Anyone. Marks a stale pending action `Expired` and drops it from the index: requires a nonzero `approval_ttl`, the action older than it, and no approval still fresh. |
+| `propose(proposer, target, function, args) -> proposal_id` | Signer-only. Stores `Proposal { target, function, args, nonce }` (at most `MAX_PROPOSAL_ARGS` (10) args) and registers it. `proposal_id` = sha256 of the proposal's XDR, which is also its description hash, so the id commits to the exact call. |
+| `execute(proposal_id)` | Anyone, once approved. Marks the proposal `Executed`, then calls `target.function(args)` via `invoke_contract` **as the multisig** — so a target whose admin is the multisig passes its `admin.require_auth()` with no other signature. Can never run twice; a failing target call reverts the whole transaction (the proposal stays pending). Returns the target's return value. |
 
 ### Views
 
-`is_signer`, `get_signer_count`, `get_threshold`, `get_approval_ttl`, `has_approved(action_id, signer)` (false if expired), `get_approval_count(action_id)` (counts only currently-unexpired approvals), `is_approved(action_id)`, `is_executable(action_id, class)`, `get_threshold_reached_at(action_id)`, `get_delays`, `get_delay(class)`, `get_account_config`.
+`is_signer`, `get_signer_count`, `get_threshold`, `get_approval_ttl`, `has_approved(action_id, signer)` (false if expired), `get_approval_count(action_id)` (counts only currently-unexpired approvals), `is_approved(action_id)`, `is_executable(action_id, class)`, `get_threshold_reached_at(action_id)`, `get_delays`, `get_delay(class)`, `get_account_config`, `get_action(action_id)` (`ActionMeta` or none), `get_pending_actions(cursor, limit)` (up to `limit` ≤ 50 pending ids from index `cursor`; order isn't stable across writes because removal is swap-remove), `get_pending_count`, `get_proposal(proposal_id)`.
 
 ### Timelock tiers
 
@@ -433,7 +624,7 @@ stellar tx simulate --network testnet < pause.signed.tx \
 
 ### Events
 
-`approved`, `revoked`, `reset`.
+`registered`, `approved`, `revoked` (topics: name, address, action id), `reset`, `expired`, `executed` (topics: name, action id). Every event's data is the action's description hash.
 
 ### Errors
 
@@ -445,11 +636,109 @@ stellar tx simulate --network testnet < pause.signed.tx \
 | 4 | `NotASigner` |
 | 5 | `AlreadyApproved` |
 | 6 | `NotYetApproved` |
-| 7 | `InvalidDelays` |
-| 8 | `AccountNotConfigured` |
-| 9 | `UnsortedSignatures` |
-| 10 | `InsufficientSignatures` |
-| 11 | `ContextNotAllowed` |
+| 7 | `ActionAlreadyRegistered` |
+| 8 | `ActionNotPending` |
+| 9 | `TooManyPendingActions` |
+| 10 | `ProposalNotFound` |
+| 11 | `ProposalTooLarge` |
+| 12 | `InvalidPageLimit` |
+| 13 | `NotExpired` |
+
+### Migrating from `_via_multisig` to executor mode
+
+1. Deploy and `initialize` a multisig with the intended signers and threshold.
+2. On each target contract, `transfer_admin(<multisig address>)` — from then on the multisig is the admin, and every admin function keeps its single `admin.require_auth()` path.
+3. For each admin action: a signer calls `propose(signer, target, fn_name, args)`, signers `approve(signer, proposal_id)` until threshold, then anyone calls `execute(proposal_id)`.
+4. The existing `_via_multisig` entrypoints and `is_approved` keep working unchanged (with `BytesN<32>` action ids), so consumers can move over one function at a time; their removal is a follow-up deprecation.
+
+## `timelock` reference
+
+Meant to hold the admin role on every other Zenith contract, so any
+parameter or code change is visible on-chain for at least `min_delay`
+seconds before it can run. Modelled on OpenZeppelin's TimelockController.
+
+| Function | Description |
+|---|---|
+| `initialize(min_delay, proposers, executors, cancellers)` | One-time setup. Empty `executors` means anyone may execute a ready operation. There is no admin afterwards. |
+| `schedule(proposer, calls, predecessor, salt, delay) -> id` | Proposer-only. `calls` is a `Vec<Call { target, function, args }>`; `delay >= min_delay`. The id is `sha256(xdr((calls, predecessor, salt)))` (see `hash_operation`). Rejects an id that's already pending or done. |
+| `execute(executor, calls, predecessor, salt)` | Executor-only (unless open). Requires the operation ready and `predecessor` (if any) done. Runs every call in order via `invoke_contract`; any revert reverts the whole batch. |
+| `cancel(canceller, id)` | Canceller-only. Removes a pending operation. |
+
+**Self-administration.** Soroban forbids re-entry, so a `Call` whose
+`target` is the timelock itself is dispatched internally by `execute`:
+`update_delay(u64)`, `grant_role(Role, Address)`, `revoke_role(Role, Address)`,
+`set_open_executor(bool)`. These changes are therefore only reachable
+through a delayed operation.
+
+**Views:** `get_timestamp(id)` (0 unknown, 1 done, else ready-at),
+`is_operation`, `is_operation_pending`, `is_operation_ready`,
+`is_operation_done`, `get_min_delay`, `has_role(role, account)`,
+`is_open_executor`, `hash_operation`.
+
+**Events:** `scheduled`, `executed`, `cancelled`, `min_delay_changed`, `role_changed`.
+
+**Errors:** 1 `AlreadyInitialized`, 2 `Unauthorized`, 3 `InsufficientDelay`,
+4 `AlreadyScheduled`, 5 `NotReady`, 6 `PredecessorNotDone`, 7 `NotPending`,
+8 `UnknownSelfCall`, 9 `EmptyOperation`.
+
+### Operations guide
+
+1. Deploy the timelock, then `transfer_admin(timelock)` on each contract.
+2. A proposer schedules the change, e.g. `calls = [Call { target: options_market, function: "set_fee_rate", args: [25u32] }]`, with a unique `salt`, and announces the id.
+3. During the delay users can exit; a canceller can `cancel(id)`.
+4. Once `is_operation_ready(id)`, an executor calls `execute` with the exact same `calls`/`predecessor`/`salt`.
+5. Use `predecessor` to force ordering (e.g. a migration after an `upgrade`).
+
+## `params` reference
+
+All writes require the `timelock` address set at `initialize`. Values
+move freely inside their bounds; bounds themselves only move through a
+second, slower path (`BOUNDS_CHANGE_DELAY` = 7 days on top of the
+timelock's own delay), so widening the sanity envelope always takes
+longer than using it. Every change bumps `get_version()`.
+
+| Function | Description |
+|---|---|
+| `initialize(timelock)` | One-time setup. |
+| `define_param(key, value, min, max)` | Creates a parameter that has never been set. |
+| `set_param(key, value)` | Moves the value within `[min, max]`. Emits `param_updated(key, old, new)`. |
+| `propose_bounds(key, min, max)` | Queues new bounds (must still contain the current value), executable after `BOUNDS_CHANGE_DELAY`. |
+| `execute_bounds(key)` / `cancel_bounds(key)` | Applies or drops the queued bounds change. |
+
+Views: `get_param(key) -> Option<{value, min, max, updated_at}>`,
+`get_value(key)`, `get_pending_bounds(key)`, `get_version()`,
+`get_timelock()`. Events: `param_defined`, `param_updated`,
+`bounds_proposed`, `bounds_updated`, `bounds_cancelled`.
+
+### Parameter catalog
+
+| Key | Consumer | Unit | Suggested bounds | Default when unset |
+|---|---|---|---|---|
+| `fee_bps` | options_market fee rate | basis points | `[0, 1000]` | local `FeeRateBps` (50) |
+| `settle_w` | options_market exercise window after expiry | seconds | `[3600, 604800]` | 86,400 |
+
+options_market points at a registry via admin-only
+`set_params_registry(registry)`. It caches both values in instance
+storage with the registry version and only re-reads them when the
+version moves. An unreachable registry, an unset key, or a value
+outside options_market's own hard limits (`MAX_FEE_RATE_BPS`, window > 0)
+leaves the cached value in place. Other parameters (oracle staleness,
+`min_reports`, OI caps, ...) are follow-ups.
+
+## `grants_escrow` reference
+
+| Function | Description |
+|---|---|
+| `create_grant(funder, grantee, token, milestones: Vec<(amount, deadline)>, reviewers, quorum) -> u64` | Funds the grant upfront. Rejects a reviewer who is also the grantee, duplicate reviewers, a quorum outside `1..=reviewers`, and non-positive amounts or past deadlines. |
+| `submit_milestone(grant_id, idx, evidence_hash)` | Grantee only, before the milestone's deadline. |
+| `approve_milestone(grant_id, idx, reviewer)` | One approval per reviewer; the approval that reaches quorum releases the milestone in full (no partial approval). |
+| `reclaim(grant_id) -> i128` | Funder only. Returns every unreleased milestone whose deadline plus `GRACE_PERIOD` (7 days) has passed. |
+
+Views: `get_grant`, `get_grant_count`, `has_approved`,
+`get_grantee_grant_count(grantee)`, `get_grants_by_grantee(grantee,
+start, limit)` (paginated, `limit` capped at 50). Events:
+`grant_created`, `milestone_submitted`, `milestone_approved`,
+`milestone_released`, `funds_reclaimed`.
 
 ## Known gaps
 
@@ -506,8 +795,9 @@ stellar tx simulate --network testnet < pause.signed.tx \
   `upgrade`, `cancel_series`, `create_series`, `update_premium`.
   price_oracle: `pause`, `unpause`, `transfer_admin`,
   `set_max_staleness`, `set_min_reports`, `add_feeder`, `remove_feeder`.
-  vault: `pause`, `unpause`, `transfer_admin`, `withdraw`, `transfer_tag`,
-  `sweep_untagged`. `initialize` can't have one by construction — there
+  vault: `pause`, `unpause`, `transfer_admin`, `set_token_allowed`,
+  `set_integrator`, `sweep_untagged`, plus the emergency-only `withdraw`
+  and `transfer_tag` (whose normal path is tag-owner-gated, not admin). `initialize` can't have one by construction — there
   is no admin, and therefore no Multisig deployment trusted by this
   contract, until it runs. Every `_via_multisig` function is additive
   (the original admin-gated version is unchanged) and checks

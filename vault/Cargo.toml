@@ -33,3 +33,6 @@ multisig = { package = "zenith-multisig", path = "../multisig", features = ["tes
 
 [features]
 testutils = ["soroban-sdk/testutils"]
+# Compiles a full-ledger post-condition check into every mutating
+# entrypoint. For tests/fuzzing only; never enable for production wasm.
+invariants = []
