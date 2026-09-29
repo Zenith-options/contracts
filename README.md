@@ -166,9 +166,11 @@ documented per field.
 | Function | Description |
 |---|---|
 | `buy_option(buyer, series_id, contracts, max_premium)` | Opens a Long position. `max_premium` is slippage protection. Premium (net of the protocol fee) funds the pool `write_option` pays writers from. |
-| `write_option(writer, series_id, contracts, collateral_amount)` | Opens a Short position. Collateral: notional value for calls, 110% of strike for puts. Premium is paid out of the pool buyers have funded — `InsufficientPremiumPool` if no buyer has paid in enough yet (a write can't be paid a "premium" out of its own just-deposited collateral). |
-| `exercise(owner, position_id)` | Long-side payout after expiry, within the 24h settlement window, if in the money. |
+| `write_option(writer, series_id, contracts, collateral_amount, min_premium)` | Opens a Short position. Collateral: notional value for calls, 110% of strike for puts. Premium is paid out of the pool buyers have funded — `InsufficientPremiumPool` if no buyer has paid in enough yet (a write can't be paid a "premium" out of its own just-deposited collateral). `min_premium` is slippage protection: `PremiumBelowMinimum` if the net premium the writer would receive (after the protocol fee) is below it, so an `update_premium` cut or fee increase ordered ahead of the write can't underpay the writer. Pass `0` to opt out. |
+| `exercise(owner, position_id)` | Long-side payout after expiry, within the 24h settlement window, if in the money. The 24h settlement window is a soft deadline (longs remain claimable until the 90-day forfeiture window). |
 | `exercise_batch(owner, position_ids)` | Same as `exercise`, for every id in `position_ids` in one call — for an owner with several long positions who'd otherwise need one transaction per position. All-or-nothing (any single id failing `exercise`'s own checks aborts the whole batch) and capped at `MAX_BATCH_SIZE` (25). Returns the summed payout. |
+| `settle_long(position_id)` | Permissionless auto-exercise / keeper settlement for in-the-money longs after settlement. Anyone can call; payout is unconditionally transferred to the position owner. |
+| `sweep_forfeited(position_id)` | Admin entrypoint to sweep unexercised ITM long payouts after the 90-day forfeiture deadline to the protocol treasury/fee recipient with a `payout_forfeited` event. |
 | `reclaim_collateral(writer, position_id)` | Short-side payout after settlement: locked collateral minus the max loss paid out to longs. |
 | `reclaim_batch(writer, position_ids)` | Batched `reclaim_collateral`, same all-or-nothing/`MAX_BATCH_SIZE` contract as `exercise_batch`. Returns the summed reclaim. |
 | `claim_refund(owner, position_id)` | On a Cancelled series: buyers get their premium back (net of the fee already sent to `fee_recipient`), writers get their full collateral back. Paid directly from options_market's own balance. |
@@ -186,7 +188,8 @@ documented per field.
 `get_series_count_for_underlying`, `get_series_id`, `get_series`, `get_position`,
 `get_user_positions`, `get_underlying_price`, `get_series_escrow`
 (remaining not-yet-claimed refund liability for a series), `get_stats`
-(total premiums collected, total open interest, series count).
+(total premiums collected, total open interest, series count),
+`get_orphaned_liabilities`, `sync_orphaned_liabilities`.
 
 ### Errors
 
@@ -204,6 +207,7 @@ documented per field.
 | 10 | `AlreadySettled` | | 22 | `InvalidSeriesParams` |
 | 11 | `ExerciseWindowClosed` | | 23 | `InvalidBatchSize` |
 | 12 | `ZeroContracts` | | 24 | `NothingToEscrow` |
+| | | | 25 | `NotEligibleForForfeiture` |
 | | | | 26 | `DuplicateSeries` |
 
 ## `price_oracle` reference

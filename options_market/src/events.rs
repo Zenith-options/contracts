@@ -112,3 +112,24 @@ pub fn series_escrowed_to_vault(env: &Env, series_id: u64, amount: i128) {
         amount,
     );
 }
+
+pub fn payout_forfeited(env: &Env, owner: Address, position_id: u64, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "payout_forfeited"), owner),
+        (position_id, amount),
+    );
+}
+
+pub fn option_auto_exercised(
+    env: &Env,
+    owner: Address,
+    position_id: u64,
+    settlement_price: i128,
+    payout: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "option_auto_exercised"), owner),
+        (position_id, settlement_price, payout),
+    );
+}
+

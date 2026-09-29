@@ -28,5 +28,7 @@ pub enum Error {
     InvalidSeriesParams = 22,
     InvalidBatchSize = 23,
     NothingToEscrow = 24,
-    DuplicateSeries = 26,
+    PremiumBelowMinimum = 25,
+    NotEligibleForForfeiture = 26,
+    DuplicateSeries = 27,
 }
