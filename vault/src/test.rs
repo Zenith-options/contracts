@@ -1,10 +1,13 @@
 #![cfg(test)]
 
-use crate::{Vault, VaultClient};
+extern crate std;
+
+use crate::{Tag, Vault, VaultClient};
 use multisig::{Multisig, MultisigClient};
 use soroban_sdk::{
+    symbol_short,
     testutils::{Address as _, Events as _},
-    token, Address, Env, TryFromVal,
+    token, vec, Address, Env, Symbol, TryFromVal,
 };
 
 struct Harness<'a> {
@@ -43,12 +46,38 @@ fn balance(h: &Harness, of: &Address) -> i128 {
     token::Client::new(&h.env, &h.token).balance(of)
 }
 
+/// The namespaced tag a legacy u64 id maps to.
+fn lt(h: &Harness, id: u64) -> Tag {
+    Tag {
+        owner: h.admin.clone(),
+        kind: symbol_short!("legacy"),
+        id,
+    }
+}
+
+fn tag(owner: &Address, kind: &str, id: u64, env: &Env) -> Tag {
+    Tag {
+        owner: owner.clone(),
+        kind: Symbol::new(env, kind),
+        id,
+    }
+}
+
+fn new_token(h: &Harness) -> Address {
+    let token_admin = Address::generate(&h.env);
+    h.env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address()
+}
+
 #[test]
 fn initialize_sets_admin_and_token() {
     let h = setup();
     assert_eq!(h.client.get_admin(), h.admin);
     assert_eq!(h.client.get_token(), h.token);
-    assert_eq!(h.client.get_total_escrowed(), 0);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 0);
+    assert!(h.client.is_token_allowed(&h.token));
+    assert_eq!(h.client.legacy_tag(&7), lt(&h, 7));
 }
 
 #[test]
@@ -88,10 +117,10 @@ fn deposit_pulls_funds_and_credits_the_tags_ledger() {
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
 
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
-    assert_eq!(h.client.balance_of(&7), 400);
-    assert_eq!(h.client.get_total_escrowed(), 400);
+    assert_eq!(h.client.balance_of_legacy(&7), 400);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 400);
     assert_eq!(balance(&h, &depositor), 600);
     assert_eq!(balance(&h, &h.client.address), 400);
 }
@@ -102,11 +131,11 @@ fn deposit_accumulates_across_multiple_calls_for_the_same_tag() {
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
 
-    h.client.deposit(&depositor, &7, &100);
-    h.client.deposit(&depositor, &7, &250);
+    h.client.deposit_legacy(&depositor, &7, &100);
+    h.client.deposit_legacy(&depositor, &7, &250);
 
-    assert_eq!(h.client.balance_of(&7), 350);
-    assert_eq!(h.client.get_total_escrowed(), 350);
+    assert_eq!(h.client.balance_of_legacy(&7), 350);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 350);
 }
 
 #[test]
@@ -115,12 +144,12 @@ fn deposit_keeps_different_tags_independent() {
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
 
-    h.client.deposit(&depositor, &1, &100);
-    h.client.deposit(&depositor, &2, &250);
+    h.client.deposit_legacy(&depositor, &1, &100);
+    h.client.deposit_legacy(&depositor, &2, &250);
 
-    assert_eq!(h.client.balance_of(&1), 100);
-    assert_eq!(h.client.balance_of(&2), 250);
-    assert_eq!(h.client.get_total_escrowed(), 350);
+    assert_eq!(h.client.balance_of_legacy(&1), 100);
+    assert_eq!(h.client.balance_of_legacy(&2), 250);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 350);
 }
 
 #[test]
@@ -129,7 +158,7 @@ fn deposit_rejects_a_non_positive_amount() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &0);
+    h.client.deposit_legacy(&depositor, &7, &0);
 }
 
 // ─── withdraw ────────────────────────────────────────────────────────────────
@@ -139,13 +168,13 @@ fn withdraw_pays_out_and_debits_the_tags_ledger() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     let payee = Address::generate(&h.env);
-    h.client.withdraw(&7, &payee, &150);
+    h.client.withdraw_legacy(&7, &payee, &150);
 
-    assert_eq!(h.client.balance_of(&7), 250);
-    assert_eq!(h.client.get_total_escrowed(), 250);
+    assert_eq!(h.client.balance_of_legacy(&7), 250);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 250);
     assert_eq!(balance(&h, &payee), 150);
 }
 
@@ -155,14 +184,14 @@ fn withdraw_rejects_more_than_the_tags_own_balance() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     // Tag 7 only has 400 earmarked — this is exactly the gap the vault
     // exists to close: a withdrawal can't draw on tag 8's (nonexistent)
     // balance just because the vault's raw token balance happens to be
     // nonzero from OTHER deposits.
     let payee = Address::generate(&h.env);
-    h.client.withdraw(&7, &payee, &401);
+    h.client.withdraw_legacy(&7, &payee, &401);
 }
 
 #[test]
@@ -170,16 +199,16 @@ fn withdraw_cannot_drain_another_tags_deposit() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &100);
-    h.client.deposit(&depositor, &2, &900);
+    h.client.deposit_legacy(&depositor, &1, &100);
+    h.client.deposit_legacy(&depositor, &2, &900);
 
     let payee = Address::generate(&h.env);
-    h.client.withdraw(&1, &payee, &100);
+    h.client.withdraw_legacy(&1, &payee, &100);
 
     // Tag 1 is now fully withdrawn; tag 2's much larger balance must be
     // completely unaffected.
-    assert_eq!(h.client.balance_of(&1), 0);
-    assert_eq!(h.client.balance_of(&2), 900);
+    assert_eq!(h.client.balance_of_legacy(&1), 0);
+    assert_eq!(h.client.balance_of_legacy(&2), 900);
 }
 
 #[test]
@@ -188,8 +217,8 @@ fn withdraw_rejects_a_non_positive_amount() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
-    h.client.withdraw(&7, &depositor, &0);
+    h.client.deposit_legacy(&depositor, &7, &400);
+    h.client.withdraw_legacy(&7, &depositor, &0);
 }
 
 // ─── transfer_admin ─────────────────────────────────────────────────────────
@@ -224,7 +253,7 @@ fn pause_blocks_deposit_and_withdraw_unpause_restores_them() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     assert!(!h.client.is_paused());
     h.client.pause();
@@ -234,9 +263,9 @@ fn pause_blocks_deposit_and_withdraw_unpause_restores_them() {
     assert!(!h.client.is_paused());
 
     // Both sides work again post-unpause.
-    h.client.deposit(&depositor, &7, &100);
-    h.client.withdraw(&7, &depositor, &50);
-    assert_eq!(h.client.balance_of(&7), 450);
+    h.client.deposit_legacy(&depositor, &7, &100);
+    h.client.withdraw_legacy(&7, &depositor, &50);
+    assert_eq!(h.client.balance_of_legacy(&7), 450);
 }
 
 #[test]
@@ -246,7 +275,7 @@ fn deposit_is_rejected_while_paused() {
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
     h.client.pause();
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 }
 
 #[test]
@@ -255,10 +284,10 @@ fn withdraw_is_rejected_while_paused() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     h.client.pause();
-    h.client.withdraw(&7, &depositor, &100);
+    h.client.withdraw_legacy(&7, &depositor, &100);
 }
 
 // ─── events ──────────────────────────────────────────────────────────────────
@@ -269,20 +298,22 @@ fn deposit_emits_a_deposited_event_with_the_amount_as_data() {
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
 
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     let events = h.env.events().all();
     let (contract_id, topics, data) = events.last().unwrap();
     assert_eq!(contract_id, h.client.address);
-    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 400);
+    let (data_from, amount) = <(Address, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(data_from, depositor);
+    assert_eq!(amount, 400);
 
-    // from and tag live in topics, not data — an indexer filtering
-    // "deposits from this wallet" or "deposits for this tag" reads
-    // them from here.
-    let topic_from = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
-    let topic_tag = u64::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
-    assert_eq!(topic_from, depositor);
-    assert_eq!(topic_tag, 7);
+    // token and the full tag live in topics — an indexer filtering
+    // "deposits of this token" or "deposits for this tag" reads them
+    // from here.
+    let topic_token = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    let topic_tag = Tag::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
+    assert_eq!(topic_token, h.token);
+    assert_eq!(topic_tag, lt(&h, 7));
 }
 
 #[test]
@@ -290,19 +321,20 @@ fn withdraw_emits_a_withdrawn_event_with_the_amount_as_data() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
-    h.client.withdraw(&7, &depositor, &150);
+    h.client.withdraw_legacy(&7, &depositor, &150);
 
     let events = h.env.events().all();
     let (_, topics, data) = events.last().unwrap();
-    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 150);
+    let (data_to, amount) = <(Address, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(data_to, depositor);
+    assert_eq!(amount, 150);
 
-    // to and tag live in topics, not data.
-    let topic_to = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
-    let topic_tag = u64::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
-    assert_eq!(topic_to, depositor);
-    assert_eq!(topic_tag, 7);
+    let topic_token = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    let topic_tag = Tag::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
+    assert_eq!(topic_token, h.token);
+    assert_eq!(topic_tag, lt(&h, 7));
 }
 
 // ─── sweep_untagged ─────────────────────────────────────────────────────────
@@ -312,7 +344,7 @@ fn sweep_untagged_recovers_a_direct_transfer_that_bypassed_deposit() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     // Simulate a stray direct transfer straight to the vault's own
     // address, bypassing deposit() entirely — those funds aren't credited
@@ -320,13 +352,13 @@ fn sweep_untagged_recovers_a_direct_transfer_that_bypassed_deposit() {
     mint(&h, &h.client.address, 250);
 
     let rescuer = Address::generate(&h.env);
-    let swept = h.client.sweep_untagged(&rescuer);
+    let swept = h.client.sweep_untagged(&h.token, &rescuer);
 
     assert_eq!(swept, 250);
     assert_eq!(balance(&h, &rescuer), 250);
     // Tag 7's own escrowed balance must be completely untouched.
-    assert_eq!(h.client.balance_of(&7), 400);
-    assert_eq!(h.client.get_total_escrowed(), 400);
+    assert_eq!(h.client.balance_of_legacy(&7), 400);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 400);
 }
 
 #[test]
@@ -335,13 +367,13 @@ fn sweep_untagged_rejects_when_the_balance_exactly_matches_the_ledger() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     // No stray transfer this time — the vault's actual balance (400)
     // exactly matches get_total_escrowed (400), so there's nothing to
     // sweep.
     let rescuer = Address::generate(&h.env);
-    h.client.sweep_untagged(&rescuer);
+    h.client.sweep_untagged(&h.token, &rescuer);
 }
 
 #[test]
@@ -349,18 +381,20 @@ fn sweep_untagged_emits_a_swept_untagged_event() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
     mint(&h, &h.client.address, 250);
 
     let rescuer = Address::generate(&h.env);
-    h.client.sweep_untagged(&rescuer);
+    h.client.sweep_untagged(&h.token, &rescuer);
 
     let events = h.env.events().all();
     let (_, topics, data) = events.last().unwrap();
     assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 250);
 
-    // to lives in topics, not data.
-    let topic_to = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    // token and to live in topics, not data.
+    let topic_token = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    let topic_to = Address::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
+    assert_eq!(topic_token, h.token);
     assert_eq!(topic_to, rescuer);
 }
 
@@ -371,15 +405,15 @@ fn transfer_tag_moves_escrow_without_any_token_movement() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &400);
+    h.client.deposit_legacy(&depositor, &1, &400);
 
     let vault_balance_before = balance(&h, &h.client.address);
-    h.client.transfer_tag(&1, &2, &150);
+    h.client.transfer_tag_legacy(&1, &2, &150);
 
-    assert_eq!(h.client.balance_of(&1), 250);
-    assert_eq!(h.client.balance_of(&2), 150);
+    assert_eq!(h.client.balance_of_legacy(&1), 250);
+    assert_eq!(h.client.balance_of_legacy(&2), 150);
     // TotalEscrowed unchanged — nothing entered or left the vault.
-    assert_eq!(h.client.get_total_escrowed(), 400);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 400);
     assert_eq!(balance(&h, &h.client.address), vault_balance_before);
 }
 
@@ -388,13 +422,13 @@ fn transfer_tag_accumulates_into_an_already_funded_destination() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &400);
-    h.client.deposit(&depositor, &2, &100);
+    h.client.deposit_legacy(&depositor, &1, &400);
+    h.client.deposit_legacy(&depositor, &2, &100);
 
-    h.client.transfer_tag(&1, &2, &400);
+    h.client.transfer_tag_legacy(&1, &2, &400);
 
-    assert_eq!(h.client.balance_of(&1), 0);
-    assert_eq!(h.client.balance_of(&2), 500);
+    assert_eq!(h.client.balance_of_legacy(&1), 0);
+    assert_eq!(h.client.balance_of_legacy(&2), 500);
 }
 
 #[test]
@@ -403,9 +437,9 @@ fn transfer_tag_rejects_more_than_the_source_tags_balance() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &100);
+    h.client.deposit_legacy(&depositor, &1, &100);
 
-    h.client.transfer_tag(&1, &2, &101);
+    h.client.transfer_tag_legacy(&1, &2, &101);
 }
 
 #[test]
@@ -414,9 +448,9 @@ fn transfer_tag_rejects_a_non_positive_amount() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &100);
+    h.client.deposit_legacy(&depositor, &1, &100);
 
-    h.client.transfer_tag(&1, &2, &0);
+    h.client.transfer_tag_legacy(&1, &2, &0);
 }
 
 #[test]
@@ -424,19 +458,19 @@ fn transfer_tag_emits_a_tag_transferred_event() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &400);
+    h.client.deposit_legacy(&depositor, &1, &400);
 
-    h.client.transfer_tag(&1, &2, &150);
+    h.client.transfer_tag_legacy(&1, &2, &150);
 
     let events = h.env.events().all();
     let (_, topics, data) = events.last().unwrap();
-    assert_eq!(i128::try_from_val(&h.env, &data).unwrap(), 150);
+    let (from_tag, to_tag, amount) = <(Tag, Tag, i128)>::try_from_val(&h.env, &data).unwrap();
+    assert_eq!(from_tag, lt(&h, 1));
+    assert_eq!(to_tag, lt(&h, 2));
+    assert_eq!(amount, 150);
 
-    // from_tag and to_tag live in topics, not data.
-    let topic_from_tag = u64::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
-    let topic_to_tag = u64::try_from_val(&h.env, &topics.get(2).unwrap()).unwrap();
-    assert_eq!(topic_from_tag, 1);
-    assert_eq!(topic_to_tag, 2);
+    let topic_token = Address::try_from_val(&h.env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(topic_token, h.token);
 }
 
 // ─── cross-contract: pause_via_multisig / transfer_admin_via_multisig ─────
@@ -552,7 +586,7 @@ fn withdraw_via_multisig_pays_out_once_approved() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
@@ -562,9 +596,9 @@ fn withdraw_via_multisig_pays_out_once_approved() {
 
     let payee = Address::generate(&h.env);
     h.client
-        .withdraw_via_multisig(&multisig_id, &action_id, &7, &payee, &150);
+        .withdraw_via_multisig(&multisig_id, &action_id, &h.token, &lt(&h, 7), &payee, &150);
 
-    assert_eq!(h.client.balance_of(&7), 250);
+    assert_eq!(h.client.balance_of_legacy(&7), 250);
     assert_eq!(balance(&h, &payee), 150);
 }
 
@@ -574,12 +608,12 @@ fn withdraw_via_multisig_rejects_when_not_yet_approved() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
     let (multisig_id, _signers) = setup_multisig(&h);
 
     let payee = Address::generate(&h.env);
     h.client
-        .withdraw_via_multisig(&multisig_id, &99u64, &7, &payee, &150);
+        .withdraw_via_multisig(&multisig_id, &99u64, &h.token, &lt(&h, 7), &payee, &150);
 }
 
 #[test]
@@ -588,7 +622,7 @@ fn withdraw_via_multisig_still_enforces_the_tags_own_balance_once_approved() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &7, &400);
+    h.client.deposit_legacy(&depositor, &7, &400);
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
@@ -600,7 +634,7 @@ fn withdraw_via_multisig_still_enforces_the_tags_own_balance_once_approved() {
     // tag 7 actually has earmarked.
     let payee = Address::generate(&h.env);
     h.client
-        .withdraw_via_multisig(&multisig_id, &action_id, &7, &payee, &401);
+        .withdraw_via_multisig(&multisig_id, &action_id, &h.token, &lt(&h, 7), &payee, &401);
 }
 
 // ─── cross-contract: transfer_tag_via_multisig ─────────────────────────────
@@ -610,7 +644,7 @@ fn transfer_tag_via_multisig_moves_escrow_once_approved() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &400);
+    h.client.deposit_legacy(&depositor, &1, &400);
 
     let (multisig_id, signers) = setup_multisig(&h);
     let multisig_client = MultisigClient::new(&h.env, &multisig_id);
@@ -618,12 +652,18 @@ fn transfer_tag_via_multisig_moves_escrow_once_approved() {
     multisig_client.approve(&signers[0], &action_id);
     multisig_client.approve(&signers[1], &action_id);
 
-    h.client
-        .transfer_tag_via_multisig(&multisig_id, &action_id, &1, &2, &150);
+    h.client.transfer_tag_via_multisig(
+        &multisig_id,
+        &action_id,
+        &h.token,
+        &lt(&h, 1),
+        &lt(&h, 2),
+        &150,
+    );
 
-    assert_eq!(h.client.balance_of(&1), 250);
-    assert_eq!(h.client.balance_of(&2), 150);
-    assert_eq!(h.client.get_total_escrowed(), 400); // unaffected by the reassignment
+    assert_eq!(h.client.balance_of_legacy(&1), 250);
+    assert_eq!(h.client.balance_of_legacy(&2), 150);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 400); // unaffected by the reassignment
 }
 
 #[test]
@@ -632,11 +672,17 @@ fn transfer_tag_via_multisig_rejects_when_not_yet_approved() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &400);
+    h.client.deposit_legacy(&depositor, &1, &400);
     let (multisig_id, _signers) = setup_multisig(&h);
 
-    h.client
-        .transfer_tag_via_multisig(&multisig_id, &99u64, &1, &2, &150);
+    h.client.transfer_tag_via_multisig(
+        &multisig_id,
+        &99u64,
+        &h.token,
+        &lt(&h, 1),
+        &lt(&h, 2),
+        &150,
+    );
 }
 
 // ─── cross-contract: sweep_untagged_via_multisig ───────────────────────────
@@ -646,7 +692,7 @@ fn sweep_untagged_via_multisig_recovers_once_approved() {
     let h = setup();
     let depositor = Address::generate(&h.env);
     mint(&h, &depositor, 1_000);
-    h.client.deposit(&depositor, &1, &400);
+    h.client.deposit_legacy(&depositor, &1, &400);
     // A stray direct transfer that bypassed deposit() entirely.
     mint(&h, &h.client.address, 100);
 
@@ -657,9 +703,9 @@ fn sweep_untagged_via_multisig_recovers_once_approved() {
     multisig_client.approve(&signers[1], &action_id);
 
     let recovered_to = Address::generate(&h.env);
-    let swept = h
-        .client
-        .sweep_untagged_via_multisig(&multisig_id, &action_id, &recovered_to);
+    let swept =
+        h.client
+            .sweep_untagged_via_multisig(&multisig_id, &action_id, &h.token, &recovered_to);
 
     assert_eq!(swept, 100);
     assert_eq!(balance(&h, &recovered_to), 100);
@@ -674,7 +720,474 @@ fn sweep_untagged_via_multisig_rejects_when_not_yet_approved() {
 
     let recovered_to = Address::generate(&h.env);
     h.client
-        .sweep_untagged_via_multisig(&multisig_id, &99u64, &recovered_to);
+        .sweep_untagged_via_multisig(&multisig_id, &99u64, &h.token, &recovered_to);
+}
+
+// ─── multi-token (#79) ──────────────────────────────────────────────────────
+
+#[test]
+fn tokens_are_isolated_per_tag_and_per_total() {
+    let h = setup();
+    let other = new_token(&h);
+    h.client.set_token_allowed(&other, &true);
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    token::StellarAssetClient::new(&h.env, &other).mint(&depositor, &1_000);
+    let t = lt(&h, 7);
+
+    h.client.deposit(&depositor, &h.token, &t, &400);
+    h.client.deposit(&depositor, &other, &t, &300);
+    h.client.withdraw(&other, &t, &depositor, &300);
+
+    assert_eq!(h.client.balance_of(&h.token, &t), 400);
+    assert_eq!(h.client.balance_of(&other, &t), 0);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 400);
+    assert_eq!(h.client.get_total_escrowed(&other), 0);
+    assert_eq!(balance(&h, &h.client.address), 400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // InsufficientEscrowBalance
+fn withdrawing_token_a_never_touches_token_b() {
+    let h = setup();
+    let other = new_token(&h);
+    h.client.set_token_allowed(&other, &true);
+    let depositor = Address::generate(&h.env);
+    token::StellarAssetClient::new(&h.env, &other).mint(&depositor, &1_000);
+    h.client.deposit(&depositor, &other, &lt(&h, 7), &300);
+
+    h.client.withdraw(&h.token, &lt(&h, 7), &depositor, &1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")] // TokenNotAllowed
+fn deposit_rejects_a_token_not_on_the_allowlist() {
+    let h = setup();
+    let other = new_token(&h);
+    let depositor = Address::generate(&h.env);
+    token::StellarAssetClient::new(&h.env, &other).mint(&depositor, &1_000);
+    h.client.deposit(&depositor, &other, &lt(&h, 7), &300);
+}
+
+#[test]
+fn removing_a_token_from_the_allowlist_keeps_existing_balances_withdrawable() {
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit_legacy(&depositor, &7, &400);
+
+    h.client.set_token_allowed(&h.token, &false);
+    assert!(!h.client.is_token_allowed(&h.token));
+    h.client.withdraw_legacy(&7, &depositor, &400);
+    assert_eq!(balance(&h, &depositor), 1_000);
+}
+
+// ─── namespaced tags (#83) ──────────────────────────────────────────────────
+
+#[test]
+fn two_kinds_with_the_same_id_are_isolated() {
+    let h = setup();
+    let integrator = Address::generate(&h.env);
+    h.client.set_integrator(&integrator, &true);
+    let series = tag(&integrator, "series", 7, &h.env);
+    let position = tag(&integrator, "position", 7, &h.env);
+    mint(&h, &integrator, 1_000);
+
+    h.client.deposit(&integrator, &h.token, &series, &400);
+    h.client.deposit(&integrator, &h.token, &position, &100);
+
+    assert_eq!(h.client.balance_of(&h.token, &series), 400);
+    assert_eq!(h.client.balance_of(&h.token, &position), 100);
+    // ...and neither aliases the legacy tag with the same id.
+    assert_eq!(h.client.balance_of_legacy(&7), 0);
+}
+
+#[test]
+fn two_integrators_with_the_same_kind_and_id_are_isolated() {
+    let h = setup();
+    let a = Address::generate(&h.env);
+    let b = Address::generate(&h.env);
+    h.client.set_integrator(&a, &true);
+    h.client.set_integrator(&b, &true);
+    mint(&h, &a, 1_000);
+    mint(&h, &b, 1_000);
+
+    h.client
+        .deposit(&a, &h.token, &tag(&a, "series", 7, &h.env), &400);
+    h.client
+        .deposit(&b, &h.token, &tag(&b, "series", 7, &h.env), &100);
+
+    assert_eq!(
+        h.client.balance_of(&h.token, &tag(&a, "series", 7, &h.env)),
+        400
+    );
+    assert_eq!(
+        h.client.balance_of(&h.token, &tag(&b, "series", 7, &h.env)),
+        100
+    );
+}
+
+// ─── tag ownership (#80) ────────────────────────────────────────────────────
+
+#[test]
+fn first_deposit_records_the_tag_owner() {
+    let h = setup();
+    let integrator = Address::generate(&h.env);
+    h.client.set_integrator(&integrator, &true);
+    let t = tag(&integrator, "series", 1, &h.env);
+    assert_eq!(h.client.get_tag_owner(&t), None);
+
+    // An end user deposits into the integrator's tag; the integrator
+    // still owns it.
+    let user = Address::generate(&h.env);
+    mint(&h, &user, 1_000);
+    h.client.deposit(&user, &h.token, &t, &400);
+    assert_eq!(h.client.get_tag_owner(&t), Some(integrator));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")] // UnregisteredIntegrator
+fn an_unregistered_integrator_cannot_create_tags() {
+    let h = setup();
+    let rogue = Address::generate(&h.env);
+    mint(&h, &rogue, 1_000);
+    h.client
+        .deposit(&rogue, &h.token, &tag(&rogue, "series", 1, &h.env), &400);
+}
+
+#[test]
+fn withdraw_requires_the_tag_owner_not_the_admin() {
+    let h = setup();
+    let integrator = Address::generate(&h.env);
+    h.client.set_integrator(&integrator, &true);
+    mint(&h, &integrator, 1_000);
+    let t = tag(&integrator, "series", 1, &h.env);
+    h.client.deposit(&integrator, &h.token, &t, &400);
+
+    h.client.withdraw(&h.token, &t, &integrator, &100);
+
+    let auths = h.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, integrator);
+}
+
+#[test]
+fn transfer_tag_across_owners_requires_both_owners() {
+    let h = setup();
+    let a = Address::generate(&h.env);
+    let b = Address::generate(&h.env);
+    h.client.set_integrator(&a, &true);
+    h.client.set_integrator(&b, &true);
+    mint(&h, &a, 1_000);
+    mint(&h, &b, 1_000);
+    let ta = tag(&a, "series", 1, &h.env);
+    let tb = tag(&b, "series", 1, &h.env);
+    h.client.deposit(&a, &h.token, &ta, &400);
+    h.client.deposit(&b, &h.token, &tb, &100);
+
+    h.client.transfer_tag(&h.token, &ta, &tb, &150);
+
+    let auths = h.env.auths();
+    assert!(auths.iter().any(|(signer, _)| *signer == a));
+    assert!(auths.iter().any(|(signer, _)| *signer == b));
+    assert_eq!(h.client.balance_of(&h.token, &tb), 250);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // InsufficientEscrowBalance
+fn withdraw_from_a_never_created_tag_panics() {
+    let h = setup();
+    let integrator = Address::generate(&h.env);
+    h.client.withdraw(
+        &h.token,
+        &tag(&integrator, "series", 1, &h.env),
+        &integrator,
+        &1,
+    );
+}
+
+// ─── balance-delta accounting / shortfall (#82) ─────────────────────────────
+
+/// Minimal token that burns 10% of every transfer, to exercise
+/// balance-delta crediting in deposit().
+mod fee_token {
+    use soroban_sdk::{contract, contractimpl, Address, Env};
+
+    #[contract]
+    pub struct FeeToken;
+
+    #[contractimpl]
+    impl FeeToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let b: i128 = env.storage().instance().get(&to).unwrap_or(0);
+            env.storage().instance().set(&to, &(b + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage().instance().get(&id).unwrap_or(0)
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            let fb: i128 = env.storage().instance().get(&from).unwrap_or(0);
+            let tb: i128 = env.storage().instance().get(&to).unwrap_or(0);
+            env.storage().instance().set(&from, &(fb - amount));
+            env.storage()
+                .instance()
+                .set(&to, &(tb + amount - amount / 10));
+        }
+    }
+}
+
+#[test]
+fn deposit_credits_the_measured_delta_for_a_fee_on_transfer_token() {
+    let h = setup();
+    let fee_token_id = h.env.register_contract(None, fee_token::FeeToken);
+    let fee_client = fee_token::FeeTokenClient::new(&h.env, &fee_token_id);
+    h.client.set_token_allowed(&fee_token_id, &true);
+    let depositor = Address::generate(&h.env);
+    fee_client.mint(&depositor, &1_000);
+
+    let credited = h
+        .client
+        .deposit(&depositor, &fee_token_id, &lt(&h, 7), &400);
+
+    assert_eq!(credited, 360);
+    assert_eq!(h.client.balance_of(&fee_token_id, &lt(&h, 7)), 360);
+    assert_eq!(h.client.get_total_escrowed(&fee_token_id), 360);
+    assert_eq!(h.client.get_shortfall(&fee_token_id), 0);
+}
+
+/// A clawback-enabled SAC, with 400 deposited under legacy tag 7 and
+/// then 150 clawed back from the vault's own balance.
+fn setup_clawed_back(h: &Harness) -> Address {
+    let token_admin = Address::generate(&h.env);
+    let sac = h.env.register_stellar_asset_contract_v2(token_admin);
+    sac.issuer()
+        .set_flag(soroban_sdk::testutils::IssuerFlags::RevocableFlag);
+    sac.issuer()
+        .set_flag(soroban_sdk::testutils::IssuerFlags::ClawbackEnabledFlag);
+    let clawback_token = sac.address();
+    h.client.set_token_allowed(&clawback_token, &true);
+
+    let depositor = Address::generate(&h.env);
+    let admin_client = token::StellarAssetClient::new(&h.env, &clawback_token);
+    admin_client.mint(&depositor, &1_000);
+    h.client
+        .deposit(&depositor, &clawback_token, &lt(h, 7), &400);
+    admin_client.clawback(&h.client.address, &150);
+    clawback_token
+}
+
+#[test]
+fn get_shortfall_reports_a_clawback() {
+    let h = setup();
+    let t = setup_clawed_back(&h);
+    assert_eq!(h.client.get_shortfall(&t), 150);
+    assert_eq!(h.client.get_shortfall(&h.token), 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")] // NoUntaggedFunds, not an arithmetic trap
+fn sweep_untagged_returns_no_untagged_funds_on_a_shortfall() {
+    let h = setup();
+    let t = setup_clawed_back(&h);
+    h.client.sweep_untagged(&t, &h.admin);
+}
+
+#[test]
+fn withdraw_emits_shortfall_detected_when_the_ledger_is_underbacked() {
+    let h = setup();
+    let t = setup_clawed_back(&h);
+    let payee = Address::generate(&h.env);
+
+    h.client.withdraw(&t, &lt(&h, 7), &payee, &100);
+
+    let events = h.env.events().all();
+    let shortfall_event = events
+        .iter()
+        .find(|(_, topics, _)| {
+            Symbol::try_from_val(&h.env, &topics.get(0).unwrap()).unwrap()
+                == Symbol::new(&h.env, "shortfall_detected")
+        })
+        .unwrap();
+    assert_eq!(i128::try_from_val(&h.env, &shortfall_event.2).unwrap(), 150);
+    assert_eq!(h.client.balance_of(&t, &lt(&h, 7)), 300);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")] // InsufficientVaultBalance
+fn withdraw_beyond_the_actual_balance_fails_with_a_clear_error() {
+    let h = setup();
+    let t = setup_clawed_back(&h);
+    h.client.withdraw(&t, &lt(&h, 7), &h.admin, &400);
+}
+
+// ─── legacy migration ───────────────────────────────────────────────────────
+
+#[test]
+fn migrate_legacy_moves_old_u64_entries_into_the_admins_legacy_namespace() {
+    use crate::types::LegacyKey;
+
+    let h = setup();
+    // Simulate a pre-upgrade vault: bare-u64 escrow entries and a single
+    // TotalEscrowed, backed by real tokens.
+    mint(&h, &h.client.address, 500);
+    h.env.as_contract(&h.client.address, || {
+        h.env
+            .storage()
+            .persistent()
+            .set(&LegacyKey::Escrow(1), &200i128);
+        h.env
+            .storage()
+            .persistent()
+            .set(&LegacyKey::Escrow(2), &300i128);
+        h.env
+            .storage()
+            .instance()
+            .set(&LegacyKey::TotalEscrowed, &500i128);
+    });
+
+    h.client.migrate_legacy(&vec![&h.env, 1u64, 2u64, 3u64]);
+
+    assert_eq!(h.client.balance_of_legacy(&1), 200);
+    assert_eq!(h.client.balance_of_legacy(&2), 300);
+    assert_eq!(h.client.get_total_escrowed(&h.token), 500);
+    assert_eq!(h.client.get_tag_owner(&lt(&h, 1)), Some(h.admin.clone()));
+    h.env.as_contract(&h.client.address, || {
+        assert!(!h.env.storage().persistent().has(&LegacyKey::Escrow(1)));
+        assert!(!h.env.storage().instance().has(&LegacyKey::TotalEscrowed));
+    });
+
+    // Migrated balances are withdrawable through the legacy wrappers.
+    let payee = Address::generate(&h.env);
+    h.client.withdraw_legacy(&2, &payee, &300);
+    assert_eq!(balance(&h, &payee), 300);
+}
+
+// ─── TTL policy (issue #98) and archival restore (issue #99) ────────────────
+
+fn advance_ledgers(env: &Env, ledgers: u32) {
+    use soroban_sdk::testutils::Ledger as _;
+    env.ledger().with_mut(|l| l.sequence_number += ledgers);
+}
+
+/// Whether `key` (a persistent entry, or the instance when `None`) of
+/// `contract` is still live. Accessing an archived entry through a
+/// client aborts the test rather than returning an error, so archival is
+/// checked straight against the ledger storage instead.
+fn is_live(env: &Env, contract: &Address, key: Option<crate::types::DataKey>) -> bool {
+    use soroban_sdk::xdr::{LedgerKey, ScAddress, ScVal};
+    use soroban_sdk::IntoVal;
+    let key = match key {
+        Some(key) => {
+            let val: soroban_sdk::Val = key.into_val(env);
+            ScVal::try_from_val(env, &val).unwrap()
+        }
+        None => ScVal::LedgerKeyContractInstance,
+    };
+    let contract = ScAddress::from(contract);
+    let seq = env.ledger().sequence();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (ledger_key, entry) in storage.map.clone() {
+                if let LedgerKey::ContractData(data) = ledger_key.as_ref() {
+                    if data.contract == contract && data.key == key {
+                        return Ok(
+                            matches!(entry, Some((_, Some(live_until))) if live_until >= seq),
+                        );
+                    }
+                }
+            }
+            Ok(false)
+        })
+        .unwrap()
+}
+
+/// Simulates a `RestoreFootprint` operation over every archived
+/// persistent entry: like the real operation, it brings the entry back
+/// with its stored value untouched and a fresh
+/// `min_persistent_entry_ttl` lifetime.
+fn restore_archived(env: &Env) {
+    use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::xdr::{ContractDataDurability, LedgerKey};
+    let seq = env.ledger().sequence();
+    let live_until = seq + env.ledger().get().min_persistent_entry_ttl - 1;
+    let budget = env.host().budget_cloned();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (key, entry) in storage.map.clone() {
+                let Some((entry, Some(old_live_until))) = entry else {
+                    continue;
+                };
+                if old_live_until >= seq {
+                    continue;
+                }
+                if let LedgerKey::ContractData(data) = key.as_ref() {
+                    if data.durability == ContractDataDurability::Temporary {
+                        continue;
+                    }
+                }
+                storage.put(&key, &entry, Some(live_until), &budget)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn ttl_policy_keeps_bumped_tags_live() {
+    use crate::{ttl, types::DataKey};
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &1_000);
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client
+            .bump(&soroban_sdk::vec![&h.env, DataKey::Escrow(7)]);
+    }
+    assert!(is_live(&h.env, &h.client.address, Some(DataKey::Escrow(7))));
+    assert_eq!(h.client.balance_of(&7), 1_000);
+}
+
+#[test]
+fn archived_tag_restores_and_withdraws_identically() {
+    use crate::{ttl, types::DataKey};
+    let h = setup();
+    let depositor = Address::generate(&h.env);
+    mint(&h, &depositor, 1_000);
+    h.client.deposit(&depositor, &7, &1_000);
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client.is_paused();
+    }
+    assert!(!is_live(
+        &h.env,
+        &h.client.address,
+        Some(DataKey::Escrow(7))
+    ));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.balance_of(&7), 1_000);
+    let to = Address::generate(&h.env);
+    h.client.withdraw(&7, &to, &400);
+    assert_eq!(balance(&h, &to), 400);
+    assert_eq!(h.client.balance_of(&7), 600);
+}
+
+#[test]
+fn archived_instance_restores_admin_and_token() {
+    use crate::ttl;
+    let h = setup();
+    advance_ledgers(&h.env, ttl::INSTANCE_BUMP_AMOUNT + 1);
+    assert!(!is_live(&h.env, &h.client.address, None));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.get_admin(), h.admin);
+    assert_eq!(h.client.get_token(), h.token);
 }
 
 // ── ActiveTags index / verify_ledger (#84) ──────────────────────────────────

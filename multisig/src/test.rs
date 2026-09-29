@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use crate::{Multisig, MultisigClient};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger as _},
@@ -470,4 +472,130 @@ fn approve_without_any_authorization_panics() {
     );
 
     client.approve(&signers[0], &42);
+}
+
+// ─── TTL policy (issue #98) and archival restore (issue #99) ────────────────
+
+fn advance_ledgers(env: &Env, ledgers: u32) {
+    use soroban_sdk::testutils::Ledger as _;
+    env.ledger().with_mut(|l| l.sequence_number += ledgers);
+}
+
+/// Whether `key` (a persistent entry, or the instance when `None`) of
+/// `contract` is still live. Accessing an archived entry through a
+/// client aborts the test rather than returning an error, so archival is
+/// checked straight against the ledger storage instead.
+fn is_live(env: &Env, contract: &Address, key: Option<crate::types::DataKey>) -> bool {
+    use soroban_sdk::xdr::{LedgerKey, ScAddress, ScVal};
+    use soroban_sdk::IntoVal;
+    let key = match key {
+        Some(key) => {
+            let val: soroban_sdk::Val = key.into_val(env);
+            ScVal::try_from_val(env, &val).unwrap()
+        }
+        None => ScVal::LedgerKeyContractInstance,
+    };
+    let contract = ScAddress::from(contract);
+    let seq = env.ledger().sequence();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (ledger_key, entry) in storage.map.clone() {
+                if let LedgerKey::ContractData(data) = ledger_key.as_ref() {
+                    if data.contract == contract && data.key == key {
+                        return Ok(
+                            matches!(entry, Some((_, Some(live_until))) if live_until >= seq),
+                        );
+                    }
+                }
+            }
+            Ok(false)
+        })
+        .unwrap()
+}
+
+/// Simulates a `RestoreFootprint` operation over every archived
+/// persistent entry: like the real operation, it brings the entry back
+/// with its stored value untouched and a fresh
+/// `min_persistent_entry_ttl` lifetime.
+fn restore_archived(env: &Env) {
+    use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::xdr::{ContractDataDurability, LedgerKey};
+    let seq = env.ledger().sequence();
+    let live_until = seq + env.ledger().get().min_persistent_entry_ttl - 1;
+    let budget = env.host().budget_cloned();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (key, entry) in storage.map.clone() {
+                let Some((entry, Some(old_live_until))) = entry else {
+                    continue;
+                };
+                if old_live_until >= seq {
+                    continue;
+                }
+                if let LedgerKey::ContractData(data) = key.as_ref() {
+                    if data.durability == ContractDataDurability::Temporary {
+                        continue;
+                    }
+                }
+                storage.put(&key, &entry, Some(live_until), &budget)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn ttl_policy_keeps_approvals_live_and_bump_extends_them() {
+    use crate::{ttl, types::DataKey};
+    let h = setup();
+    h.client.approve(&h.signers[0], &7);
+    let addr = h.client.address.clone();
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client
+            .bump(&vec![&h.env, DataKey::Approval(7, h.signers[0].clone())]);
+    }
+    assert!(is_live(&h.env, &addr, None));
+    assert!(is_live(
+        &h.env,
+        &addr,
+        Some(DataKey::Approval(7, h.signers[0].clone()))
+    ));
+    assert!(h.client.has_approved(&7, &h.signers[0]));
+}
+
+#[test]
+fn archived_approval_restores_and_counts_identically() {
+    use crate::{ttl, types::DataKey};
+    let h = setup();
+    h.client.approve(&h.signers[0], &7);
+    let addr = h.client.address.clone();
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client.get_threshold();
+    }
+    assert!(!is_live(
+        &h.env,
+        &addr,
+        Some(DataKey::Approval(7, h.signers[0].clone()))
+    ));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.get_approval_count(&7), 1);
+    h.client.approve(&h.signers[1], &7);
+    assert!(h.client.is_approved(&7));
+}
+
+#[test]
+fn archived_instance_restores_signers_and_threshold() {
+    use crate::ttl;
+    let h = setup();
+    advance_ledgers(&h.env, ttl::INSTANCE_BUMP_AMOUNT + 1);
+    assert!(!is_live(&h.env, &h.client.address, None));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.get_signer_count(), 3);
+    assert_eq!(h.client.get_threshold(), 2);
 }

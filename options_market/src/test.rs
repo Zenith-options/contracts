@@ -1,13 +1,21 @@
 #![cfg(test)]
 
-use crate::{OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
+extern crate std;
+
+use crate::types::DataKey;
+use crate::{ttl, OptionSeries, OptionType, OptionsMarket, OptionsMarketClient, PositionSide};
 use multisig::{Multisig, MultisigClient};
+use params::{Params, ParamsClient};
 use price_oracle::{PriceOracle, PriceOracleClient};
 use soroban_sdk::{
-    testutils::{Address as _, Events as _, Ledger},
-    token, Address, BytesN, Env, Symbol, TryFromVal,
+    symbol_short,
+    testutils::{
+        storage::{Instance as _, Persistent as _},
+        Address as _, Events as _, Ledger,
+    },
+    token, vec, Address, BytesN, Env, IntoVal, Symbol, TryFromVal,
 };
-use vault::{Vault, VaultClient};
+use vault::{Tag, Vault, VaultClient};
 
 const USDC_DECIMALS: i128 = 10_000_000; // matches PRICE_PRECISION
 
@@ -1013,16 +1021,25 @@ fn cancel_series_rejects_an_already_cancelled_series() {
 // ─── cross-contract: escrow_series_to_vault / claim_refund_from_vault ──────
 
 /// Deploys a real vault contract in the SAME Env as the options market
-/// under test, with its OWN admin set to the options market's contract
-/// address — the precondition escrow_series_to_vault/claim_refund_from_-
-/// vault's doc comments require, so options_market's cross-contract
-/// deposit()/withdraw() calls satisfy vault's own auth checks the same
-/// way any contract-to-contract call does (see vault's own docs).
+/// under test, with the options market registered as an integrator — the
+/// precondition escrow_series_to_vault/claim_refund_from_vault's doc
+/// comments require, so options_market owns its `(self, "series", id)`
+/// tags and its cross-contract deposit()/withdraw() calls satisfy vault's
+/// tag-owner auth checks the same way any contract-to-contract call does.
 fn setup_vault(h: &Harness) -> Address {
     let contract_id = h.env.register_contract(None, Vault);
     let client = VaultClient::new(&h.env, &contract_id);
-    client.initialize(&h.client.address, &h.token);
+    client.initialize(&Address::generate(&h.env), &h.token);
+    client.set_integrator(&h.client.address, &true);
     contract_id
+}
+
+fn series_tag(h: &Harness, series_id: u64) -> Tag {
+    Tag {
+        owner: h.client.address.clone(),
+        kind: Symbol::new(&h.env, "series"),
+        id: series_id,
+    }
 }
 
 #[test]
@@ -1048,12 +1065,18 @@ fn escrow_then_claim_refund_from_vault_pays_buyer_net_of_fee() {
     assert_eq!(h.client.get_series_escrow(&series_id), 0);
     // ...and now sitting in the vault, tagged by series_id.
     let vault_client = VaultClient::new(&h.env, &vault_id);
-    assert_eq!(vault_client.balance_of(&series_id), 39_800_000);
+    assert_eq!(
+        vault_client.balance_of(&h.token, &series_tag(&h, series_id)),
+        39_800_000
+    );
 
     let before = balance(&h, &buyer);
     h.client.claim_refund_from_vault(&vault_id, &buyer, &pos_id);
     assert_eq!(balance(&h, &buyer) - before, 39_800_000);
-    assert_eq!(vault_client.balance_of(&series_id), 0);
+    assert_eq!(
+        vault_client.balance_of(&h.token, &series_tag(&h, series_id)),
+        0
+    );
     assert!(h.client.get_position(&pos_id).unwrap().is_settled);
 }
 
@@ -1162,7 +1185,10 @@ fn escrow_series_to_vault_only_moves_the_remaining_liability() {
     h.client.escrow_series_to_vault(&vault_id, &series_id);
     let vault_client = VaultClient::new(&h.env, &vault_id);
     // Only buyer_b's still-outstanding refund moved — not double pos_a's.
-    assert_eq!(vault_client.balance_of(&series_id), 39_800_000);
+    assert_eq!(
+        vault_client.balance_of(&h.token, &series_tag(&h, series_id)),
+        39_800_000
+    );
 
     let before = balance(&h, &buyer_b);
     h.client
@@ -1933,4 +1959,250 @@ fn collateral_reclaimed_event_carries_position_and_amount() {
     let (event_pos_id, reclaim) = <(u64, i128)>::try_from_val(&h.env, &data).unwrap();
     assert_eq!(event_pos_id, pos_id);
     assert_eq!(reclaim, 700_000_000); // full collateral back, OTM means no payout owed
+}
+
+// ─── Params registry (issue #95) ─────────────────────────────────────────────
+
+fn setup_registry(h: &Harness) -> ParamsClient<'static> {
+    let registry = ParamsClient::new(&h.env, &h.env.register_contract(None, Params));
+    registry.initialize(&Address::generate(&h.env));
+    registry
+}
+
+#[test]
+fn registry_values_override_local_fee_and_window() {
+    let h = setup();
+    let registry = setup_registry(&h);
+    registry.define_param(&symbol_short!("fee_bps"), &100, &0, &1_000);
+    registry.define_param(&symbol_short!("settle_w"), &3_600, &60, &604_800);
+    h.client.set_params_registry(&registry.address);
+
+    assert_eq!(h.client.get_fee_rate(), 100);
+    assert_eq!(h.client.get_settlement_window(), 3_600);
+
+    registry.set_param(&symbol_short!("fee_bps"), &200);
+    assert_eq!(h.client.get_fee_rate(), 200);
+}
+
+#[test]
+fn registry_values_are_cached_until_the_version_moves() {
+    let h = setup();
+    let registry = setup_registry(&h);
+    registry.define_param(&symbol_short!("fee_bps"), &100, &0, &1_000);
+    h.client.set_params_registry(&registry.address);
+    assert_eq!(h.client.get_fee_rate(), 100);
+
+    // A local write sticks while the cached registry version is current...
+    h.client.set_fee_rate(&300);
+    assert_eq!(h.client.get_fee_rate(), 300);
+
+    // ...and the registry wins again as soon as its version moves.
+    registry.set_param(&symbol_short!("fee_bps"), &150);
+    assert_eq!(h.client.get_fee_rate(), 150);
+}
+
+#[test]
+fn unset_registry_param_keeps_the_local_default() {
+    let h = setup();
+    let registry = setup_registry(&h);
+    registry.define_param(&symbol_short!("fee_bps"), &100, &0, &1_000);
+    h.client.set_params_registry(&registry.address);
+    assert_eq!(h.client.get_settlement_window(), 86_400);
+}
+
+#[test]
+fn unavailable_registry_falls_back_to_the_cached_value() {
+    let h = setup();
+    h.client.set_fee_rate(&70);
+    h.client.set_params_registry(&Address::generate(&h.env));
+    assert_eq!(h.client.get_fee_rate(), 70);
+    assert_eq!(h.client.get_settlement_window(), 86_400);
+}
+
+#[test]
+fn registry_settlement_window_closes_exercise_early() {
+    let h = setup();
+    let registry = setup_registry(&h);
+    registry.define_param(&symbol_short!("settle_w"), &3_600, &60, &604_800);
+    h.client.set_params_registry(&registry.address);
+
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+    let expiry = h.client.get_series(&series_id).unwrap().expiry;
+    h.env.ledger().with_mut(|l| l.timestamp = expiry);
+    h.client.set_settlement_price(&series_id, &750_000_000);
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    h.env.ledger().with_mut(|l| l.timestamp = expiry + 3_601);
+    assert!(h.client.try_exercise(&buyer, &pos_id).is_err());
+}
+
+// ─── TTL policy (issue #98) and archival restore (issue #99) ────────────────
+
+fn advance_ledgers(env: &Env, ledgers: u32) {
+    env.ledger().with_mut(|l| l.sequence_number += ledgers);
+}
+
+/// Simulates a `RestoreFootprint` operation over every archived
+/// persistent entry: like the real operation, it brings the entry back
+/// with its stored value untouched and a fresh
+/// `min_persistent_entry_ttl` lifetime.
+fn restore_archived(env: &Env) {
+    use soroban_sdk::xdr::{ContractDataDurability, LedgerKey};
+    let seq = env.ledger().sequence();
+    let live_until = seq + env.ledger().get().min_persistent_entry_ttl - 1;
+    let budget = env.host().budget_cloned();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (key, entry) in storage.map.clone() {
+                let Some((entry, Some(old_live_until))) = entry else {
+                    continue;
+                };
+                if old_live_until >= seq {
+                    continue;
+                }
+                if let LedgerKey::ContractData(data) = key.as_ref() {
+                    if data.durability == ContractDataDurability::Temporary {
+                        continue;
+                    }
+                }
+                storage.put(&key, &entry, Some(live_until), &budget)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Whether `key` (a persistent entry, or the instance when `None`) of
+/// `contract` is still live. Accessing an archived entry through a
+/// client aborts the test rather than returning an error, so archival is
+/// checked straight against the ledger storage instead.
+fn is_live(env: &Env, contract: &Address, key: Option<DataKey>) -> bool {
+    use soroban_sdk::xdr::{LedgerKey, ScAddress, ScVal};
+    let key = match key {
+        Some(key) => {
+            let val: soroban_sdk::Val = key.into_val(env);
+            ScVal::try_from_val(env, &val).unwrap()
+        }
+        None => ScVal::LedgerKeyContractInstance,
+    };
+    let contract = ScAddress::from(contract);
+    let seq = env.ledger().sequence();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (ledger_key, entry) in storage.map.clone() {
+                if let LedgerKey::ContractData(data) = ledger_key.as_ref() {
+                    if data.contract == contract && data.key == key {
+                        return Ok(
+                            matches!(entry, Some((_, Some(live_until))) if live_until >= seq),
+                        );
+                    }
+                }
+            }
+            Ok(false)
+        })
+        .unwrap()
+}
+
+#[test]
+fn ttl_policy_keeps_touched_entries_live() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    h.env.as_contract(&h.client.address, || {
+        assert_eq!(
+            h.env.storage().instance().get_ttl(),
+            ttl::INSTANCE_BUMP_AMOUNT
+        );
+        assert_eq!(
+            h.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Position(pos_id)),
+            ttl::PERSISTENT_BUMP_AMOUNT
+        );
+    });
+
+    // 100 days: past both the network's default TTL and a single bump.
+    // Reading the position and keeper-bumping the series keep both live.
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client.get_position(&pos_id).unwrap();
+        h.client.bump(&vec![&h.env, DataKey::Series(series_id)]);
+    }
+    assert!(h.client.get_series(&series_id).is_some());
+    assert_eq!(h.client.get_position(&pos_id).unwrap().owner, buyer);
+
+    // Nothing touched UserPositions, so it has archived.
+    assert!(!is_live(
+        &h.env,
+        &h.client.address,
+        Some(DataKey::UserPositions(buyer))
+    ));
+}
+
+#[test]
+fn archived_position_restores_and_exercises_identically() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    // Keep the instance alive but let the position, series and user
+    // index lapse — a dormant owner.
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client.is_paused();
+    }
+    let addr = &h.client.address;
+    assert!(is_live(&h.env, addr, None));
+    assert!(!is_live(&h.env, addr, Some(DataKey::Position(pos_id))));
+    assert!(!is_live(&h.env, addr, Some(DataKey::Series(series_id))));
+
+    restore_archived(&h.env);
+
+    let position = h.client.get_position(&pos_id).unwrap();
+    assert_eq!(position.owner, buyer);
+    assert_eq!(position.contracts, USDC_DECIMALS);
+    assert!(!position.is_exercised);
+    assert_eq!(h.client.get_user_positions(&buyer), vec![&h.env, pos_id]);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &750_000_000);
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+    let before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &pos_id);
+    // Same payout as exercise_itm_call_pays_out_the_intrinsic_value.
+    assert_eq!(balance(&h, &buyer) - before, 50_000_000);
+}
+
+#[test]
+fn archived_instance_restores_the_whole_contract() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    advance_ledgers(&h.env, ttl::INSTANCE_BUMP_AMOUNT + 1);
+    assert!(!is_live(&h.env, &h.client.address, None));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.get_admin(), h.admin);
+    assert_eq!(h.client.get_fee_rate(), 50);
+    assert_eq!(
+        h.client.get_series(&series_id).unwrap().strike_price,
+        700_000_000
+    );
+    make_series(&h, OptionType::Put, 700_000_000, 40_000_000);
 }

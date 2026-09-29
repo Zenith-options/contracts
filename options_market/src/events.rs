@@ -101,6 +101,26 @@ pub fn refund_claimed(env: &Env, owner: Address, position_id: u64, amount: i128)
     );
 }
 
+pub fn position_transferred(env: &Env, from: Address, to: Address, position_id: u64) {
+    env.events().publish(
+        (Symbol::new(env, "position_transferred"), from, to),
+        position_id,
+    );
+}
+
+pub fn position_split(
+    env: &Env,
+    owner: Address,
+    position_id: u64,
+    new_position_id: u64,
+    split_contracts: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "position_split"), owner),
+        (position_id, new_position_id, split_contracts),
+    );
+}
+
 pub fn fee_rate_updated(env: &Env, new_bps: i128) {
     env.events()
         .publish((Symbol::new(env, "fee_rate_updated"),), new_bps);
@@ -112,3 +132,24 @@ pub fn series_escrowed_to_vault(env: &Env, series_id: u64, amount: i128) {
         amount,
     );
 }
+
+pub fn payout_forfeited(env: &Env, owner: Address, position_id: u64, amount: i128) {
+    env.events().publish(
+        (Symbol::new(env, "payout_forfeited"), owner),
+        (position_id, amount),
+    );
+}
+
+pub fn option_auto_exercised(
+    env: &Env,
+    owner: Address,
+    position_id: u64,
+    settlement_price: i128,
+    payout: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "option_auto_exercised"), owner),
+        (position_id, settlement_price, payout),
+    );
+}
+
