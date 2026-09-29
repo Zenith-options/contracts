@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use crate::{PriceOracle, PriceOracleClient};
 use multisig::{Multisig, MultisigClient};
 use soroban_sdk::{
@@ -754,4 +756,140 @@ fn remove_feeder_via_multisig_rejects_when_not_yet_approved() {
 
 fn aid(env: &Env, n: u8) -> BytesN<32> {
     BytesN::from_array(env, &[n; 32])
+}
+
+// ─── TTL policy (issue #98) and archival restore (issue #99) ────────────────
+
+fn advance_ledgers(env: &Env, ledgers: u32) {
+    use soroban_sdk::testutils::Ledger as _;
+    env.ledger().with_mut(|l| l.sequence_number += ledgers);
+}
+
+/// Whether `key` (a persistent entry, or the instance when `None`) of
+/// `contract` is still live. Accessing an archived entry through a
+/// client aborts the test rather than returning an error, so archival is
+/// checked straight against the ledger storage instead.
+fn is_live(env: &Env, contract: &Address, key: Option<crate::types::DataKey>) -> bool {
+    use soroban_sdk::xdr::{LedgerKey, ScAddress, ScVal};
+    use soroban_sdk::IntoVal;
+    let key = match key {
+        Some(key) => {
+            let val: soroban_sdk::Val = key.into_val(env);
+            ScVal::try_from_val(env, &val).unwrap()
+        }
+        None => ScVal::LedgerKeyContractInstance,
+    };
+    let contract = ScAddress::from(contract);
+    let seq = env.ledger().sequence();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (ledger_key, entry) in storage.map.clone() {
+                if let LedgerKey::ContractData(data) = ledger_key.as_ref() {
+                    if data.contract == contract && data.key == key {
+                        return Ok(
+                            matches!(entry, Some((_, Some(live_until))) if live_until >= seq),
+                        );
+                    }
+                }
+            }
+            Ok(false)
+        })
+        .unwrap()
+}
+
+/// Simulates a `RestoreFootprint` operation over every archived
+/// persistent entry: like the real operation, it brings the entry back
+/// with its stored value untouched and a fresh
+/// `min_persistent_entry_ttl` lifetime.
+fn restore_archived(env: &Env) {
+    use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::xdr::{ContractDataDurability, LedgerKey};
+    let seq = env.ledger().sequence();
+    let live_until = seq + env.ledger().get().min_persistent_entry_ttl - 1;
+    let budget = env.host().budget_cloned();
+    env.host()
+        .with_mut_storage(|storage| {
+            for (key, entry) in storage.map.clone() {
+                let Some((entry, Some(old_live_until))) = entry else {
+                    continue;
+                };
+                if old_live_until >= seq {
+                    continue;
+                }
+                if let LedgerKey::ContractData(data) = key.as_ref() {
+                    if data.durability == ContractDataDurability::Temporary {
+                        continue;
+                    }
+                }
+                storage.put(&key, &entry, Some(live_until), &budget)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn ttl_policy_keeps_read_prices_live() {
+    use crate::{ttl, types::DataKey};
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    let xlm = Symbol::new(&h.env, "XLM");
+    h.client.add_feeder(&feeder);
+    h.client.report_price(&feeder, &xlm, &1_000_000);
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client.get_latest_report(&xlm, &feeder);
+    }
+    assert!(is_live(
+        &h.env,
+        &h.client.address,
+        Some(DataKey::PriceReport(xlm.clone(), feeder.clone()))
+    ));
+    assert_eq!(
+        h.client.get_latest_report(&xlm, &feeder).unwrap().0,
+        1_000_000
+    );
+}
+
+#[test]
+fn archived_price_report_restores_identically() {
+    use crate::{ttl, types::DataKey};
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    let xlm = Symbol::new(&h.env, "XLM");
+    h.client.add_feeder(&feeder);
+    h.client.report_price(&feeder, &xlm, &1_000_000);
+    let before = h.client.get_price(&xlm);
+    for _ in 0..5 {
+        advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
+        h.client.is_paused();
+    }
+    assert!(!is_live(
+        &h.env,
+        &h.client.address,
+        Some(DataKey::PriceReport(xlm.clone(), feeder.clone()))
+    ));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.get_price(&xlm), before);
+    assert_eq!(
+        h.client.get_latest_report(&xlm, &feeder).unwrap().0,
+        1_000_000
+    );
+}
+
+#[test]
+fn archived_instance_restores_feeders_and_admin() {
+    use crate::ttl;
+    let h = setup();
+    let feeder = Address::generate(&h.env);
+    h.client.add_feeder(&feeder);
+    advance_ledgers(&h.env, ttl::INSTANCE_BUMP_AMOUNT + 1);
+    assert!(!is_live(&h.env, &h.client.address, None));
+
+    restore_archived(&h.env);
+
+    assert_eq!(h.client.get_admin(), h.admin);
+    assert!(h.client.is_feeder(&feeder));
 }

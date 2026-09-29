@@ -31,6 +31,7 @@ mod test;
 
 mod error;
 mod events;
+mod ttl;
 mod types;
 
 use error::Error;
@@ -55,6 +56,16 @@ pub struct Multisig;
 
 #[contractimpl]
 impl Multisig {
+    /// Permissionless keeper entrypoint: extends the contract instance and
+    /// every named persistent entry that exists, per the TTL policy in
+    /// ttl.rs. Anyone may pay the rent to keep long-lived entries alive.
+    pub fn bump(env: Env, keys: Vec<DataKey>) {
+        ttl::extend_instance(&env);
+        for key in keys.iter() {
+            ttl::extend_persistent_if_present(&env, &key);
+        }
+    }
+
     /// Deliberately does NOT call require_auth() on any signer, unlike
     /// every other contract's initialize() here requiring its incoming
     /// admin's signature. Naming an address as a signer costs an
@@ -75,6 +86,7 @@ impl Multisig {
     /// silently still be sitting at threshold if that `action_id` is
     /// ever reused.
     pub fn initialize(env: Env, signers: Vec<Address>, threshold: u32, approval_ttl: u64) {
+        ttl::extend_instance(&env);
         if env.storage().instance().has(&DataKey::Signers) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
@@ -99,20 +111,24 @@ impl Multisig {
     }
 
     pub fn is_signer(env: Env, address: Address) -> bool {
+        ttl::extend_instance(&env);
         let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
         signers.contains(&address)
     }
 
     pub fn get_signer_count(env: Env) -> u32 {
+        ttl::extend_instance(&env);
         let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
         signers.len()
     }
 
     pub fn get_threshold(env: Env) -> u32 {
+        ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::Threshold).unwrap()
     }
 
     pub fn get_approval_ttl(env: Env) -> u64 {
+        ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::ApprovalTtl).unwrap()
     }
 
@@ -126,7 +142,8 @@ impl Multisig {
     /// The first approval of an unregistered `action_id` registers it
     /// (proposer = this signer, zero description hash). An action that
     /// was already executed can never be approved again.
-    pub fn approve(env: Env, signer: Address, action_id: BytesN<32>) {
+    pub fn approve(env: Env, signer: Address, action_id: u64) {
+        ttl::extend_instance(&env);
         signer.require_auth();
         Self::require_signer(&env, &signer);
 
@@ -146,8 +163,9 @@ impl Multisig {
         if Self::has_approved(env.clone(), action_id.clone(), signer.clone()) {
             panic_with_error!(&env, Error::AlreadyApproved);
         }
-        env.storage().persistent().set(
-            &DataKey::Approval(action_id.clone(), signer.clone()),
+        ttl::set_persistent(
+            &env,
+            &DataKey::Approval(action_id, signer.clone()),
             &env.ledger().timestamp(),
         );
         events::approved(&env, signer, action_id, meta.description_hash);
@@ -157,7 +175,22 @@ impl Multisig {
     /// approved before new information came in and want to reconsider.
     /// An already-expired approval has nothing left to withdraw, so this
     /// rejects it the same as a signer who never approved at all.
-    pub fn revoke(env: Env, signer: Address, action_id: BytesN<32>) {
+    pub fn revoke(env: Env, signer: Address, action_id: u64) {
+        ttl::extend_instance(&env);
+
+        signer.require_auth();
+
+        if !Self::has_approved(env.clone(), action_id.clone(), signer.clone()) {
+            panic_with_error!(&env, Error::NotYetApproved);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Approval(action_id.clone(), signer.clone()));
+        let hash = Self::description_hash(&env, &action_id);
+        events::revoked(&env, signer, action_id, hash);
+    }
+
+    /// True only if `signer` approved `action_id` AND that approval
         signer.require_auth();
 
         if !Self::has_approved(env.clone(), action_id.clone(), signer.clone()) {
@@ -172,11 +205,10 @@ impl Multisig {
 
     /// True only if `signer` approved `action_id` AND that approval
     /// hasn't expired under `approval_ttl` (zero ttl = never expires).
-    pub fn has_approved(env: Env, action_id: BytesN<32>, signer: Address) -> bool {
-        let approved_at: Option<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Approval(action_id, signer));
+    pub fn has_approved(env: Env, action_id: u64, signer: Address) -> bool {
+        ttl::extend_instance(&env);
+        let approved_at: Option<u64> =
+            ttl::get_persistent(&env, &DataKey::Approval(action_id, signer));
         let Some(approved_at) = approved_at else {
             return false;
         };
@@ -196,7 +228,9 @@ impl Multisig {
     /// counter, since an approval can go stale purely from time passing,
     /// with no revoke() transaction to update a counter at the moment it
     /// happens.
-    pub fn get_approval_count(env: Env, action_id: BytesN<32>) -> u32 {
+    pub fn get_approval_count(env: Env, action_id: u64) -> u32 {
+        ttl::extend_instance(&env);
+
         let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
         let mut count = 0u32;
         for signer in signers.iter() {
@@ -207,7 +241,42 @@ impl Multisig {
         count
     }
 
-    pub fn is_approved(env: Env, action_id: BytesN<32>) -> bool {
+    pub fn is_approved(env: Env, action_id: u64) -> bool {
+        ttl::extend_instance(&env);
+        let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        let mut count = 0u32;
+        for signer in signers.iter() {
+            if Self::has_approved(env.clone(), action_id.clone(), signer) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn get_approval_count(env: Env, action_id: u64) -> u32 {
+        ttl::extend_instance(&env);
+        let signers: Vec<Address> = env.storage().instance().get(&DataKey::Signers).unwrap();
+        let mut count = 0u32;
+        for signer in signers.iter() {
+            if Self::has_approved(env.clone(), action_id.clone(), signer) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn is_approved(env: Env, action_id: u64) -> bool {
+        ttl::extend_instance(&env);
+        let count = Self::get_approval_count(env.clone(), action_id);
+        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
+        count >= threshold
+    }
+
+    /// Clears every signer's approval of `action_id` and resets its count
+    /// to zero — for whoever executed the underlying action to call once
+    /// it's done, so the same votes can't linger indefinitely and be
+    /// silently reused if `action_id` is ever reused for a future action
+    /// (e.g.
         let count = Self::get_approval_count(env.clone(), action_id);
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
         count >= threshold
