@@ -31,4 +31,5 @@ pub enum Error {
     PremiumBelowMinimum = 25,
     NotEligibleForForfeiture = 26,
     DuplicateSeries = 27,
+    InvalidSplitAmount = 28,
 }

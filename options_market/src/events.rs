@@ -101,6 +101,19 @@ pub fn refund_claimed(env: &Env, owner: Address, position_id: u64, amount: i128)
     );
 }
 
+pub fn position_split(
+    env: &Env,
+    owner: Address,
+    position_id: u64,
+    new_position_id: u64,
+    split_contracts: i128,
+) {
+    env.events().publish(
+        (Symbol::new(env, "position_split"), owner),
+        (position_id, new_position_id, split_contracts),
+    );
+}
+
 pub fn fee_rate_updated(env: &Env, new_bps: i128) {
     env.events()
         .publish((Symbol::new(env, "fee_rate_updated"),), new_bps);

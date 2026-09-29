@@ -173,6 +173,7 @@ documented per field.
 | `sweep_forfeited(position_id)` | Admin entrypoint to sweep unexercised ITM long payouts after the 90-day forfeiture deadline to the protocol treasury/fee recipient with a `payout_forfeited` event. |
 | `reclaim_collateral(writer, position_id)` | Short-side payout after settlement: locked collateral minus the max loss paid out to longs. |
 | `reclaim_batch(writer, position_ids)` | Batched `reclaim_collateral`, same all-or-nothing/`MAX_BATCH_SIZE` contract as `exercise_batch`. Returns the summed reclaim. |
+| `split_position(owner, position_id, split_contracts)` | Splits `split_contracts` (`0 < split < contracts`, else `InvalidSplitAmount`) off an open position into a new position with the same series, side and owner. `premium_paid`, `fee_paid` and `collateral_locked` are divided pro rata, rounded down for the new position with the remainder kept in the original, so every total (and `SeriesEscrow`, open interest) is unchanged. Blocked while paused and for exercised/settled positions. Returns the new position id. |
 | `claim_refund(owner, position_id)` | On a Cancelled series: buyers get their premium back (net of the fee already sent to `fee_recipient`), writers get their full collateral back. Paid directly from options_market's own balance. |
 | `claim_refund_from_vault(vault_contract, owner, position_id)` | Same eligibility checks and refund formula as `claim_refund`, but pays out of a deployed `vault`'s `series_id`-tagged escrow instead — see "Vault integration" below. Requires `escrow_series_to_vault` to have moved this series' liability into `vault` first. |
 
@@ -209,6 +210,7 @@ documented per field.
 | 12 | `ZeroContracts` | | 24 | `NothingToEscrow` |
 | | | | 25 | `NotEligibleForForfeiture` |
 | | | | 26 | `DuplicateSeries` |
+| | | | 27 | `InvalidSplitAmount` |
 
 ## `price_oracle` reference
 
