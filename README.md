@@ -45,6 +45,16 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   as a permissionless alternative to their own admin-gated
   `pause`/`unpause`/`transfer_admin`; see "Known gaps" below for what's
   still admin-only.
+- [`params/`](params) — a timelock-controlled registry of protocol
+  parameters, each with hard `[min, max]` bounds. `options_market`
+  reads its fee rate and settlement window from it (cached locally,
+  refreshed only when the registry version moves). See
+  "`params` reference" below for the parameter catalog.
+- [`grants_escrow/`](grants_escrow) — milestone-based escrow for
+  community grants and bounties: funded upfront, released per milestone
+  on reviewer quorum, reclaimable by the funder after a missed deadline
+  plus grace period. Operations guide:
+  [`docs/grants_escrow.md`](docs/grants_escrow.md).
 
 ## Building and testing
 
@@ -70,6 +80,9 @@ cargo build --target wasm32-unknown-unknown --release   # do this SECOND — opt
 cd ../vault
 cargo build --target wasm32-unknown-unknown --release   # do this THIRD — options_market needs it too, and vault itself needs multisig's wasm to already exist
 
+cd ../params
+cargo build --target wasm32-unknown-unknown --release   # options_market needs it too (no dependencies of its own)
+
 cd ../options_market   # now this crate can build/test/etc.
 cargo build                                   # native build, fast iteration
 cargo test                                    # unit tests (soroban-sdk testutils)
@@ -78,6 +91,7 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
+`params` and `grants_escrow` have no wasm dependencies of their own.
 `vault` only needs multisig's wasm built first, no other dependency of
 its own (options_market depending on vault's wasm doesn't run the other
 way). `multisig` itself has no dependency on anything else and can be
@@ -86,7 +100,7 @@ built/tested independently, in any order relative to the others.
 CI (`.github/workflows/ci.yml`) builds the required dependency wasm(s)
 first whenever a job is about to touch options_market, price_oracle,
 or vault, then runs the same four checks against every push and PR,
-for all four crates.
+for every crate.
 
 Every event any of these four contracts publishes has a test that
 decodes its actual payload via `TryFromVal` (topics and data), not
@@ -128,6 +142,27 @@ soroban contract invoke --id <contract-id> --source <admin> --network testnet --
   initialize --admin <admin-address>
 ```
 
+## Storage TTL policy
+
+Every contract extends its **instance** storage at the top of every
+entrypoint, and extends a **persistent** entry whenever it reads or
+writes it (`ttl.rs` in each crate). `extend_ttl` only charges rent once
+an entry's remaining TTL drops below the threshold, so the steady-state
+cost of a read is one TTL check. No contract uses temporary storage.
+Ledgers are ~5s, so one day ≈ 17,280 ledgers.
+
+| Class | Keys | Threshold | Extend to | Who pays |
+|---|---|---|---|---|
+| Instance | options_market: `Admin`, `Oracle`, `CollateralToken`, `FeeRecipient`, counters, `TotalPremiumsCollected`, `TotalOpenInterest`, `Paused`, `FeeRateBps`, `SeriesCountForUnderlying`, `PremiumPool`, `ParamsRegistry`, `ParamsVersion`, `SettlementWindow` · price_oracle: `Admin`, `Paused`, `MaxStaleness`, `MinReports`, `Feeders` · vault: `Admin`, `Token`, `Paused`, `TotalEscrowed` · multisig: `Signers`, `Threshold`, `ApprovalTtl` · params: `Timelock`, `Version` · grants_escrow: `GrantCounter` | 23 days | 30 days | Whoever invokes any entrypoint |
+| Persistent | options_market: `Series`, `Position`, `UserPositions`, `UnderlyingPrice`, `SeriesEscrow` · price_oracle: `PriceReport`, `AggregatedPrice` · vault: `Escrow` · multisig: `Approval` · params: `Param`, `PendingBounds` · grants_escrow: `Grant`, `Approval`, `GranteeGrants` | 60 days | 90 days | Whoever reads/writes the entry; keepers via `bump` |
+
+Every contract also exposes a permissionless `bump(keys: Vec<DataKey>)`
+that extends the instance plus each named persistent entry that exists,
+so a keeper can keep long-lived but idle entries (a long-dated series,
+a dormant position, an idle vault tag) from archiving. Entries that do
+archive anyway can be restored — see the
+[archival runbook](docs/runbooks/archival.md) and `scripts/restore/`.
+
 ## `options_market` reference
 
 All amounts are fixed-point at `PRICE_PRECISION` (1e7) unless noted —
@@ -148,9 +183,9 @@ documented per field.
 | `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `upgrade(new_wasm_hash)` | Swaps the contract's executable via Soroban's deployer, keeping the same address, ID, and storage. |
 | `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
-| `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out. Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. |
+| `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out; `premium` must be > 0 (`InvalidSeriesParams`). Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. Each `(underlying, option_type, strike_price, expiry)` spec can be listed once, ever (a cancelled or settled series still owns it): a second listing fails with `DuplicateSeries`. |
 | `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Same validation and per-underlying cap apply. |
-| `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. |
+| `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. `new_premium` must be > 0 (`InvalidSeriesParams`). |
 | `update_premium_via_multisig(multisig_contract, action_id, series_id, new_premium, new_implied_vol)` | Permissionless alternative to `update_premium`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
 | `cancel_series(series_id)` | Cancels an Active series. Position holders then call `claim_refund` individually — the admin doesn't push funds to everyone in one call, since that would scale badly against Soroban's per-call resource limits. |
 | `cancel_series_via_multisig(multisig_contract, action_id, series_id)` | Permissionless alternative to `cancel_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Cancelling disrupts every open position in a series, so gating it behind M-of-N is at least as warranted as pause. |
@@ -167,11 +202,15 @@ documented per field.
 | Function | Description |
 |---|---|
 | `buy_option(buyer, series_id, contracts, max_premium)` | Opens a Long position. `max_premium` is slippage protection. Premium (net of the protocol fee) funds the pool `write_option` pays writers from. |
-| `write_option(writer, series_id, contracts, collateral_amount)` | Opens a Short position. Collateral: notional value for calls, 110% of strike for puts. Premium is paid out of the pool buyers have funded — `InsufficientPremiumPool` if no buyer has paid in enough yet (a write can't be paid a "premium" out of its own just-deposited collateral). |
-| `exercise(owner, position_id)` | Long-side payout after expiry, within the 24h settlement window, if in the money. |
+| `write_option(writer, series_id, contracts, collateral_amount, min_premium)` | Opens a Short position. Collateral: notional value for calls, 110% of strike for puts. Premium is paid out of the pool buyers have funded — `InsufficientPremiumPool` if no buyer has paid in enough yet (a write can't be paid a "premium" out of its own just-deposited collateral). `min_premium` is slippage protection: `PremiumBelowMinimum` if the net premium the writer would receive (after the protocol fee) is below it, so an `update_premium` cut or fee increase ordered ahead of the write can't underpay the writer. Pass `0` to opt out. |
+| `exercise(owner, position_id)` | Long-side payout after expiry, within the 24h settlement window, if in the money. The 24h settlement window is a soft deadline (longs remain claimable until the 90-day forfeiture window). |
 | `exercise_batch(owner, position_ids)` | Same as `exercise`, for every id in `position_ids` in one call — for an owner with several long positions who'd otherwise need one transaction per position. All-or-nothing (any single id failing `exercise`'s own checks aborts the whole batch) and capped at `MAX_BATCH_SIZE` (25). Returns the summed payout. |
+| `settle_long(position_id)` | Permissionless auto-exercise / keeper settlement for in-the-money longs after settlement. Anyone can call; payout is unconditionally transferred to the position owner. |
+| `sweep_forfeited(position_id)` | Admin entrypoint to sweep unexercised ITM long payouts after the 90-day forfeiture deadline to the protocol treasury/fee recipient with a `payout_forfeited` event. |
 | `reclaim_collateral(writer, position_id)` | Short-side payout after settlement: locked collateral minus the max loss paid out to longs. |
 | `reclaim_batch(writer, position_ids)` | Batched `reclaim_collateral`, same all-or-nothing/`MAX_BATCH_SIZE` contract as `exercise_batch`. Returns the summed reclaim. |
+| `transfer_position(from, to, position_id)` | Moves an open position to `to` (`from` must own it and sign); both parties' position lists are updated and `to` inherits exercise / reclaim / refund rights. Shorts are transferable because their collateral is already locked here, so `to` only gains the leftover-collateral reclaim. Rejected for exercised/settled positions and while paused; `to == from` is a no-op. Emits `position_transferred(from, to; position_id)`. |
+| `split_position(owner, position_id, split_contracts)` | Splits `split_contracts` (`0 < split < contracts`, else `InvalidSplitAmount`) off an open position into a new position with the same series, side and owner. `premium_paid`, `fee_paid` and `collateral_locked` are divided pro rata, rounded down for the new position with the remainder kept in the original, so every total (and `SeriesEscrow`, open interest) is unchanged. Blocked while paused and for exercised/settled positions. Returns the new position id. |
 | `claim_refund(owner, position_id)` | On a Cancelled series: buyers get their premium back (net of the fee already sent to `fee_recipient`), writers get their full collateral back. Paid directly from options_market's own balance. |
 | `claim_refund_from_vault(vault_contract, owner, position_id)` | Same eligibility checks and refund formula as `claim_refund`, but pays out of a deployed `vault`'s `series_id`-tagged escrow instead — see "Vault integration" below. Requires `escrow_series_to_vault` to have moved this series' liability into `vault` first. |
 
@@ -184,10 +223,11 @@ documented per field.
 ### Views
 
 `get_admin`, `is_paused`, `get_fee_rate`, `get_premium_pool`,
-`get_series_count_for_underlying`, `get_series`, `get_position`,
+`get_series_count_for_underlying`, `get_series_id`, `get_series`, `get_position`,
 `get_user_positions`, `get_underlying_price`, `get_series_escrow`
 (remaining not-yet-claimed refund liability for a series), `get_stats`
-(total premiums collected, total open interest, series count).
+(total premiums collected, total open interest, series count),
+`get_orphaned_liabilities`, `sync_orphaned_liabilities`.
 
 ### Errors
 
@@ -205,6 +245,9 @@ documented per field.
 | 10 | `AlreadySettled` | | 22 | `InvalidSeriesParams` |
 | 11 | `ExerciseWindowClosed` | | 23 | `InvalidBatchSize` |
 | 12 | `ZeroContracts` | | 24 | `NothingToEscrow` |
+| | | | 25 | `NotEligibleForForfeiture` |
+| | | | 26 | `DuplicateSeries` |
+| | | | 27 | `InvalidSplitAmount` |
 
 ## `price_oracle` reference
 
@@ -411,6 +454,57 @@ set, so a compromised signer can never add another compromised signer.
 | 4 | `NotASigner` |
 | 5 | `AlreadyApproved` |
 | 6 | `NotYetApproved` |
+
+## `params` reference
+
+All writes require the `timelock` address set at `initialize`. Values
+move freely inside their bounds; bounds themselves only move through a
+second, slower path (`BOUNDS_CHANGE_DELAY` = 7 days on top of the
+timelock's own delay), so widening the sanity envelope always takes
+longer than using it. Every change bumps `get_version()`.
+
+| Function | Description |
+|---|---|
+| `initialize(timelock)` | One-time setup. |
+| `define_param(key, value, min, max)` | Creates a parameter that has never been set. |
+| `set_param(key, value)` | Moves the value within `[min, max]`. Emits `param_updated(key, old, new)`. |
+| `propose_bounds(key, min, max)` | Queues new bounds (must still contain the current value), executable after `BOUNDS_CHANGE_DELAY`. |
+| `execute_bounds(key)` / `cancel_bounds(key)` | Applies or drops the queued bounds change. |
+
+Views: `get_param(key) -> Option<{value, min, max, updated_at}>`,
+`get_value(key)`, `get_pending_bounds(key)`, `get_version()`,
+`get_timelock()`. Events: `param_defined`, `param_updated`,
+`bounds_proposed`, `bounds_updated`, `bounds_cancelled`.
+
+### Parameter catalog
+
+| Key | Consumer | Unit | Suggested bounds | Default when unset |
+|---|---|---|---|---|
+| `fee_bps` | options_market fee rate | basis points | `[0, 1000]` | local `FeeRateBps` (50) |
+| `settle_w` | options_market exercise window after expiry | seconds | `[3600, 604800]` | 86,400 |
+
+options_market points at a registry via admin-only
+`set_params_registry(registry)`. It caches both values in instance
+storage with the registry version and only re-reads them when the
+version moves. An unreachable registry, an unset key, or a value
+outside options_market's own hard limits (`MAX_FEE_RATE_BPS`, window > 0)
+leaves the cached value in place. Other parameters (oracle staleness,
+`min_reports`, OI caps, ...) are follow-ups.
+
+## `grants_escrow` reference
+
+| Function | Description |
+|---|---|
+| `create_grant(funder, grantee, token, milestones: Vec<(amount, deadline)>, reviewers, quorum) -> u64` | Funds the grant upfront. Rejects a reviewer who is also the grantee, duplicate reviewers, a quorum outside `1..=reviewers`, and non-positive amounts or past deadlines. |
+| `submit_milestone(grant_id, idx, evidence_hash)` | Grantee only, before the milestone's deadline. |
+| `approve_milestone(grant_id, idx, reviewer)` | One approval per reviewer; the approval that reaches quorum releases the milestone in full (no partial approval). |
+| `reclaim(grant_id) -> i128` | Funder only. Returns every unreleased milestone whose deadline plus `GRACE_PERIOD` (7 days) has passed. |
+
+Views: `get_grant`, `get_grant_count`, `has_approved`,
+`get_grantee_grant_count(grantee)`, `get_grants_by_grantee(grantee,
+start, limit)` (paginated, `limit` capped at 50). Events:
+`grant_created`, `milestone_submitted`, `milestone_approved`,
+`milestone_released`, `funds_reclaimed`.
 
 ## Known gaps
 

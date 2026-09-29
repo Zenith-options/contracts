@@ -5,41 +5,52 @@ on:
     branches: [main]
   pull_request:
 
-# options_market cross-contract-calls price_oracle, multisig, AND vault via
+# options_market cross-contract-calls price_oracle, multisig, vault, AND
+# params (its parameter registry) via
 # soroban-sdk's contractimport! against their compiled wasm (not a normal
 # source dependency, to avoid linking their own contract functions into
 # options_market's wasm and colliding on shared names like
-# pause/transfer_admin). That means all three wasm files have to exist
+# pause/transfer_admin). That means all four wasm files have to exist
 # before options_market can even be *compiled*, native target included —
 # every job below installs wasm32-unknown-unknown and builds price_oracle's,
-# multisig's, and vault's wasm first when it's about to touch options_market.
+# multisig's, vault's, and params' wasm first when it's about to touch
+# options_market.
 #
 # price_oracle and vault each also now cross-call multisig the same way
 # (for pause_via_multisig/unpause_via_multisig/transfer_admin_via_multisig),
 # so both need multisig's wasm built first too — that's also why the
 # multisig build step above runs before the vault build step, not just
 # before options_market's.
+#
+# streams, staking, timelock and governor have no wasm prerequisites (the
+# governor reaches the timelock and voting token through contractclient
+# traits). integration_tests registers every contract natively, so like
+# options_market it needs multisig's, price_oracle's and vault's wasm first;
+# it has no wasm of its own and is left out of the wasm job.
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig]
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, integration_tests]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
-      - if: matrix.crate == 'options_market'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
-      - if: matrix.crate == 'options_market'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: vault
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: params
       - run: cargo build --all-targets
         working-directory: ${{ matrix.crate }}
       - run: cargo test
@@ -49,7 +60,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig]
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow, integration_tests]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,15 +68,18 @@ jobs:
           components: clippy
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
-      - if: matrix.crate == 'options_market'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
-      - if: matrix.crate == 'options_market'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: vault
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: params
       - run: cargo clippy --all-targets -- -D warnings
         working-directory: ${{ matrix.crate }}
 
@@ -73,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig]
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -86,21 +100,24 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig]
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow, integration_tests]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'price_oracle' || matrix.crate == 'vault' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: multisig
-      - if: matrix.crate == 'options_market'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: price_oracle
-      - if: matrix.crate == 'options_market'
+      - if: matrix.crate == 'options_market' || matrix.crate == 'integration_tests'
         run: cargo build --target wasm32-unknown-unknown --release
         working-directory: vault
+      - if: matrix.crate == 'options_market'
+        run: cargo build --target wasm32-unknown-unknown --release
+        working-directory: params
       - run: cargo build --target wasm32-unknown-unknown --release
         working-directory: ${{ matrix.crate }}
