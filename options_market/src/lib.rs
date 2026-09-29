@@ -1011,33 +1011,36 @@ impl OptionsMarket {
         pos_id
     }
 
-    // ── Position Management ───────────────────────────────────────────────────
+    // ── Position Transfer ─────────────────────────────────────────────────────
 
-    /// Split `split_contracts` off position `position_id` into a new position
-    /// with the same series, side, owner and `opened_at` (issue #52).
+    /// Transfer ownership of an open position from `from` to `to` (issue #51).
+    /// `from` must sign and own the position. Both parties' `UserPositions`
+    /// lists are updated, and the new owner inherits every right attached to
+    /// the position (exercise for longs, collateral reclaim and cancellation
+    /// refunds for either side).
     ///
-    /// `premium_paid`, `fee_paid` and `collateral_locked` are divided in
-    /// proportion to `split_contracts / contracts`, rounded down for the new
-    /// position, with the remainder left in the original. Every field's total
-    /// across the two positions equals the original exactly, so open interest
-    /// and `SeriesEscrow` are unchanged and a cancelled series refunds the
-    /// same total either way.
+    /// Shorts are transferable too: their collateral is fully locked in this
+    /// contract at write time, so the recipient receives only the right to
+    /// reclaim whatever collateral is left after settlement, not an unfunded
+    /// obligation.
     ///
-    /// Rounding note: payouts are computed per position, so exercising two
-    /// halves can pay (and reclaiming two short halves can keep) at most one
-    /// unit less (more) per split than the unsplit position would.
-    ///
-    /// Fails with `InvalidSplitAmount` unless `0 < split_contracts <
-    /// contracts`, and with `AlreadyExercised` / `AlreadySettled` for a closed
-    /// position. Returns the new position id.
-    pub fn split_position(
-        env: Env,
-        owner: Address,
-        position_id: u64,
-        split_contracts: i128,
-    ) -> u64 {
+    /// Fails with `Unauthorized` if `from` isn't the owner, and with
+    /// `AlreadyExercised` / `AlreadySettled` for a closed position. Blocked
+    /// while paused. Transferring to `from` itself is a no-op.
+    pub fn transfer_position(env: Env, from: Address, to: Address, position_id: u64) {
         require_not_paused(&env);
-        owner.require_auth();
+        from.require_auth();
+
+        let mut position: OptionPosition = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Position(position_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::PositionNotFound));
+        if position.owner != from {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if position.is_exercised {
+            panic_with_error!(&env, Error::AlreadyE
 
         let mut position: OptionPosition = env
             .storage()
@@ -1053,54 +1056,16 @@ impl OptionsMarket {
         if position.is_settled {
             panic_with_error!(&env, Error::AlreadySettled);
         }
-        if split_contracts <= 0 || split_contracts >= position.contracts {
-            panic_with_error!(&env, Error::InvalidSplitAmount);
+        if position.owner != owner {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        if position.is_exercised {
+            panic_with_error!(&env, Error::AlreadyExercised);
+        }
+        if position.is_settled {
+            panic_with_error!(&env, Error::AlreadySettled);
         }
 
-        let share = |amount: i128| -> i128 {
-            amount
-                .checked_mul(split_contracts)
-                .unwrap()
-                .checked_div(position.contracts)
-                .unwrap()
-        };
-        let premium_part = share(position.premium_paid);
-        let fee_part = share(position.fee_paid);
-        let collateral_part = share(position.collateral_locked);
-
-        let new_id = next_position_id(&env);
-        let new_position = OptionPosition {
-            position_id: new_id,
-            series_id: position.series_id,
-            owner: owner.clone(),
-            side: position.side.clone(),
-            contracts: split_contracts,
-            premium_paid: premium_part,
-            fee_paid: fee_part,
-            collateral_locked: collateral_part,
-            is_exercised: false,
-            is_settled: false,
-            opened_at: position.opened_at,
-        };
-
-        position.contracts = position.contracts.checked_sub(split_contracts).unwrap();
-        position.premium_paid = position.premium_paid.checked_sub(premium_part).unwrap();
-        position.fee_paid = position.fee_paid.checked_sub(fee_part).unwrap();
-        position.collateral_locked = position
-            .collateral_locked
-            .checked_sub(collateral_part)
-            .unwrap();
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::Position(position_id), &position);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Position(new_id), &new_position);
-        add_user_position(&env, &owner, new_id);
-
-        events::position_split(&env, owner, position_id, new_id, split_contracts);
-        new_id
     }
 
     // ── Exercise ──────────────────────────────────────────────────────────────

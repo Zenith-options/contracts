@@ -101,6 +101,13 @@ pub fn refund_claimed(env: &Env, owner: Address, position_id: u64, amount: i128)
     );
 }
 
+pub fn position_transferred(env: &Env, from: Address, to: Address, position_id: u64) {
+    env.events().publish(
+        (Symbol::new(env, "position_transferred"), from, to),
+        position_id,
+    );
+}
+
 pub fn position_split(
     env: &Env,
     owner: Address,
