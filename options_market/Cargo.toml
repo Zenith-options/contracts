@@ -5,7 +5,9 @@ edition = "2021"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# rlib alongside cdylib so integration_tests/ can register a real
+# options_market natively for the governance handover tests.
+crate-type = ["cdylib", "rlib"]
 
 [profile.release]
 opt-level = "z"
