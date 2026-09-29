@@ -59,3 +59,34 @@ pub fn add_user_position(env: &Env, user: &Address, position_id: u64) {
     positions.push_back(position_id);
     env.storage().persistent().set(&key, &positions);
 }
+
+pub fn add_orphaned_liability(env: &Env, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let current: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::OrphanedLiabilities)
+        .unwrap_or(0);
+    let updated = current.checked_add(amount).unwrap();
+    env.storage()
+        .instance()
+        .set(&DataKey::OrphanedLiabilities, &updated);
+}
+
+pub fn deduct_orphaned_liability(env: &Env, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let current: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::OrphanedLiabilities)
+        .unwrap_or(0);
+    let updated = current.saturating_sub(amount);
+    env.storage()
+        .instance()
+        .set(&DataKey::OrphanedLiabilities, &updated);
+}
+

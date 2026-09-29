@@ -1934,3 +1934,111 @@ fn collateral_reclaimed_event_carries_position_and_amount() {
     assert_eq!(event_pos_id, pos_id);
     assert_eq!(reclaim, 700_000_000); // full collateral back, OTM means no payout owed
 }
+
+#[test]
+fn offline_long_can_still_exercise_after_settlement_window() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let series = h.client.get_series(&series_id).unwrap();
+    // Advance past expiry and past the 24h settlement window (e.g. + 2 days)
+    h.env.ledger().set_timestamp(series.expiry + 2 * 86_400);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    h.client.exercise(&buyer, &pos_id);
+    let after = balance(&h, &buyer);
+    assert_eq!(after - before, 50_000_000); // 50 USDC intrinsic payout
+}
+
+#[test]
+fn keeper_can_settle_long_permissionlessly() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    let before = balance(&h, &buyer);
+    let payout = h.client.settle_long(&pos_id);
+    let after = balance(&h, &buyer);
+
+    assert_eq!(payout, 50_000_000);
+    assert_eq!(after - before, 50_000_000);
+
+    let pos = h.client.get_position(&pos_id).unwrap();
+    assert!(pos.is_exercised);
+}
+
+#[test]
+fn unclaimed_long_sweeps_to_treasury_after_forfeiture_deadline() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+
+    let buyer = Address::generate(&h.env);
+    mint(&h, &buyer, 1_000 * USDC_DECIMALS);
+    let pos_id = h
+        .client
+        .buy_option(&buyer, &series_id, &USDC_DECIMALS, &(50 * USDC_DECIMALS));
+
+    let series = h.client.get_series(&series_id).unwrap();
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+    mint(&h, &h.client.address, 1_000 * USDC_DECIMALS);
+
+    // Advance 91 days past expiry (past 90d FORFEITURE_WINDOW)
+    h.env
+        .ledger()
+        .set_timestamp(series.expiry + 91 * 86_400);
+
+    let treasury_before = balance(&h, &h.fee_recipient);
+    let swept = h.client.sweep_forfeited(&pos_id);
+    let treasury_after = balance(&h, &h.fee_recipient);
+
+    assert_eq!(swept, 50_000_000);
+    assert_eq!(treasury_after - treasury_before, 50_000_000);
+
+    let pos = h.client.get_position(&pos_id).unwrap();
+    assert!(pos.is_exercised);
+}
+
+#[test]
+fn get_orphaned_liabilities_tracks_unexercised_funds() {
+    let h = setup();
+    let series_id = make_series(&h, OptionType::Call, 700_000_000, 40_000_000);
+    fund_premium_pool(&h, series_id, USDC_DECIMALS);
+
+    let writer = Address::generate(&h.env);
+    mint(&h, &writer, 700_000_000);
+    let short_id = h
+        .client
+        .write_option(&writer, &series_id, &USDC_DECIMALS, &700_000_000);
+
+    advance_past_expiry(&h, series_id);
+    h.client.set_settlement_price(&series_id, &(750_000_000));
+
+    assert_eq!(h.client.get_orphaned_liabilities(), 0);
+
+    // Writer reclaims: max_loss = 50_000_000, reclaim = 650_000_000
+    h.client.reclaim_collateral(&writer, &short_id);
+    assert_eq!(h.client.get_orphaned_liabilities(), 50_000_000);
+
+    // Admin can also sync/adjust if needed
+    h.client.sync_orphaned_liabilities(&0);
+    assert_eq!(h.client.get_orphaned_liabilities(), 0);
+}
+
