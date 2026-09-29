@@ -72,63 +72,35 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
 
 ## Building and testing
 
-Each crate is standalone (no workspace `Cargo.toml`), but **build order
-matters for options_market**: it cross-calls price_oracle and vault via
-soroban-sdk's `contractimport!` against their *compiled wasm* (not a
-normal source dependency — that would link the other contract's own
-functions into the caller's wasm and collide with functions of the same
-name, like `pause`/`transfer_admin`). So those two wasm files have to
-exist before options_market can be compiled at all, even natively.
-Multisig is cross-called through `zenith-common` with `invoke_contract`
-instead, so nothing needs multisig's wasm to compile:
+The repo is one Cargo workspace (root `Cargo.toml`: shared
+`[profile.release]` and `soroban-sdk` version). Build order is handled by
+`cargo xtask` — you need Rust stable plus the wasm target:
 
 ```sh
-cd price_oracle
-cargo build --target wasm32-unknown-unknown --release   # options_market needs it
-
-cd ../vault
-cargo build --target wasm32-unknown-unknown --release   # options_market needs it too
-
-cd ../params
-cargo build --target wasm32-unknown-unknown --release   # options_market needs it too (no dependencies of its own)
-
-cd ../options_market   # now this crate can build/test/etc.
-cargo build                                   # native build, fast iteration
-cargo test                                    # unit tests (soroban-sdk testutils)
-cargo clippy --all-targets -- -D warnings     # matches CI
-cargo fmt --check                             # matches CI
-cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
+rustup target add wasm32-unknown-unknown
+cargo xtask build          # every contract's wasm, dependencies first
+cargo xtask test           # builds the wasm tests need, then cargo test
+cargo xtask ci             # fmt --check, clippy, wasm checks, tests — same as CI
 ```
 
-`params` and `grants_escrow` have no wasm dependencies of their own.
-`vault` only needs multisig's wasm built first, no other dependency of
-its own (options_market depending on vault's wasm doesn't run the other
-way). `multisig` itself has no dependency on anything else and can be
-built/tested independently, in any order relative to the others.
+Add `-p <crate>` (e.g. `-p options_market`) to scope any command. Release
+wasm lands in `target/wasm32-unknown-unknown/release/`. `cargo xtask help`
+lists the rest (`clippy`, `fmt`, `graph`, `check-wasm`, `check-imports`).
 
-CI (`.github/workflows/ci.yml`) builds the required dependency wasm(s)
-first whenever a job is about to touch options_market, price_oracle,
-or vault, then runs the same four checks against every push and PR,
-for every crate. On PRs a
-`spec-diff` job (`tools/spec-diff/check.sh <base-ref>`) builds every
-contract at the base branch and at the PR, fails if any existing
-function, type or error in a contract's spec was removed or changed
-(additions are fine; intentional signature changes must be listed in
-`tools/spec-diff/allow.txt`), and prints each contract's wasm size
-delta.
+Why an xtask: options_market calls price_oracle, vault and params through
+`contractimport!` against their *compiled wasm* (a source dependency
+would link their `pause`/`transfer_admin`/... into options_market's wasm
+and collide), so that wasm must exist before options_market compiles at
+all. A crate that imports wasm lists it in `[package.metadata.zenith]
+wasm-deps`; xtask builds those first, and `check-imports` keeps the list
+in sync with the `contractimport!` paths. Each contract's wasm is built on
+its own so dev-dependency `testutils` never reaches a release build —
+`check-wasm` verifies that on the artifacts.
 
-Every event any of these four contracts publishes has a test that
-decodes its actual payload via `TryFromVal` (topics and data), not
-just a test that confirms an event fired — the intent being that
-anything an off-chain indexer would need to parse out of an event is
-pinned down by a test, so a change to a tuple's field order or type
-shows up as a test failure rather than as a silently broken indexer.
-
-## Deploying
-
-```sh
-soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/
+On PRs the `spec-diff` CI job (`tools/spec-diff/check.sh <base-ref>`)
+fails if any existing function, type or error in a contract's spec was
+removed or changed (additions are fine; intentional changes go in
+`tools/spec-diff/allow.txt`) and prints each contract's wasm size delta.
 
 Every event any of these four contracts publishes has a test that
 decodes its actual payload via `TryFromVal` (topics and data), not

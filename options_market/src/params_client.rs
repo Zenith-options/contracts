@@ -2,9 +2,9 @@
 //! reason as price_oracle_client.rs: contractimport! against params'
 //! compiled wasm, not a normal source dependency.
 //!
-//! Requires params' wasm to already be built (`cd ../params && cargo
-//! build --target wasm32-unknown-unknown --release`) before this crate
-//! can compile at all.
+//! Requires params' wasm in the shared workspace target/ before this crate
+//! can compile at all; `cargo xtask build` handles that (see
+//! `[package.metadata.zenith] wasm-deps` in ../Cargo.toml).
 soroban_sdk::contractimport!(
-    file = "../params/target/wasm32-unknown-unknown/release/zenith_params.wasm"
+    file = "../target/wasm32-unknown-unknown/release/zenith_params.wasm"
 );
