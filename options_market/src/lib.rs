@@ -246,7 +246,7 @@ impl OptionsMarket {
         if expiry <= now + 3600 {
             panic_with_error!(&env, Error::ExpiryTooSoon);
         }
-        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
+        if strike_price <= 0 || premium <= 0 || implied_vol < 0 {
             panic_with_error!(&env, Error::InvalidSeriesParams);
         }
 
@@ -332,7 +332,7 @@ impl OptionsMarket {
         if expiry <= now + 3600 {
             panic_with_error!(&env, Error::ExpiryTooSoon);
         }
-        if strike_price <= 0 || premium < 0 || implied_vol < 0 {
+        if strike_price <= 0 || premium <= 0 || implied_vol < 0 {
             panic_with_error!(&env, Error::InvalidSeriesParams);
         }
 
@@ -406,6 +406,11 @@ impl OptionsMarket {
         if series.state != SeriesState::Active {
             panic_with_error!(&env, Error::SeriesNotActive);
         }
+        // A zero (or negative) premium would let buyers open positions for
+        // free and writers lock collateral for nothing (#47).
+        if new_premium <= 0 {
+            panic_with_error!(&env, Error::InvalidSeriesParams);
+        }
 
         series.premium = new_premium;
         series.implied_vol = new_implied_vol;
@@ -442,6 +447,11 @@ impl OptionsMarket {
 
         if series.state != SeriesState::Active {
             panic_with_error!(&env, Error::SeriesNotActive);
+        }
+        // A zero (or negative) premium would let buyers open positions for
+        // free and writers lock collateral for nothing (#47).
+        if new_premium <= 0 {
+            panic_with_error!(&env, Error::InvalidSeriesParams);
         }
 
         series.premium = new_premium;
