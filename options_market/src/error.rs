@@ -29,4 +29,5 @@ pub enum Error {
     InvalidBatchSize = 23,
     NothingToEscrow = 24,
     PremiumBelowMinimum = 25,
+    NotEligibleForForfeiture = 26,
 }
