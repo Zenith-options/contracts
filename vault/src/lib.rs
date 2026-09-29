@@ -11,7 +11,7 @@
 //! 7" is always answerable instead of inferred from the token contract's
 //! raw balance.
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env};
+use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, Vec};
 
 #[cfg(test)]
 mod test;
@@ -19,6 +19,7 @@ mod test;
 mod error;
 mod events;
 mod multisig_client;
+mod ttl;
 mod types;
 
 use error::Error;
@@ -40,7 +41,18 @@ pub struct Vault;
 
 #[contractimpl]
 impl Vault {
+    /// Permissionless keeper entrypoint: extends the contract instance and
+    /// every named persistent entry that exists, per the TTL policy in
+    /// ttl.rs. Anyone may pay the rent to keep long-lived entries alive.
+    pub fn bump(env: Env, keys: Vec<DataKey>) {
+        ttl::extend_instance(&env);
+        for key in keys.iter() {
+            ttl::extend_persistent_if_present(&env, &key);
+        }
+    }
+
     pub fn initialize(env: Env, admin: Address, token: Address) {
+        ttl::extend_instance(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
@@ -58,6 +70,7 @@ impl Vault {
     /// change (e.g. after an options_market upgrade to a new contract
     /// address).
     pub fn transfer_admin(env: Env, new_admin: Address) {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -74,6 +87,7 @@ impl Vault {
         action_id: u64,
         new_admin: Address,
     ) {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -90,6 +104,7 @@ impl Vault {
     /// there's no "existing position" here that needs an exit path
     /// independent of the vault itself.
     pub fn pause(env: Env) {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -97,6 +112,7 @@ impl Vault {
     }
 
     pub fn unpause(env: Env) {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -106,6 +122,7 @@ impl Vault {
     /// Permissionless alternative to pause(), same rationale and pattern
     /// as options_market's and price_oracle's pause_via_multisig.
     pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -115,6 +132,7 @@ impl Vault {
     }
 
     pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -124,6 +142,7 @@ impl Vault {
     }
 
     pub fn is_paused(env: Env) -> bool {
+        ttl::extend_instance(&env);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -135,6 +154,7 @@ impl Vault {
     /// the transfer — this contract never moves funds without the source
     /// account's own signature.
     pub fn deposit(env: Env, from: Address, tag: u64, amount: i128) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         from.require_auth();
         if amount <= 0 {
@@ -149,10 +169,8 @@ impl Vault {
         );
 
         let key = DataKey::Escrow(tag);
-        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&key, &balance.checked_add(amount).unwrap());
+        let balance: i128 = ttl::get_persistent(&env, &key).unwrap_or(0);
+        ttl::set_persistent(&env, &key, &balance.checked_add(amount).unwrap());
 
         let total: i128 = env
             .storage()
@@ -181,6 +199,7 @@ impl Vault {
     /// deposited under this tag, regardless of what the vault's raw token
     /// balance happens to be from OTHER tags' deposits.
     pub fn withdraw(env: Env, tag: u64, to: Address, amount: i128) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -189,13 +208,11 @@ impl Vault {
         }
 
         let key = DataKey::Escrow(tag);
-        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let balance: i128 = ttl::get_persistent(&env, &key).unwrap_or(0);
         if balance < amount {
             panic_with_error!(&env, Error::InsufficientEscrowBalance);
         }
-        env.storage()
-            .persistent()
-            .set(&key, &balance.checked_sub(amount).unwrap());
+        ttl::set_persistent(&env, &key, &balance.checked_sub(amount).unwrap());
 
         let total: i128 = env
             .storage()
@@ -232,6 +249,7 @@ impl Vault {
         to: Address,
         amount: i128,
     ) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
@@ -242,13 +260,11 @@ impl Vault {
         }
 
         let key = DataKey::Escrow(tag);
-        let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let balance: i128 = ttl::get_persistent(&env, &key).unwrap_or(0);
         if balance < amount {
             panic_with_error!(&env, Error::InsufficientEscrowBalance);
         }
-        env.storage()
-            .persistent()
-            .set(&key, &balance.checked_sub(amount).unwrap());
+        ttl::set_persistent(&env, &key, &balance.checked_sub(amount).unwrap());
 
         let total: i128 = env
             .storage()
@@ -277,6 +293,7 @@ impl Vault {
     /// just needs to be re-earmarked under the new position's tag.
     /// Admin-gated, same as withdraw.
     pub fn transfer_tag(env: Env, from_tag: u64, to_tag: u64, amount: i128) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -285,19 +302,15 @@ impl Vault {
         }
 
         let from_key = DataKey::Escrow(from_tag);
-        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+        let from_balance: i128 = ttl::get_persistent(&env, &from_key).unwrap_or(0);
         if from_balance < amount {
             panic_with_error!(&env, Error::InsufficientEscrowBalance);
         }
-        env.storage()
-            .persistent()
-            .set(&from_key, &from_balance.checked_sub(amount).unwrap());
+        ttl::set_persistent(&env, &from_key, &from_balance.checked_sub(amount).unwrap());
 
         let to_key = DataKey::Escrow(to_tag);
-        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&to_key, &to_balance.checked_add(amount).unwrap());
+        let to_balance: i128 = ttl::get_persistent(&env, &to_key).unwrap_or(0);
+        ttl::set_persistent(&env, &to_key, &to_balance.checked_add(amount).unwrap());
 
         // TotalEscrowed is unaffected — nothing entered or left the vault,
         // only which tag it's earmarked under changed.
@@ -315,6 +328,7 @@ impl Vault {
         to_tag: u64,
         amount: i128,
     ) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
@@ -325,31 +339,26 @@ impl Vault {
         }
 
         let from_key = DataKey::Escrow(from_tag);
-        let from_balance: i128 = env.storage().persistent().get(&from_key).unwrap_or(0);
+        let from_balance: i128 = ttl::get_persistent(&env, &from_key).unwrap_or(0);
         if from_balance < amount {
             panic_with_error!(&env, Error::InsufficientEscrowBalance);
         }
-        env.storage()
-            .persistent()
-            .set(&from_key, &from_balance.checked_sub(amount).unwrap());
+        ttl::set_persistent(&env, &from_key, &from_balance.checked_sub(amount).unwrap());
 
         let to_key = DataKey::Escrow(to_tag);
-        let to_balance: i128 = env.storage().persistent().get(&to_key).unwrap_or(0);
-        env.storage()
-            .persistent()
-            .set(&to_key, &to_balance.checked_add(amount).unwrap());
+        let to_balance: i128 = ttl::get_persistent(&env, &to_key).unwrap_or(0);
+        ttl::set_persistent(&env, &to_key, &to_balance.checked_add(amount).unwrap());
 
         events::tag_transferred(&env, from_tag, to_tag, amount);
     }
 
     pub fn balance_of(env: Env, tag: u64) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Escrow(tag))
-            .unwrap_or(0)
+        ttl::extend_instance(&env);
+        ttl::get_persistent(&env, &DataKey::Escrow(tag)).unwrap_or(0)
     }
 
     pub fn get_total_escrowed(env: Env) -> i128 {
+        ttl::extend_instance(&env);
         env.storage()
             .instance()
             .get(&DataKey::TotalEscrowed)
@@ -357,10 +366,12 @@ impl Vault {
     }
 
     pub fn get_admin(env: Env) -> Address {
+        ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     pub fn get_token(env: Env) -> Address {
+        ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::Token).unwrap()
     }
 
@@ -374,6 +385,7 @@ impl Vault {
     /// OWN escrowed balance), and get_total_escrowed's ledger sum would
     /// permanently under-report the vault's actual token balance.
     pub fn sweep_untagged(env: Env, to: Address) -> i128 {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -406,6 +418,7 @@ impl Vault {
         action_id: u64,
         to: Address,
     ) -> i128 {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);

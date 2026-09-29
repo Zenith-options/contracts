@@ -16,6 +16,7 @@ mod error;
 mod events;
 mod math;
 mod multisig_client;
+mod ttl;
 mod types;
 
 use error::Error;
@@ -41,7 +42,18 @@ pub struct PriceOracle;
 
 #[contractimpl]
 impl PriceOracle {
+    /// Permissionless keeper entrypoint: extends the contract instance and
+    /// every named persistent entry that exists, per the TTL policy in
+    /// ttl.rs. Anyone may pay the rent to keep long-lived entries alive.
+    pub fn bump(env: Env, keys: Vec<DataKey>) {
+        ttl::extend_instance(&env);
+        for key in keys.iter() {
+            ttl::extend_persistent_if_present(&env, &key);
+        }
+    }
+
     pub fn initialize(env: Env, admin: Address) {
+        ttl::extend_instance(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
@@ -61,6 +73,7 @@ impl PriceOracle {
     /// Admin adjusts how old a feeder's report can be and still count
     /// toward get_price's aggregate.
     pub fn set_max_staleness(env: Env, seconds: u64) {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if seconds == 0 {
@@ -84,6 +97,7 @@ impl PriceOracle {
         action_id: u64,
         seconds: u64,
     ) {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -98,6 +112,7 @@ impl PriceOracle {
     }
 
     pub fn get_max_staleness(env: Env) -> u64 {
+        ttl::extend_instance(&env);
         env.storage()
             .instance()
             .get(&DataKey::MaxStaleness)
@@ -112,6 +127,7 @@ impl PriceOracle {
     /// no averaging effect at all, defeating the point of aggregating
     /// across multiple feeders in the first place.
     pub fn set_min_reports(env: Env, count: u32) {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if count == 0 {
@@ -133,6 +149,7 @@ impl PriceOracle {
         action_id: u64,
         count: u32,
     ) {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -145,16 +162,19 @@ impl PriceOracle {
     }
 
     pub fn get_min_reports(env: Env) -> u32 {
+        ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::MinReports).unwrap()
     }
 
     pub fn get_admin(env: Env) -> Address {
+        ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     /// Admin hands off control to a new address. Requires the CURRENT
     /// admin's signature, not the incoming one.
     pub fn transfer_admin(env: Env, new_admin: Address) {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
@@ -171,6 +191,7 @@ impl PriceOracle {
         action_id: u64,
         new_admin: Address,
     ) {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -185,6 +206,7 @@ impl PriceOracle {
     /// further changes to the feed, not hide the last-known price from
     /// callers still reading it.
     pub fn pause(env: Env) {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -192,6 +214,7 @@ impl PriceOracle {
     }
 
     pub fn unpause(env: Env) {
+        ttl::extend_instance(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -201,6 +224,7 @@ impl PriceOracle {
     /// Permissionless alternative to pause(), same rationale and pattern
     /// as options_market's pause_via_multisig.
     pub fn pause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -210,6 +234,7 @@ impl PriceOracle {
     }
 
     pub fn unpause_via_multisig(env: Env, multisig_contract: Address, action_id: u64) {
+        ttl::extend_instance(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -219,6 +244,7 @@ impl PriceOracle {
     }
 
     pub fn is_paused(env: Env) -> bool {
+        ttl::extend_instance(&env);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -228,6 +254,7 @@ impl PriceOracle {
     /// Admin authorizes a new price feeder. Feeders are the only addresses
     /// allowed to call report_price.
     pub fn add_feeder(env: Env, feeder: Address) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -255,6 +282,7 @@ impl PriceOracle {
         action_id: u64,
         feeder: Address,
     ) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
@@ -277,6 +305,7 @@ impl PriceOracle {
     /// report is left in storage (for audit purposes) but is no longer
     /// counted toward the aggregate once removed.
     pub fn remove_feeder(env: Env, feeder: Address) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
@@ -302,6 +331,7 @@ impl PriceOracle {
         action_id: u64,
         feeder: Address,
     ) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         let multisig = multisig_client::Client::new(&env, &multisig_contract);
         if !multisig.is_approved(&action_id) {
@@ -320,11 +350,13 @@ impl PriceOracle {
     }
 
     pub fn is_feeder(env: Env, address: Address) -> bool {
+        ttl::extend_instance(&env);
         let feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
         feeders.contains(&address)
     }
 
     pub fn get_feeder_count(env: Env) -> u32 {
+        ttl::extend_instance(&env);
         let feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
         feeders.len()
     }
@@ -333,6 +365,7 @@ impl PriceOracle {
     /// feeder's own report — see the aggregation step (still to come) for
     /// how per-feeder reports become the single price callers read.
     pub fn report_price(env: Env, feeder: Address, symbol: Symbol, price: i128) {
+        ttl::extend_instance(&env);
         require_not_paused(&env);
         feeder.require_auth();
 
@@ -345,7 +378,8 @@ impl PriceOracle {
         }
 
         let now = env.ledger().timestamp();
-        env.storage().persistent().set(
+        ttl::set_persistent(
+            &env,
             &DataKey::PriceReport(symbol.clone(), feeder.clone()),
             &(price, now),
         );
@@ -353,9 +387,8 @@ impl PriceOracle {
     }
 
     pub fn get_latest_report(env: Env, symbol: Symbol, feeder: Address) -> Option<(i128, u64)> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PriceReport(symbol, feeder))
+        ttl::extend_instance(&env);
+        ttl::get_persistent(&env, &DataKey::PriceReport(symbol, feeder))
     }
 
     /// The aggregate price for `symbol`: the median across every
@@ -363,6 +396,7 @@ impl PriceOracle {
     /// max_staleness. Returns None if no feeder has a fresh report —
     /// callers must not treat that the same as "price is zero."
     pub fn get_price(env: Env, symbol: Symbol) -> Option<i128> {
+        ttl::extend_instance(&env);
         let feeders: Vec<Address> = env.storage().instance().get(&DataKey::Feeders).unwrap();
         let max_staleness: u64 = env
             .storage()
@@ -374,10 +408,8 @@ impl PriceOracle {
         let mut buffer = [0i128; MAX_FEEDERS as usize];
         let mut count = 0usize;
         for feeder in feeders.iter() {
-            let report: Option<(i128, u64)> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::PriceReport(symbol.clone(), feeder));
+            let report: Option<(i128, u64)> =
+                ttl::get_persistent(&env, &DataKey::PriceReport(symbol.clone(), feeder));
             if let Some((price, reported_at)) = report {
                 if now.checked_sub(reported_at).unwrap_or(u64::MAX) <= max_staleness {
                     buffer[count] = price;

@@ -44,6 +44,16 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   as a permissionless alternative to their own admin-gated
   `pause`/`unpause`/`transfer_admin`; see "Known gaps" below for what's
   still admin-only.
+- [`params/`](params) — a timelock-controlled registry of protocol
+  parameters, each with hard `[min, max]` bounds. `options_market`
+  reads its fee rate and settlement window from it (cached locally,
+  refreshed only when the registry version moves). See
+  "`params` reference" below for the parameter catalog.
+- [`grants_escrow/`](grants_escrow) — milestone-based escrow for
+  community grants and bounties: funded upfront, released per milestone
+  on reviewer quorum, reclaimable by the funder after a missed deadline
+  plus grace period. Operations guide:
+  [`docs/grants_escrow.md`](docs/grants_escrow.md).
 
 ## Building and testing
 
@@ -69,6 +79,9 @@ cargo build --target wasm32-unknown-unknown --release   # do this SECOND — opt
 cd ../vault
 cargo build --target wasm32-unknown-unknown --release   # do this THIRD — options_market needs it too, and vault itself needs multisig's wasm to already exist
 
+cd ../params
+cargo build --target wasm32-unknown-unknown --release   # options_market needs it too (no dependencies of its own)
+
 cd ../options_market   # now this crate can build/test/etc.
 cargo build                                   # native build, fast iteration
 cargo test                                    # unit tests (soroban-sdk testutils)
@@ -77,6 +90,7 @@ cargo fmt --check                             # matches CI
 cargo build --target wasm32-unknown-unknown --release   # the real deploy artifact
 ```
 
+`params` and `grants_escrow` have no wasm dependencies of their own.
 `vault` only needs multisig's wasm built first, no other dependency of
 its own (options_market depending on vault's wasm doesn't run the other
 way). `multisig` itself has no dependency on anything else and can be
@@ -85,7 +99,7 @@ built/tested independently, in any order relative to the others.
 CI (`.github/workflows/ci.yml`) builds the required dependency wasm(s)
 first whenever a job is about to touch options_market, price_oracle,
 or vault, then runs the same four checks against every push and PR,
-for all four crates.
+for every crate.
 
 Every event any of these four contracts publishes has a test that
 decodes its actual payload via `TryFromVal` (topics and data), not
@@ -126,6 +140,27 @@ soroban contract deploy \
 soroban contract invoke --id <contract-id> --source <admin> --network testnet -- \
   initialize --admin <admin-address>
 ```
+
+## Storage TTL policy
+
+Every contract extends its **instance** storage at the top of every
+entrypoint, and extends a **persistent** entry whenever it reads or
+writes it (`ttl.rs` in each crate). `extend_ttl` only charges rent once
+an entry's remaining TTL drops below the threshold, so the steady-state
+cost of a read is one TTL check. No contract uses temporary storage.
+Ledgers are ~5s, so one day ≈ 17,280 ledgers.
+
+| Class | Keys | Threshold | Extend to | Who pays |
+|---|---|---|---|---|
+| Instance | options_market: `Admin`, `Oracle`, `CollateralToken`, `FeeRecipient`, counters, `TotalPremiumsCollected`, `TotalOpenInterest`, `Paused`, `FeeRateBps`, `SeriesCountForUnderlying`, `PremiumPool`, `ParamsRegistry`, `ParamsVersion`, `SettlementWindow` · price_oracle: `Admin`, `Paused`, `MaxStaleness`, `MinReports`, `Feeders` · vault: `Admin`, `Token`, `Paused`, `TotalEscrowed` · multisig: `Signers`, `Threshold`, `ApprovalTtl` · params: `Timelock`, `Version` · grants_escrow: `GrantCounter` | 23 days | 30 days | Whoever invokes any entrypoint |
+| Persistent | options_market: `Series`, `Position`, `UserPositions`, `UnderlyingPrice`, `SeriesEscrow` · price_oracle: `PriceReport`, `AggregatedPrice` · vault: `Escrow` · multisig: `Approval` · params: `Param`, `PendingBounds` · grants_escrow: `Grant`, `Approval`, `GranteeGrants` | 60 days | 90 days | Whoever reads/writes the entry; keepers via `bump` |
+
+Every contract also exposes a permissionless `bump(keys: Vec<DataKey>)`
+that extends the instance plus each named persistent entry that exists,
+so a keeper can keep long-lived but idle entries (a long-dated series,
+a dormant position, an idle vault tag) from archiving. Entries that do
+archive anyway can be restored — see the
+[archival runbook](docs/runbooks/archival.md) and `scripts/restore/`.
 
 ## `options_market` reference
 
@@ -344,6 +379,57 @@ set, so a compromised signer can never add another compromised signer.
 | 4 | `NotASigner` |
 | 5 | `AlreadyApproved` |
 | 6 | `NotYetApproved` |
+
+## `params` reference
+
+All writes require the `timelock` address set at `initialize`. Values
+move freely inside their bounds; bounds themselves only move through a
+second, slower path (`BOUNDS_CHANGE_DELAY` = 7 days on top of the
+timelock's own delay), so widening the sanity envelope always takes
+longer than using it. Every change bumps `get_version()`.
+
+| Function | Description |
+|---|---|
+| `initialize(timelock)` | One-time setup. |
+| `define_param(key, value, min, max)` | Creates a parameter that has never been set. |
+| `set_param(key, value)` | Moves the value within `[min, max]`. Emits `param_updated(key, old, new)`. |
+| `propose_bounds(key, min, max)` | Queues new bounds (must still contain the current value), executable after `BOUNDS_CHANGE_DELAY`. |
+| `execute_bounds(key)` / `cancel_bounds(key)` | Applies or drops the queued bounds change. |
+
+Views: `get_param(key) -> Option<{value, min, max, updated_at}>`,
+`get_value(key)`, `get_pending_bounds(key)`, `get_version()`,
+`get_timelock()`. Events: `param_defined`, `param_updated`,
+`bounds_proposed`, `bounds_updated`, `bounds_cancelled`.
+
+### Parameter catalog
+
+| Key | Consumer | Unit | Suggested bounds | Default when unset |
+|---|---|---|---|---|
+| `fee_bps` | options_market fee rate | basis points | `[0, 1000]` | local `FeeRateBps` (50) |
+| `settle_w` | options_market exercise window after expiry | seconds | `[3600, 604800]` | 86,400 |
+
+options_market points at a registry via admin-only
+`set_params_registry(registry)`. It caches both values in instance
+storage with the registry version and only re-reads them when the
+version moves. An unreachable registry, an unset key, or a value
+outside options_market's own hard limits (`MAX_FEE_RATE_BPS`, window > 0)
+leaves the cached value in place. Other parameters (oracle staleness,
+`min_reports`, OI caps, ...) are follow-ups.
+
+## `grants_escrow` reference
+
+| Function | Description |
+|---|---|
+| `create_grant(funder, grantee, token, milestones: Vec<(amount, deadline)>, reviewers, quorum) -> u64` | Funds the grant upfront. Rejects a reviewer who is also the grantee, duplicate reviewers, a quorum outside `1..=reviewers`, and non-positive amounts or past deadlines. |
+| `submit_milestone(grant_id, idx, evidence_hash)` | Grantee only, before the milestone's deadline. |
+| `approve_milestone(grant_id, idx, reviewer)` | One approval per reviewer; the approval that reaches quorum releases the milestone in full (no partial approval). |
+| `reclaim(grant_id) -> i128` | Funder only. Returns every unreleased milestone whose deadline plus `GRACE_PERIOD` (7 days) has passed. |
+
+Views: `get_grant`, `get_grant_count`, `has_approved`,
+`get_grantee_grant_count(grantee)`, `get_grants_by_grantee(grantee,
+start, limit)` (paginated, `limit` capped at 50). Events:
+`grant_created`, `milestone_submitted`, `milestone_approved`,
+`milestone_released`, `funds_reclaimed`.
 
 ## Known gaps
 
