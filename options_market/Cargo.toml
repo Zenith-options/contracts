@@ -19,6 +19,9 @@ strip = "symbols"
 debug-assertions = false
 panic = "abort"
 codegen-units = 1
+# Whole-program LTO lets the linker drop and inline across the sdk and
+# zenith-common boundaries — one of the #106 size reductions.
+lto = true
 
 [dependencies]
 soroban-sdk = { version = "21.0.0" }
@@ -33,12 +36,19 @@ ed25519-dalek = "2"
 # contract instead — via contractimport! against its compiled wasm, not by
 # depending on and linking its actual implementation).
 price_oracle = { package = "zenith-price-oracle", path = "../price_oracle", features = ["testutils"] }
-# Same reasoning as price_oracle above, for src/multisig_client.rs.
+# Registers a real multisig for the `_via_multisig` tests (options_market
+# itself reaches it through zenith-common's invoke_contract, not a client).
 multisig = { package = "zenith-multisig", path = "../multisig", features = ["testutils"] }
 # Same reasoning as price_oracle above, for src/vault_client.rs.
 vault = { package = "zenith-vault", path = "../vault", features = ["testutils"] }
 # Same reasoning as price_oracle above, for src/params_client.rs.
 params = { package = "zenith-params", path = "../params", features = ["testutils"] }
+# Measures and snapshots per-entrypoint resource usage (src/test_resources.rs).
+resource-snapshot = { path = "../tools/resource-snapshot" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
+# Registers the built release wasm in src/test_resources.rs instead of the
+# native contract, so resource snapshots measure what runs on-chain.
+# Build the wasm first: cargo build --target wasm32-unknown-unknown --release
+resource-wasm = []

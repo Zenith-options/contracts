@@ -117,6 +117,45 @@ function, type or error in a contract's spec was removed or changed
 `tools/spec-diff/allow.txt`), and prints each contract's wasm size
 delta.
 
+### Wasm size budgets
+
+The CI `budgets` job builds every contract, optimizes it
+(`stellar contract optimize`, or `wasm-opt -Oz` when the stellar CLI
+isn't installed), prints raw and optimized sizes to the job summary,
+uploads the optimized wasm as the `optimized-wasm` artifact, and fails
+if any optimized size is over its budget in
+`scripts/wasm-size/budgets.txt` (the size when set + 10%). Locally:
+
+```sh
+scripts/wasm-size/check.sh                           # after building the wasm
+scripts/wasm-size/check.sh --update options_market   # deliberate growth: explain it in the PR
+```
+
+### Resource budget snapshots
+
+`options_market/src/test_resources.rs` measures CPU instructions,
+memory bytes, and read/write ledger entries and bytes for its public
+entrypoints (including the worst cases: `exercise_batch`,
+`reclaim_batch` and `prune_positions` at `MAX_BATCH_SIZE`, and a full
+`migrate_counters` page) and compares them with
+`options_market/snapshots/resources/*.json`. Any metric more than 5%
+above its snapshot fails the test (the tolerance can be set per
+scenario). CI runs it against the **optimized wasm** (`--features
+resource-wasm`), since native execution undercounts; each snapshot
+records which mode it was measured in, and modes are never compared.
+`scripts/resource-diff/resource_diff.py` posts the table to the job
+summary.
+
+```sh
+cd options_market
+cargo build --target wasm32-unknown-unknown --release
+cargo test --features resource-wasm resource_snapshots                       # compare
+UPDATE_SNAPSHOTS=1 cargo test --features resource-wasm resource_snapshots    # re-record
+```
+
+The measuring and comparing lives in `tools/resource-snapshot`, so
+other crates can add the same `test_resources` module.
+
 Every event any of these four contracts publishes has a test that
 decodes its actual payload via `TryFromVal` (topics and data), not
 just a test that confirms an event fired — the intent being that
@@ -181,8 +220,8 @@ Ledgers are ~5s, so one day ≈ 17,280 ledgers.
 
 | Class | Keys | Threshold | Extend to | Who pays |
 |---|---|---|---|---|
-| Instance | options_market: `Admin`, `Oracle`, `CollateralToken`, `FeeRecipient`, counters, `TotalPremiumsCollected`, `TotalOpenInterest`, `Paused`, `FeeRateBps`, `SeriesCountForUnderlying`, `PremiumPool`, `ParamsRegistry`, `ParamsVersion`, `SettlementWindow` · price_oracle: `Admin`, `Paused`, `MaxStaleness`, `MinReports`, `Feeders` · vault: `Admin`, `Token`, `Paused`, `TotalEscrowed` · multisig: `Signers`, `Threshold`, `ApprovalTtl` · params: `Timelock`, `Version` · grants_escrow: `GrantCounter` | 23 days | 30 days | Whoever invokes any entrypoint |
-| Persistent | options_market: `Series`, `Position`, `UserPositions`, `UnderlyingPrice`, `SeriesEscrow` · price_oracle: `PriceReport`, `AggregatedPrice` · vault: `Escrow` · multisig: `Approval` · params: `Param`, `PendingBounds` · grants_escrow: `Grant`, `Approval`, `GranteeGrants` | 60 days | 90 days | Whoever reads/writes the entry; keepers via `bump` |
+| Instance | options_market: `Admin`, `Oracle`, `CollateralToken`, `FeeRecipient`, counters, `TotalPremiumsCollected`, `TotalOpenInterest`, `Paused`, `FeeRateBps`, `PremiumPool`, `ParamsRegistry`, `ParamsVersion`, `SettlementWindow`, `MaxActiveSeries`, `Migration` · price_oracle: `Admin`, `Paused`, `MaxStaleness`, `MinReports`, `Feeders` · vault: `Admin`, `Token`, `Paused`, `TotalEscrowed` · multisig: `Signers`, `Threshold`, `ApprovalTtl` · params: `Timelock`, `Version` · grants_escrow: `GrantCounter` | 23 days | 30 days | Whoever invokes any entrypoint |
+| Persistent | options_market: `Series`, `Position`, `UserPositions`, `UnderlyingPrice`, `SeriesEscrow`, `SeriesCountForUnderlying`, `SeriesIndex`, `ActiveSeriesCount`, `SeriesPositions`, `SeriesClosedAt`, `SeriesReleased` · price_oracle: `PriceReport`, `AggregatedPrice` · vault: `Escrow` · multisig: `Approval` · params: `Param`, `PendingBounds` · grants_escrow: `Grant`, `Approval`, `GranteeGrants` | 60 days | 90 days | Whoever reads/writes the entry; keepers via `bump` |
 
 Every contract also exposes a permissionless `bump(keys: Vec<DataKey>)`
 that extends the instance plus each named persistent entry that exists,
@@ -190,6 +229,11 @@ so a keeper can keep long-lived but idle entries (a long-dated series,
 a dormant position, an idle vault tag) from archiving. Entries that do
 archive anyway can be restored — see the
 [archival runbook](docs/runbooks/archival.md) and `scripts/restore/`.
+In options_market, closed series and positions don't need to be kept
+alive at all: once past their retention period they can be deleted
+with `prune_positions` / `prune_series` (see "Pruning and the
+active-series cap"), which frees the entries instead of letting them
+archive with rent already paid.
 
 ## `options_market` reference
 
@@ -211,18 +255,19 @@ documented per field.
 | `pause_via_multisig(multisig_contract, action_id)` / `unpause_via_multisig(...)` | Permissionless alternative to `pause`/`unpause`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. No `require_auth()` — the M-of-N approval itself is what authorizes the call. |
 | `upgrade(new_wasm_hash)` | Swaps the contract's executable via Soroban's deployer, keeping the same address, ID, and storage. |
 | `upgrade_via_multisig(multisig_contract, action_id, new_wasm_hash)` | Permissionless alternative to `upgrade`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Arguably the highest-value place for this pattern in the whole codebase — a contract's executable is the single most consequential thing about it. |
-| `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out; `premium` must be > 0 (`InvalidSeriesParams`). Capped at `MAX_SERIES_PER_UNDERLYING` (50) series ever listed per underlying symbol. Each `(underlying, option_type, strike_price, expiry)` spec can be listed once, ever (a cancelled or settled series still owns it): a second listing fails with `DuplicateSeries`. |
-| `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Same validation and per-underlying cap apply. |
+| `create_series(underlying, option_type, strike_price, expiry, premium, implied_vol)` | Lists a new series. `expiry` must be > 1 hour out; `premium` must be > 0 (`InvalidSeriesParams`). Capped at `max_active_series` (default `DEFAULT_MAX_ACTIVE_SERIES` = 50) **concurrently active** series per underlying symbol (`TooManySeriesForUnderlying`); see "Active-series cap" below. Each `(underlying, option_type, strike_price, expiry)` spec can be listed once until its series is pruned (a cancelled or settled series still owns it): a second listing fails with `DuplicateSeries`. Blocked with `MigrationPending` until `migrate_counters` finishes after an upgrade. |
+| `create_series_via_multisig(multisig_contract, action_id, underlying, option_type, strike_price, expiry, premium, implied_vol)` | Permissionless alternative to `create_series`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. Same validation and active-series cap apply. |
 | `update_premium(series_id, new_premium, new_implied_vol)` | Re-prices an Active series. `new_premium` must be > 0 (`InvalidSeriesParams`). |
 | `update_premium_via_multisig(multisig_contract, action_id, series_id, new_premium, new_implied_vol)` | Permissionless alternative to `update_premium`: cross-calls a deployed `multisig` and checks `is_approved(action_id)` instead of requiring the admin's own signature. |
 | `cancel_series(series_id)` | Cancels an Active series. Position holders then call `claim_refund` individually — the admin doesn't push funds to everyone in one call, since that would scale badly against Soroban's per-call resource limits. |
+| `set_max_active_series(cap)` / `set_max_active_series_via_multisig(multisig_contract, action_id, cap)` | Sets the per-underlying cap on concurrently active series, `1..=MAX_ACTIVE_SERIES_CEILING` (500), else `InvalidActiveSeriesCap`. A params registry value for `max_ser` overrides it on the next registry version change. Multisig class: Standard. |
 | `cancel_series_via_multisig(multisig_contract, action_id, series_id)` | Permissionless alternative to `cancel_series`: cross-calls a deployed `multisig` and checks `is_executable(action_id, class)` instead of requiring the admin's own signature. Cancelling disrupts every open position in a series, so gating it behind M-of-N is at least as warranted as pause. |
 
 ### Oracle
 
 | Function | Description |
 |---|---|
-| `set_settlement_price(series_id, price)` | The trusted-oracle-address flow: whatever address was set as `oracle` at `initialize` asserts a price directly. Records it and flips the series to `Settled`. |
+| `set_settlement_price(series_id, price)` | The trusted-oracle-address flow: whatever address was set as `oracle` at `initialize` asserts a price directly. Records it and flips the series to `Settled`. One-shot: an already Settled series fails with `AlreadySettled`, a Cancelled one with `SeriesNotActive`. Records the settlement time as the series' retention anchor. |
 | `set_settlement_price_from_oracle(series_id, oracle_contract)` | The permissionless alternative: anyone can settle an expired series by pointing at a live `price_oracle` deployment and letting it supply the price via a cross-contract call. No signature required — the price is already backed by that contract's own feeder-authenticated aggregate. |
 
 ### Traders
@@ -250,6 +295,64 @@ documented per field.
 | `claim_refund(owner, position_id)` | On a Cancelled series: buyers get their premium back (net of the fee already sent to `fee_recipient`), writers get their full collateral back. Paid directly from options_market's own balance. |
 | `claim_refund_from_vault(vault_contract, owner, position_id)` | Same eligibility checks and refund formula as `claim_refund`, but pays out of a deployed `vault`'s `series_id`-tagged escrow instead — see "Vault integration" below. Requires `escrow_series_to_vault` to have moved this series' liability into `vault` first. |
 
+### Pruning and the active-series cap
+
+| Function | Description |
+|---|---|
+| `prune_positions(position_ids)` | Permissionless. Removes up to `MAX_BATCH_SIZE` (25) terminal positions whose series' retention period has passed (see the retention policy below), plus each id's entry in its owner's `UserPositions` list, and emits `position_pruned(owner, series_id; OptionPosition)` with the full record. All-or-nothing: `NotPrunable` for a position that is not terminal or still carries a liability, `RetentionNotElapsed` before the retention period ends. Returns the number pruned. |
+| `prune_series(series_id)` | Permissionless. Removes a terminal series once **all** its positions are pruned (`SeriesHasPositions` otherwise) and its retention period has passed, together with its `SeriesEscrow`, `SeriesIndex` (the spec can be listed again), `SeriesPositions`, `SeriesClosedAt` and `SeriesReleased` entries. Frees its active-series slot if it still held one, and emits `series_pruned(underlying, series_id; OptionSeries)`. |
+| `release_series_slot(series_id)` | Permissionless. Frees the series' active-series slot if it no longer needs one (below). Returns whether it did; each series releases at most once. |
+| `migrate_counters(limit)` | Permissionless, run after upgrading from a version without these counters. Reads at most `limit` (1..=`MAX_PAGE_SCAN` = 200) entries per call, first every position (to rebuild per-series counts), then every series (to rebuild `ActiveSeriesCount`). Returns `true` when done. Until then `create_series`, pruning and `release_series_slot` fail with `MigrationPending`. Fresh deployments start migrated. |
+
+#### Retention policy
+
+A **series is terminal** once it is `Settled` or `Cancelled`. Its
+retention period, `PRUNE_RETENTION` (30 days), runs from its anchor:
+
+- **Settled:** the later of the settlement time and the end of the exercise window (`expiry + settlement_window`).
+- **Cancelled:** the cancellation time.
+
+Series closed before this version have no recorded close time and fall
+back to `expiry`, which is never earlier than the real anchor.
+
+A **position is terminal**, and carries no liability, when:
+
+| Series | Side | Terminal when |
+|---|---|---|
+| Cancelled | either | its refund was claimed (`is_settled`) |
+| Settled | Short | its collateral was reclaimed (`is_settled`) |
+| Settled | Long | exercised, auto-exercised or forfeited (`is_exercised`), or it expired worthless (payout 0) |
+
+An unexercised in-the-money long is never pruned while its payout is
+still claimable: it becomes terminal only after `sweep_forfeited` pays
+it out (after the 90-day forfeiture window). An unreclaimed short and an
+unrefunded position of a cancelled series are never pruned either.
+
+Pruned ids are never reused. `get_position` / `get_series` return
+`None` for them; `get_position_status` / `get_series_status` return
+`Pruned` for an allocated id whose entry was pruned, `None` for an id
+that was never allocated, and `Live(record)` otherwise. The
+`position_pruned` / `series_pruned` events are the permanent record for
+indexers. Oracle history is out of scope (it has its own ring buffer).
+There is no keeper bounty yet.
+
+#### Active-series cap
+
+`ActiveSeriesCount(underlying)` counts series that hold a listing slot.
+`create_series` takes a slot; a series gives it back exactly once
+(guarded by `SeriesReleased(series_id)`) when it:
+
+- is **Settled** and its exercise window has closed. Unexercised ITM longs don't keep it active: they're tracked in `OrphanedLiabilities` and still block pruning until swept;
+- is **Cancelled** and every position has taken its refund. An empty series is released as soon as it's cancelled, otherwise on the last refund;
+- is **pruned**, if it hadn't released already.
+
+An Active series, including one past expiry that hasn't been settled,
+always counts. Cancelled releases happen automatically; a settled
+series is released by anyone calling `release_series_slot` (or
+`prune_series`) once its window has closed. There is no `Voided` state
+in this contract; `Cancelled` covers it. `get_series_count_for_underlying`
+still returns the lifetime count, but it no longer caps anything.
+
 ### Vault integration
 
 | Function | Description |
@@ -259,7 +362,11 @@ documented per field.
 ### Views
 
 `get_admin`, `is_paused`, `get_fee_rate`, `get_premium_pool`,
-`get_series_count_for_underlying`, `get_series_id`, `get_series`, `get_position`,
+`get_series_count_for_underlying` (lifetime), `get_active_series_count`,
+`get_max_active_series`, `get_series_position_counts` (`{ live, open }`),
+`get_migration_state`, `is_migrated`, `get_position_status`,
+`get_series_status`,
+`get_series_id`, `get_series`, `get_position`,
 `get_user_positions`, `get_underlying_price`, `get_series_escrow`
 (remaining not-yet-claimed refund liability for a series), `get_stats`
 (total premiums collected, total open interest, series count),
@@ -276,7 +383,7 @@ At `limit = 50` in the test harness: `get_series_page` ≈ 2.0M CPU /
 |---|---|
 | `get_series_page(cursor, limit, filter)` | Series with id > `cursor`, in id order. `SeriesFilter { state, underlying, option_type }` — each a list of accepted values, empty = any. `state` is the stored state (stays `Active` past expiry until settled/cancelled). Returns `SeriesPage { items, next_cursor }`. |
 | `get_user_positions_page(user, cursor, limit, side)` | `user`'s positions from index `cursor` of their position list, optionally only `Long` or `Short`. Returns `PositionPage { items, next_cursor }`. |
-| `get_series_by_underlying(symbol)` | Every series id listed on `symbol`, oldest first (secondary index maintained on create; bounded by `MAX_SERIES_PER_UNDERLYING`). |
+| `get_series_by_underlying(symbol)` | Every series id listed on `symbol`, oldest first (secondary index maintained on create; ids of pruned series are dropped). |
 | `get_position_value(position_id)` | **Indicative only — never used for settlement.** Intrinsic value at the settlement price if set, else the last recorded underlying price (0 if neither). Positive for longs, negative for shorts, 0 once exercised/settled. |
 | `get_account_summary(user)` | **Indicative only.** `AccountSummary { open_positions, long_value, short_liability, collateral_locked, net_value }` over `user`'s open positions. |
 
@@ -284,21 +391,23 @@ At `limit = 50` in the test harness: `get_series_page` ≈ 2.0M CPU /
 
 | # | Error | | # | Error |
 |---|---|---|---|---|
-| 1 | `AlreadyInitialized` | | 13 | `PriceNotSet` |
-| 2 | `Unauthorized` | | 14 | `NotInTheMoney` |
-| 3 | `SeriesNotFound` | | 15 | `WrongSide` |
-| 4 | `SeriesNotActive` | | 16 | `ExpiryTooSoon` |
-| 5 | `SeriesNotExpired` | | 17 | `ContractPaused` |
-| 6 | `PositionNotFound` | | 18 | `SeriesNotCancelled` |
-| 7 | `InsufficientPremium` | | 19 | `InvalidFeeRate` |
-| 8 | `InsufficientCollateral` | | 20 | `TooManySeriesForUnderlying` |
-| 9 | `AlreadyExercised` | | 21 | `InsufficientPremiumPool` |
-| 10 | `AlreadySettled` | | 22 | `InvalidSeriesParams` |
-| 11 | `ExerciseWindowClosed` | | 23 | `InvalidBatchSize` |
-| 12 | `ZeroContracts` | | 24 | `NothingToEscrow` |
-| | | | 25 | `NotEligibleForForfeiture` |
-| | | | 26 | `DuplicateSeries` |
-| | | | 27 | `InvalidSplitAmount` |
+| 1 | `AlreadyInitialized` | | 18 | `SeriesNotCancelled` |
+| 2 | `Unauthorized` | | 19 | `InvalidFeeRate` |
+| 3 | `SeriesNotFound` | | 20 | `TooManySeriesForUnderlying` (active-series cap) |
+| 4 | `SeriesNotActive` | | 21 | `InsufficientPremiumPool` |
+| 5 | `SeriesNotExpired` | | 22 | `InvalidSeriesParams` |
+| 6 | `PositionNotFound` | | 23 | `InvalidBatchSize` |
+| 7 | `InsufficientPremium` | | 24 | `NothingToEscrow` |
+| 8 | `InsufficientCollateral` | | 25 | `PremiumBelowMinimum` |
+| 9 | `AlreadyExercised` | | 26 | `NotEligibleForForfeiture` |
+| 10 | `AlreadySettled` | | 27 | `DuplicateSeries` |
+| 11 | `ExerciseWindowClosed` | | 28 | `InvalidSplitAmount` |
+| 12 | `ZeroContracts` | | 29 | `NotPrunable` |
+| 13 | `PriceNotSet` | | 30 | `RetentionNotElapsed` |
+| 14 | `NotInTheMoney` | | 31 | `SeriesHasPositions` |
+| 15 | `WrongSide` | | 32 | `MigrationPending` |
+| 16 | `ExpiryTooSoon` | | 33 | `InvalidActiveSeriesCap` |
+| 17 | `ContractPaused` | | 34 | `InvalidPageLimit` |
 
 ## `price_oracle` reference
 
@@ -716,6 +825,7 @@ Views: `get_param(key) -> Option<{value, min, max, updated_at}>`,
 |---|---|---|---|---|
 | `fee_bps` | options_market fee rate | basis points | `[0, 1000]` | local `FeeRateBps` (50) |
 | `settle_w` | options_market exercise window after expiry | seconds | `[3600, 604800]` | 86,400 |
+| `max_ser` | options_market cap on concurrently active series per underlying | series | `[1, 500]` | local `MaxActiveSeries` (50) |
 
 options_market points at a registry via admin-only
 `set_params_registry(registry)`. It caches both values in instance

@@ -1,0 +1,19 @@
+[package]
+name = "resource-snapshot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Dev-only helper for the per-crate `test_resources` suites: measures one
+# contract invocation (CPU, memory, footprint entries and bytes) and
+# compares it against a committed JSON snapshot under
+# `<crate>/snapshots/resources/`. Never linked into any contract wasm.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Same version as every contract crate, so the testutils Env types unify.
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
