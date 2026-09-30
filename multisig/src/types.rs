@@ -3,6 +3,13 @@ use soroban_sdk::{contracttype, Address, BytesN, Symbol, Val, Vec};
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
+use soroban_sdk::{contracttype, Address, BytesN, Symbol, Val, Vec};
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    /// O(1) membership check — see issue #101.
+    IsSigner(Address),
     /// Map<Address, u32>: every signer and their voting weight.
     Signers,
     /// Approval weight an action needs for `is_approved`.
