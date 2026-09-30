@@ -22,16 +22,13 @@ on:
 # multisig build step above runs before the vault build step, not just
 # before options_market's.
 #
-# The `budgets` job builds every contract, optimizes it, enforces the wasm
-# size budgets in scripts/wasm-size/budgets.txt (#106), then runs the
-# resource-snapshot suites against the optimized wasm and posts the
-# summary table (#105).
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, lp_token, lp_pool, integration_tests]
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, integration_tests]
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, lp_token, lp_pool, integration_tests]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, integration_tests, tools/spec-diff, tools/resource-snapshot]
+        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, lp_token, lp_pool, integration_tests, tools/spec-diff, tools/resource-snapshot]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, integration_tests, tools/resource-snapshot]
+        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, lp_token, lp_pool, integration_tests, tools/resource-snapshot]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -104,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow, integration_tests]
+        crate: [options_market, price_oracle, vault, multisig, streams, staking, timelock, governor, params, grants_escrow, lp_token, lp_pool, integration_tests]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

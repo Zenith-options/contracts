@@ -35,6 +35,11 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
 - [`timelock/`](timelock) — a delayed-execution admin (proposer /
   executor / canceller roles, predecessor dependencies) meant to hold the
   admin role on the other contracts so users always get an exit window.
+- [`lp_pool/`](lp_pool) — a liquidity-provider pool that writes options
+  on `options_market` on behalf of its depositors, with epoch-queued
+  deposits and withdrawals. See [docs/lp_pool.md](docs/lp_pool.md).
+- [`lp_token/`](lp_token) — a SEP-41 share token that only the pinned
+  `lp_pool` can mint. See [docs/lp_token.md](docs/lp_token.md).
 - [`multisig/`](multisig) — M-of-N approval tracking for opaque,
   caller-defined actions, motivated by every other contract here having
   a single `admin: Address` as its sole point of control. A fixed
@@ -628,9 +633,45 @@ data `amount`), and the token-scoped ones:
 
 ## `multisig` reference
 
-Signers, threshold, `approval_ttl`, timelock `delays` and the optional
-custom-account config are all fixed at `initialize` and immutable — there's deliberately no in-protocol way to change the signer
-set, so a compromised signer can never add another compromised signer.
+Every signer has a weight and `threshold` is a total weight: an action
+is approved once the summed weight of its fresh approvals reaches it.
+The legacy `initialize` gives every signer weight 1, which is plain
+M-of-N. `approval_ttl` is fixed at initialization.
+
+> **Note:** the timelock tiers (`is_executable`, `delays`) and custom
+> account (`__check_auth`) documented below were described by #150, but
+> their source was never committed. The multisig here was restored from
+> #149 and does not implement them yet; `zenith-common`'s
+> `is_executable` cross-call has nothing to call until they're rebuilt.
+
+### Why rotation exists, and how it stays safe
+
+Signers used to be immutable, so that a compromised signer could never
+add another compromised signer. The cost was liveness: every lost key
+permanently weakened the multisig, and losing `N − M + 1` keys bricked
+every contract it administers. Redeploying doesn't help, because
+re-pinning a new multisig needs the old one's approval.
+
+Rotation keeps the original safety goal with four guards:
+
+1. **Higher bar.** A signer change needs `rotation_threshold` approval
+   weight, which is always above `threshold` (or equal to the total
+   weight, i.e. unanimity). A normal quorum, including one holding a
+   compromised key, can't rotate on its own.
+2. **Mandatory delay with a single-signer veto.** Once approved, a change
+   waits `rotation_delay` seconds before it can execute. Any one signer
+   can `veto_signer_change` until then, so a single honest key can stop
+   a hostile rotation.
+3. **Small steps.** At most one signer is added and one removed per
+   change. Every invariant (`1 <= threshold <= total weight`, no
+   duplicates, weights > 0, overflow-safe sums, a reachable rotation
+   threshold) is checked when the change is proposed and again when it
+   executes.
+4. **Epoch invalidation.** Approvals are stored as
+   `Approval(epoch, action, signer)`. Executing a change bumps
+   `SignerEpoch`, which invalidates every outstanding vote in O(1),
+   including votes from a removed signer. A change proposed in an
+   earlier epoch can't execute (`StaleSignerChange`).
 
 Action ids are `BytesN<32>`. Every action has an on-chain registry entry,
 `ActionMeta { proposer, created_at, description_hash, status }`
@@ -642,7 +683,8 @@ is swap-removed on execute, reset, or expiry.
 
 | Function | Description |
 |---|---|
-| `initialize(signers, threshold, approval_ttl, delays, account)` | One-time setup. Rejects a zero threshold, a threshold above the signer count, or a duplicate signer. `approval_ttl` is in seconds; zero means approvals never expire (the original behavior). `delays: Delays { standard, critical }` (seconds; `standard <= critical`). `account: Option<AccountConfig { signers: Vec<BytesN<32>>, threshold, allowed_contracts }>` enables custom-account mode. |
+| `initialize(signers, threshold, approval_ttl)` | Backward-compatible equal-weight setup: every signer gets weight 1. The rotation threshold is `threshold + 1` (or unanimity when `threshold` is already every signer), and the rotation delay is `DEFAULT_ROTATION_DELAY` (3 days). Rejects a zero threshold, a threshold above the signer count, or a duplicate signer. `approval_ttl` is in seconds; zero means approvals never expire. |
+| `initialize_weighted(signers: Vec<(Address, u32)>, threshold_weight, approval_ttl, rotation_threshold, rotation_delay)` | Weighted setup. Rejects a zero weight (`InvalidWeight`), a total weight that overflows `u32` (`WeightOverflow`), duplicates, `threshold_weight` outside `1..=total`, and a rotation threshold that isn't above the threshold (or equal to the total weight) or is above the total. A signer whose weight alone meets the threshold is **allowed** but announced with a `single_key_quorum` event, e.g. for a deliberate hardware-secured cold key. |
 | `register_action(proposer, action_id, description_hash)` | Signer-only. Registers `action_id` with a `description_hash` (e.g. sha256 of an off-chain write-up) before anyone votes, so signers can verify on-chain what they approve. Rejects an id that's already pending or executed. |
 | `approve(signer, action_id)` | Records `signer`'s approval, stamped with the current ledger timestamp. Requires the signer's own signature and current signer-set membership. Registers the action (zero description hash) if it isn't pending yet. Rejects an executed action, and a signer voting twice while their existing approval is still fresh — an EXPIRED approval is treated as no approval at all, so re-approving after expiry just refreshes the timestamp. |
 | `revoke(signer, action_id)` | Withdraws `signer`'s own still-fresh vote. Rejects revoking an approval that's already expired — there's nothing left to withdraw. |
@@ -650,10 +692,34 @@ is swap-removed on execute, reset, or expiry.
 | `expire(action_id)` | Anyone. Marks a stale pending action `Expired` and drops it from the index: requires a nonzero `approval_ttl`, the action older than it, and no approval still fresh. |
 | `propose(proposer, target, function, args) -> proposal_id` | Signer-only. Stores `Proposal { target, function, args, nonce }` (at most `MAX_PROPOSAL_ARGS` (10) args) and registers it. `proposal_id` = sha256 of the proposal's XDR, which is also its description hash, so the id commits to the exact call. |
 | `execute(proposal_id)` | Anyone, once approved. Marks the proposal `Executed`, then calls `target.function(args)` via `invoke_contract` **as the multisig** — so a target whose admin is the multisig passes its `admin.require_auth()` with no other signature. Can never run twice; a failing target call reverts the whole transaction (the proposal stays pending). Returns the target's return value. |
+| `propose_signer_change(proposer, add: Vec<SignerWeight>, remove: Vec<Address>, new_threshold, new_rotation_threshold) -> change_id` | Signer-only. `add` and `remove` each hold at most one entry; adding the address being removed changes its weight. Validated against the resulting set. `change_id` = sha256 of the `SignerChange` XDR (including the current epoch and a nonce), so approvals bind to the exact payload. Emits `signer_change_proposed`. |
+| `queue_signer_change(change_id) -> ready_at` | Anyone, once `get_approval_weight(change_id) >= rotation_threshold`. Starts the `rotation_delay`. |
+| `veto_signer_change(signer, change_id)` | Any single signer, any time before execution. Marks the change `Reset` and emits `signer_change_vetoed`. |
+| `execute_signer_change(change_id)` | Anyone, at or after `ready_at`, as long as the approval weight still meets `rotation_threshold` and the epoch hasn't changed. Applies the change, bumps the epoch and emits `signers_rotated`. |
+
+Weighted example: two core members (weight 2) and three community members (weight 1) with `threshold_weight = 4`. Any 2 core members approve (2 + 2), or 1 core member plus 2 community members (2 + 1 + 1), but 3 community members alone (3) do not.
+
+```sh
+stellar contract invoke --id $MULTISIG -- initialize_weighted \
+  --signers '[["'$CORE_A'",2],["'$CORE_B'",2],["'$COMM_A'",1],["'$COMM_B'",1],["'$COMM_C'",1]]' \
+  --threshold_weight 4 --approval_ttl 0 --rotation_threshold 6 --rotation_delay 259200
+```
+
+Rotating out a lost key (2-of-3 legacy setup, rotation threshold 3):
+
+```sh
+ID=$(stellar contract invoke --id $MULTISIG --source a -- propose_signer_change \
+  --proposer $A --add '[{"address":"'$D'","weight":1}]' --remove '["'$C'"]' \
+  --new_threshold 2 --new_rotation_threshold 3)
+# a, b, c approve($ID) -> queue_signer_change($ID) -> wait 3 days -> execute_signer_change($ID)
+```
+
+A lost key can't vote, so the rotation threshold must stay reachable
+without it. Set it below the total weight when you initialize.
 
 ### Views
 
-`is_signer`, `get_signer_count`, `get_threshold`, `get_approval_ttl`, `has_approved(action_id, signer)` (false if expired), `get_approval_count(action_id)` (counts only currently-unexpired approvals), `is_approved(action_id)`, `is_executable(action_id, class)`, `get_threshold_reached_at(action_id)`, `get_delays`, `get_delay(class)`, `get_account_config`, `get_action(action_id)` (`ActionMeta` or none), `get_pending_actions(cursor, limit)` (up to `limit` ≤ 50 pending ids from index `cursor`; order isn't stable across writes because removal is swap-remove), `get_pending_count`, `get_proposal(proposal_id)`.
+`is_signer`, `get_signers` (address → weight), `get_signer_weight(address)` (0 if not a signer), `get_signer_count`, `get_total_weight`, `get_threshold` (a weight), `get_rotation_threshold`, `get_rotation_delay`, `get_signer_epoch`, `get_approval_ttl`, `has_approved(action_id, signer)` (false if expired or from an earlier epoch), `get_approval_count(action_id)` (number of signers with a fresh approval), `get_approval_weight(action_id)` (their summed weight), `is_approved(action_id)` (weight ≥ threshold), `get_signer_change(change_id)`, `get_signer_change_ready_at(change_id)`, `get_action(action_id)` (`ActionMeta` or none), `get_pending_actions(cursor, limit)` (up to `limit` ≤ 50 pending ids from index `cursor`; order isn't stable across writes because removal is swap-remove), `get_pending_count`, `get_proposal(proposal_id)`.
 
 ### Timelock tiers
 
@@ -733,7 +799,7 @@ stellar tx simulate --network testnet < pause.signed.tx \
 
 ### Events
 
-`registered`, `approved`, `revoked` (topics: name, address, action id), `reset`, `expired`, `executed` (topics: name, action id). Every event's data is the action's description hash.
+`registered`, `approved`, `revoked` (topics: name, address, action id), `reset`, `expired`, `executed` (topics: name, action id). Every event's data is the action's description hash. Rotation: `signer_change_proposed` (proposer, change id; data: the `SignerChange`), `signer_change_queued` (change id; data: ready-at), `signer_change_vetoed` (signer; data: change id), `signers_rotated` (change id; data: new epoch). `single_key_quorum` (signer; data: `(weight, threshold)`) warns that one signer can approve alone.
 
 ### Errors
 
@@ -745,13 +811,25 @@ stellar tx simulate --network testnet < pause.signed.tx \
 | 4 | `NotASigner` |
 | 5 | `AlreadyApproved` |
 | 6 | `NotYetApproved` |
-| 7 | `ActionAlreadyRegistered` |
-| 8 | `ActionNotPending` |
-| 9 | `TooManyPendingActions` |
-| 10 | `ProposalNotFound` |
-| 11 | `ProposalTooLarge` |
-| 12 | `InvalidPageLimit` |
-| 13 | `NotExpired` |
+| 7 | `InvalidDelays` |
+| 8 | `AccountNotConfigured` |
+| 9 | `UnsortedSignatures` |
+| 10 | `InsufficientSignatures` |
+| 11 | `ContextNotAllowed` |
+| 12 | `ActionAlreadyRegistered` |
+| 13 | `ActionNotPending` |
+| 14 | `TooManyPendingActions` |
+| 15 | `ProposalNotFound` |
+| 16 | `ProposalTooLarge` |
+| 17 | `InvalidPageLimit` |
+| 18 | `NotExpired` |
+| 19 | `InvalidWeight` |
+| 20 | `WeightOverflow` |
+| 21 | `InvalidSignerChange` |
+| 22 | `SignerChangeNotFound` |
+| 23 | `StaleSignerChange` |
+| 24 | `RotationDelayActive` |
+| 25 | `SignerChangeNotQueued` |
 
 ### Migrating from `_via_multisig` to executor mode
 
