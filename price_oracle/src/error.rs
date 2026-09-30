@@ -14,4 +14,11 @@ pub enum Error {
     TooManyFeeders = 8,
     Unauthorized = 9,
     InvalidMinReports = 10,
+    // Schema migrations (zenith_common::migrations) — same codes in
+    // every Zenith contract. See docs/migrations.md.
+    SchemaVersionMismatch = 100,
+    InvalidMigrationTarget = 101,
+    MigrationInProgress = 102,
+    NoMigrationInProgress = 103,
+    InvalidMigrationBatch = 104,
 }

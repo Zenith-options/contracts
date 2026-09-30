@@ -10,4 +10,11 @@ pub enum Error {
     NothingToWithdraw = 4,
     CooldownActive = 5,
     TooManyRewardTokens = 6,
+    // Schema migrations (zenith_common::migrations) — same codes in
+    // every Zenith contract. See docs/migrations.md.
+    SchemaVersionMismatch = 100,
+    InvalidMigrationTarget = 101,
+    MigrationInProgress = 102,
+    NoMigrationInProgress = 103,
+    InvalidMigrationBatch = 104,
 }

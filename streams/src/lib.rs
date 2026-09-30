@@ -22,9 +22,11 @@ mod test;
 mod error;
 mod events;
 pub mod math;
+mod migrations;
 mod types;
 
 use error::Error;
+pub use migrations::CURRENT_SCHEMA_VERSION;
 use types::{DataKey, Stream};
 
 #[contract]
@@ -68,6 +70,7 @@ impl Streams {
             .instance()
             .set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::StreamCounter, &0u64);
+        zenith_common::migrations::init_schema(&env, CURRENT_SCHEMA_VERSION);
     }
 
     pub fn get_governance(env: Env) -> Address {
@@ -90,6 +93,7 @@ impl Streams {
         end: u64,
     ) -> u64 {
         funder.require_auth();
+        migrations::require_current(&env);
         if total <= 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
@@ -131,6 +135,7 @@ impl Streams {
     pub fn withdraw(env: Env, stream_id: u64, amount: i128) {
         let mut stream = load(&env, stream_id);
         stream.recipient.require_auth();
+        migrations::require_current(&env);
         if amount <= 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
@@ -154,6 +159,7 @@ impl Streams {
     /// the funder is refunded the unstreamed remainder.
     pub fn cancel(env: Env, caller: Address, stream_id: u64) {
         caller.require_auth();
+        migrations::require_current(&env);
         let mut stream = load(&env, stream_id);
         if caller != stream.funder && caller != Self::get_governance(env.clone()) {
             panic_with_error!(&env, Error::Unauthorized);
@@ -187,6 +193,7 @@ impl Streams {
     pub fn transfer(env: Env, stream_id: u64, new_recipient: Address) {
         let mut stream = load(&env, stream_id);
         stream.recipient.require_auth();
+        migrations::require_current(&env);
         if stream.canceled {
             panic_with_error!(&env, Error::StreamCanceled);
         }
@@ -194,6 +201,44 @@ impl Streams {
         stream.recipient = new_recipient.clone();
         save(&env, stream_id, &stream);
         events::transferred(&env, stream_id, old, new_recipient);
+    }
+
+    // ── Schema migrations (docs/migrations.md) ──────────────────────────────
+
+    /// Runs the registered steps `from+1 ..= to`. Governance only. Returns
+    /// the version reached (less than `to` if a step paginated).
+    pub fn migrate(env: Env, from: u32, to: u32) -> u32 {
+        Self::get_governance(env.clone()).require_auth();
+        zenith_common::migrations::migrate(
+            &env,
+            from,
+            to,
+            CURRENT_SCHEMA_VERSION,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    /// Continues a paginated migration from `cursor`. Permissionless, like
+    /// `bump`: the target was fixed by `migrate` and the steps are code in
+    /// this wasm, so a keeper can only advance it.
+    pub fn migrate_batch(env: Env, cursor: u32, limit: u32) -> u32 {
+        zenith_common::migrations::migrate_batch(
+            &env,
+            cursor,
+            limit,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    pub fn schema_version(env: Env) -> u32 {
+        zenith_common::migrations::schema_version(&env)
+    }
+
+    /// `(target, cursor)` while a paginated migration is in progress.
+    pub fn migration_state(env: Env) -> Option<(u32, u32)> {
+        zenith_common::migrations::migration_state(&env)
     }
 
     /// `(recipient_withdrawable, funder_refundable)` as of now: what the

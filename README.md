@@ -58,7 +58,10 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   and admin-transfer helpers. Every admin function is a single
   `x_inner(env, Auth, ...)` called by both its admin-gated entrypoint
   and its `_via_multisig` twin, so no validation is duplicated between
-  twins.
+  twins. Also hosts the storage-migration framework
+  (`zenith_common::migrations`) and pinned-multisig upgrades
+  (`zenith_common::upgrade`) that every contract uses. See
+  [Upgrades and storage migrations](#upgrades-and-storage-migrations).
 - [`params/`](params) — a timelock-controlled registry of protocol
   parameters, each with hard `[min, max]` bounds. `options_market`
   reads its fee rate and settlement window from it (cached locally,
@@ -190,6 +193,32 @@ so a keeper can keep long-lived but idle entries (a long-dated series,
 a dormant position, an idle vault tag) from archiving. Entries that do
 archive anyway can be restored — see the
 [archival runbook](docs/runbooks/archival.md) and `scripts/restore/`.
+
+## Upgrades and storage migrations
+
+Every contract carries a `SchemaVersion` (written at `initialize`; a
+missing key reads as the baseline `1`) and a `migrate(from, to)`
+entrypoint that runs the storage-migration steps compiled into the
+current wasm, keyed by the version they migrate **to**. Full guide,
+including how to author a step: [`docs/migrations.md`](docs/migrations.md).
+
+| Function | Description |
+|---|---|
+| `migrate(from, to) -> u32` | Runs steps `from+1 ..= to` in order. Rejects `from` ≠ stored version (so a step can't repeat) and `to` beyond this wasm's `CURRENT_SCHEMA_VERSION`. Returns the version reached. Who may call it depends on the contract (admin, pinned multisig, timelock, governance, any multisig signer). See the guide. |
+| `migrate_batch(cursor, limit) -> u32` | Permissionless. Continues a migration whose step paginated, from exactly the cursor it stopped at (`limit` ≤ 200). |
+| `schema_version()` / `migration_state()` | Stored layout version and `(target, cursor)` while a migration is in flight. |
+| `upgrade(new_wasm_hash)` | options_market, price_oracle, vault: admin swaps the wasm, keeping address and storage. |
+| `upgrade_via_multisig(action_id, new_wasm_hash)` | price_oracle, vault: authorized only by the multisig pinned with `set_upgrade_multisig`, and only for `action_id == upgrade_action_id(new_wasm_hash)`, so approvals bind to one wasm on one contract. `Critical` class. |
+| multisig `approve_upgrade` / `revoke_upgrade` / `upgrade` | The multisig upgrades itself only after **every** signer approves the exact hash, plus a 3-day `UPGRADE_DELAY`. Its signer set is immutable by design, and an upgrade could change it. |
+
+While the stored version lags the code (right after an upgrade) or a
+paginated migration is in flight, state-changing entrypoints fail with
+`MigrationInProgress` (102). Views keep working. When upgrading through
+the timelock, schedule `upgrade` and `migrate` as two calls in **one**
+operation so the pair is atomic. Migration errors use the same codes in
+every contract: 100 `SchemaVersionMismatch`, 101 `InvalidMigrationTarget`,
+102 `MigrationInProgress`, 103 `NoMigrationInProgress`,
+104 `InvalidMigrationBatch`.
 
 ## `options_market` reference
 

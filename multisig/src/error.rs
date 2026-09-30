@@ -22,4 +22,14 @@ pub enum Error {
     ProposalTooLarge = 16,
     InvalidPageLimit = 17,
     NotExpired = 18,
+    // Schema migrations (zenith_common::migrations) — same codes in
+    // every Zenith contract. See docs/migrations.md.
+    SchemaVersionMismatch = 100,
+    InvalidMigrationTarget = 101,
+    MigrationInProgress = 102,
+    NoMigrationInProgress = 103,
+    InvalidMigrationBatch = 104,
+    // Self-upgrade (upgrade.rs).
+    UpgradeNotUnanimous = 105,
+    UpgradeDelayNotElapsed = 106,
 }
