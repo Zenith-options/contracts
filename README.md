@@ -69,6 +69,25 @@ Soroban (Stellar smart contract) crates for the Zenith options protocol.
   on reviewer quorum, reclaimable by the funder after a missed deadline
   plus grace period. Operations guide:
   [`docs/grants_escrow.md`](docs/grants_escrow.md).
+- [`test_adversaries/`](test_adversaries) — **dev-dependency only, never
+  deployed**. A reusable library of adversarial Soroban contracts for
+  negative-path testing at every cross-contract trust boundary (issue #115).
+  20 adversarial contracts across four modules:
+  - `tokens`: `LyingBalanceToken`, `FeeOnTransferToken`, `RevertOnTransferToken`,
+    `ReentrantToken`, `ZeroBalanceToken`, `OverflowToken`
+  - `oracle`: `AlwaysNoneOracle`, `ExtremeHighOracle`, `ExtremeLowOracle`,
+    `RevertingOracle`, `StaleOracle`, `NegativePriceOracle`
+  - `vault`: `NoOpVault`, `WrongBalanceVault`, `RevertOnWithdrawVault`, `DrainVault`
+  - `multisig`: `AlwaysApproveMultisig`, `NeverApproveMultisig`,
+    `SingleSignerMultisig`, `ExpiredApprovalMultisig`
+
+  Each adversary is a standalone `#[contract]` that mirrors the interface of
+  the real contract it spoofs. `options_market`, `price_oracle`, and `vault`
+  each add a `src/test_adversaries.rs` with one negative test per
+  cross-contract call site. Tests that expose open vulnerabilities are
+  `#[ignore]`'d with the issue title and un-ignored by the fix PRs.
+  See [`test_adversaries/CATALOG.md`](test_adversaries/CATALOG.md) for the
+  full adversary catalog with per-adversary documentation.
 
 ## Building and testing
 

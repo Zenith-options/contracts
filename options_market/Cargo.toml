@@ -39,6 +39,8 @@ multisig = { package = "zenith-multisig", path = "../multisig", features = ["tes
 vault = { package = "zenith-vault", path = "../vault", features = ["testutils"] }
 # Same reasoning as price_oracle above, for src/params_client.rs.
 params = { package = "zenith-params", path = "../params", features = ["testutils"] }
+# Adversarial mock contracts for negative-path cross-contract tests (issue #115).
+test_adversaries = { package = "zenith-test-adversaries", path = "../test_adversaries" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
