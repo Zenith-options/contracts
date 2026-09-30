@@ -1,0 +1,25 @@
+[package]
+name = "zenith-test-adversaries"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = """
+Adversarial Soroban contract mocks for negative-path testing at every
+cross-contract trust boundary in the Zenith protocol. Dev-dependency only —
+never deployed to any network. See the adversary catalog in README.md.
+"""
+
+# Pure rlib: no cdylib, no contract spec entries exported, no wasm output.
+# Consumers register individual adversary structs with
+# env.register_contract(None, Adversary) in their own test code.
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+
+[dev-dependencies]
+soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+
+[features]
+default = []
