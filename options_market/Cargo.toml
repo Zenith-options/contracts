@@ -1,8 +1,8 @@
 [package]
 name = "zenith-options-market"
-version = "0.1.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
 
 [lib]
 # rlib alongside cdylib so timelock can depend on this crate for its
@@ -19,28 +19,47 @@ strip = "symbols"
 debug-assertions = false
 panic = "abort"
 codegen-units = 1
+# Whole-program LTO lets the linker drop and inline across the sdk and
+# zenith-common boundaries — one of the #106 size reductions.
+lto = true
 
 [dependencies]
-soroban-sdk = { version = "21.0.0" }
-zenith-common = { path = "../common" }
+soroban-sdk = { workspace = true }
+zenith-common = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
-ed25519-dalek = "2"
+soroban-sdk = { workspace = true, features = ["testutils"] }
+# Property-based tests for the math modules (see README "Property tests").
+proptest = "1"
+ed25519-dalek = { workspace = true }
 # Dev/test-only: registers a REAL price_oracle contract instance inside the
 # test Env for cross-contract tests. Never linked into the production wasm
 # (see src/price_oracle_client.rs for how production code calls the other
 # contract instead — via contractimport! against its compiled wasm, not by
 # depending on and linking its actual implementation).
-price_oracle = { package = "zenith-price-oracle", path = "../price_oracle", features = ["testutils"] }
-# Same reasoning as price_oracle above, for src/multisig_client.rs.
-multisig = { package = "zenith-multisig", path = "../multisig", features = ["testutils"] }
+price_oracle = { workspace = true, features = ["testutils"] }
+# Registers a real multisig for the `_via_multisig` tests (options_market
+# itself reaches it through zenith-common's invoke_contract, not a client).
+multisig = { workspace = true, features = ["testutils"] }
 # Same reasoning as price_oracle above, for src/vault_client.rs.
-vault = { package = "zenith-vault", path = "../vault", features = ["testutils"] }
+vault = { workspace = true, features = ["testutils"] }
 # Same reasoning as price_oracle above, for src/params_client.rs.
 params = { package = "zenith-params", path = "../params", features = ["testutils"] }
 # Adversarial mock contracts for negative-path cross-contract tests (issue #115).
 test_adversaries = { package = "zenith-test-adversaries", path = "../test_adversaries" }
+# Measures and snapshots per-entrypoint resource usage (src/test_resources.rs).
+resource-snapshot = { path = "../tools/resource-snapshot" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
+# Registers the built release wasm in src/test_resources.rs instead of the
+# native contract, so resource snapshots measure what runs on-chain.
+# Build the wasm first: cargo build --target wasm32-unknown-unknown --release
+resource-wasm = []
+
+# Contracts whose compiled wasm this crate `contractimport!`s (the
+# src/*_client.rs files). `cargo xtask build` reads this to build them first,
+# in dependency order, into the shared workspace target/ directory;
+# `cargo xtask check-imports` fails if a contractimport! path isn't listed.
+[package.metadata.zenith]
+wasm-deps = ["zenith-price-oracle", "zenith-vault", "zenith-params"]

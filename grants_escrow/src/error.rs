@@ -15,4 +15,11 @@ pub enum Error {
     NotAReviewer = 9,
     AlreadyApproved = 10,
     NothingToReclaim = 11,
+    // Schema migrations (zenith_common::migrations) — same codes in
+    // every Zenith contract. See docs/migrations.md.
+    SchemaVersionMismatch = 100,
+    InvalidMigrationTarget = 101,
+    MigrationInProgress = 102,
+    NoMigrationInProgress = 103,
+    InvalidMigrationBatch = 104,
 }

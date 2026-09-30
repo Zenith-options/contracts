@@ -19,10 +19,12 @@ mod test;
 
 mod error;
 mod events;
+mod migrations;
 mod ttl;
 mod types;
 
 use error::Error;
+pub use migrations::CURRENT_SCHEMA_VERSION;
 use types::DataKey;
 pub use types::{BoundsProposal, Param};
 
@@ -52,12 +54,14 @@ impl Params {
         }
         env.storage().instance().set(&DataKey::Timelock, &timelock);
         env.storage().instance().set(&DataKey::Version, &0u64);
+        zenith_common::migrations::init_schema(&env, CURRENT_SCHEMA_VERSION);
     }
 
     /// Creates a parameter that has never been set. Timelock only.
     pub fn define_param(env: Env, key: Symbol, value: i128, min: i128, max: i128) {
         ttl::extend_instance(&env);
         Self::require_timelock(&env);
+        migrations::require_current(&env);
         let param_key = DataKey::Param(key.clone());
         if env.storage().persistent().has(&param_key) {
             panic_with_error!(&env, Error::ParamAlreadyDefined);
@@ -83,6 +87,7 @@ impl Params {
     pub fn set_param(env: Env, key: Symbol, value: i128) {
         ttl::extend_instance(&env);
         Self::require_timelock(&env);
+        migrations::require_current(&env);
         let param_key = DataKey::Param(key.clone());
         let mut param = Self::load(&env, &key);
         if value < param.min || value > param.max {
@@ -102,6 +107,7 @@ impl Params {
     pub fn propose_bounds(env: Env, key: Symbol, min: i128, max: i128) {
         ttl::extend_instance(&env);
         Self::require_timelock(&env);
+        migrations::require_current(&env);
         let param = Self::load(&env, &key);
         if min > max {
             panic_with_error!(&env, Error::InvalidBounds);
@@ -122,6 +128,7 @@ impl Params {
     pub fn execute_bounds(env: Env, key: Symbol) {
         ttl::extend_instance(&env);
         Self::require_timelock(&env);
+        migrations::require_current(&env);
         let pending_key = DataKey::PendingBounds(key.clone());
         let proposal: BoundsProposal = ttl::get_persistent(&env, &pending_key)
             .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingBounds));
@@ -146,6 +153,7 @@ impl Params {
     pub fn cancel_bounds(env: Env, key: Symbol) {
         ttl::extend_instance(&env);
         Self::require_timelock(&env);
+        migrations::require_current(&env);
         let pending_key = DataKey::PendingBounds(key.clone());
         if !env.storage().persistent().has(&pending_key) {
             panic_with_error!(&env, Error::NoPendingBounds);
@@ -177,6 +185,48 @@ impl Params {
     pub fn get_timelock(env: Env) -> Address {
         ttl::extend_instance(&env);
         env.storage().instance().get(&DataKey::Timelock).unwrap()
+    }
+
+    // ── Schema migrations (docs/migrations.md) ──────────────────────────────
+
+    /// Runs the registered steps `from+1 ..= to`. Timelock only. Returns
+    /// the version reached (less than `to` if a step paginated).
+    pub fn migrate(env: Env, from: u32, to: u32) -> u32 {
+        ttl::extend_instance(&env);
+        Self::require_timelock(&env);
+        zenith_common::migrations::migrate(
+            &env,
+            from,
+            to,
+            CURRENT_SCHEMA_VERSION,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    /// Continues a paginated migration from `cursor`. Permissionless, like
+    /// `bump`: the target was fixed by the authorized `migrate` call and the
+    /// steps are code in this wasm, so a keeper can only advance it.
+    pub fn migrate_batch(env: Env, cursor: u32, limit: u32) -> u32 {
+        ttl::extend_instance(&env);
+        zenith_common::migrations::migrate_batch(
+            &env,
+            cursor,
+            limit,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    pub fn schema_version(env: Env) -> u32 {
+        ttl::extend_instance(&env);
+        zenith_common::migrations::schema_version(&env)
+    }
+
+    /// `(target, cursor)` while a paginated migration is in progress.
+    pub fn migration_state(env: Env) -> Option<(u32, u32)> {
+        ttl::extend_instance(&env);
+        zenith_common::migrations::migration_state(&env)
     }
 }
 

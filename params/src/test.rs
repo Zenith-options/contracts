@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{Params, ParamsClient, BOUNDS_CHANGE_DELAY};
+use crate::{error::Error, Params, ParamsClient, BOUNDS_CHANGE_DELAY, CURRENT_SCHEMA_VERSION};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events as _, Ledger},
@@ -109,4 +109,40 @@ fn bounds_must_contain_current_value_and_can_be_cancelled() {
     client.cancel_bounds(&fee());
     assert!(client.try_execute_bounds(&fee()).is_err());
     assert!(client.try_cancel_bounds(&fee()).is_err());
+}
+
+#[test]
+fn schema_version_set_at_initialize() {
+    let (_, client, _) = setup();
+    assert_eq!(client.schema_version(), CURRENT_SCHEMA_VERSION);
+    assert_eq!(client.migration_state(), None);
+}
+
+#[test]
+fn migrate_rejects_unknown_or_stale_targets() {
+    let (_, client, _) = setup();
+    let v = CURRENT_SCHEMA_VERSION;
+    assert_eq!(
+        client.try_migrate(&v, &(v + 1)),
+        Err(Ok(Error::InvalidMigrationTarget))
+    );
+    assert_eq!(
+        client.try_migrate(&(v - 1), &v),
+        Err(Ok(Error::SchemaVersionMismatch))
+    );
+    assert_eq!(
+        client.try_migrate_batch(&0, &10),
+        Err(Ok(Error::NoMigrationInProgress))
+    );
+}
+
+#[test]
+fn migrate_requires_timelock() {
+    let env = Env::default();
+    let timelock = Address::generate(&env);
+    let id = env.register_contract(None, Params);
+    let client = ParamsClient::new(&env, &id);
+    client.initialize(&timelock);
+    let v = CURRENT_SCHEMA_VERSION;
+    assert!(client.try_migrate(&v, &(v + 1)).is_err());
 }

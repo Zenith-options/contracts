@@ -1,21 +1,22 @@
 [package]
 name = "zenith-integration-tests"
-version = "0.1.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
 
 # Test-only crate: deploys every Zenith contract into one Env and walks the
-# governance handover (docs/governance-handover.md) stage by stage. Like
-# options_market, it needs multisig's, price_oracle's and vault's wasm built
-# first — see the CI workflow for the order.
+# governance handover (docs/governance-handover.md) stage by stage. Its
+# options_market dev-dependency needs other contracts' wasm to compile;
+# `cargo xtask test` builds those first (from options_market's
+# `[package.metadata.zenith] wasm-deps`).
 
 [dependencies]
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
-multisig = { package = "zenith-multisig", path = "../multisig", features = ["testutils"] }
-price_oracle = { package = "zenith-price-oracle", path = "../price_oracle", features = ["testutils"] }
-vault = { package = "zenith-vault", path = "../vault", features = ["testutils"] }
-options_market = { package = "zenith-options-market", path = "../options_market", features = ["testutils"] }
-timelock = { package = "zenith-timelock", path = "../timelock", features = ["testutils"] }
-governor = { package = "zenith-governor", path = "../governor", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+multisig = { workspace = true, features = ["testutils"] }
+price_oracle = { workspace = true, features = ["testutils"] }
+vault = { workspace = true, features = ["testutils"] }
+options_market = { workspace = true, features = ["testutils"] }
+timelock = { workspace = true, features = ["testutils"] }
+governor = { workspace = true, features = ["testutils"] }

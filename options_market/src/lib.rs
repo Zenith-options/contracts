@@ -1,7 +1,10 @@
-// options_market lib.rs — implementation stub.
-// Module declarations are kept here so test modules compile;
-// the implementation body is added as part of the options_market
-// feature work tracked separately.
+#![no_std]
+
+mod storage;
+mod types;
+
+#[cfg(test)]
+mod test;
 
 #[cfg(test)]
 mod test_adversaries;

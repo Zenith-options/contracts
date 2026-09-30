@@ -24,9 +24,11 @@ mod test;
 
 mod error;
 mod events;
+mod migrations;
 mod types;
 
 use error::Error;
+pub use migrations::CURRENT_SCHEMA_VERSION;
 use types::{DataKey, PendingUnstake};
 
 /// Scale of RewardPerToken. 1e18 keeps a 1-base-unit reward over a
@@ -111,10 +113,12 @@ impl Staking {
             .set(&DataKey::StakeToken, &stake_token);
         env.storage().instance().set(&DataKey::Splitter, &splitter);
         env.storage().instance().set(&DataKey::Cooldown, &cooldown);
+        zenith_common::migrations::init_schema(&env, CURRENT_SCHEMA_VERSION);
     }
 
     pub fn stake(env: Env, user: Address, amount: i128) {
         user.require_auth();
+        migrations::require_current(&env);
         if amount <= 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
@@ -149,6 +153,7 @@ impl Staking {
     /// existing pending amount and restarts the cooldown.
     pub fn request_unstake(env: Env, user: Address, amount: i128) {
         user.require_auth();
+        migrations::require_current(&env);
         if amount <= 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
@@ -177,6 +182,7 @@ impl Staking {
     /// Returns the pending unstaked amount once the cooldown has elapsed.
     pub fn withdraw(env: Env, user: Address) -> i128 {
         user.require_auth();
+        migrations::require_current(&env);
         let pending_key = DataKey::PendingUnstake(user.clone());
         let pending: PendingUnstake = env
             .storage()
@@ -201,6 +207,7 @@ impl Staking {
     /// Pays out everything `user` has accrued in every reward token.
     pub fn claim_rewards(env: Env, user: Address) {
         user.require_auth();
+        migrations::require_current(&env);
         update_user(&env, &user);
         for token in reward_tokens(&env).iter() {
             let owed_key = DataKey::Owed(user.clone(), token.clone());
@@ -223,6 +230,7 @@ impl Staking {
     pub fn notify_reward(env: Env, token: Address, amount: i128) {
         let splitter: Address = env.storage().instance().get(&DataKey::Splitter).unwrap();
         splitter.require_auth();
+        migrations::require_current(&env);
         if amount <= 0 {
             panic_with_error!(&env, Error::InvalidAmount);
         }
@@ -245,6 +253,45 @@ impl Staking {
         );
         distribute(&env, &token, amount);
         events::reward_notified(&env, token, amount);
+    }
+
+    // ── Schema migrations (docs/migrations.md) ──────────────────────────────
+
+    /// Runs the registered steps `from+1 ..= to`. Returns the version
+    /// reached (less than `to` if a step paginated). Permissionless:
+    /// staking has no admin, and a new step can only arrive with a new
+    /// wasm (see docs/migrations.md, "Governance decisions").
+    pub fn migrate(env: Env, from: u32, to: u32) -> u32 {
+        zenith_common::migrations::migrate(
+            &env,
+            from,
+            to,
+            CURRENT_SCHEMA_VERSION,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    /// Continues a paginated migration from `cursor`. Permissionless, like
+    /// `bump`: the target was fixed by `migrate` and the steps are code in
+    /// this wasm, so a keeper can only advance it.
+    pub fn migrate_batch(env: Env, cursor: u32, limit: u32) -> u32 {
+        zenith_common::migrations::migrate_batch(
+            &env,
+            cursor,
+            limit,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    pub fn schema_version(env: Env) -> u32 {
+        zenith_common::migrations::schema_version(&env)
+    }
+
+    /// `(target, cursor)` while a paginated migration is in progress.
+    pub fn migration_state(env: Env) -> Option<(u32, u32)> {
+        zenith_common::migrations::migration_state(&env)
     }
 
     // ── Views ────────────────────────────────────────────────────────────────

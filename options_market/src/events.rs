@@ -1,5 +1,7 @@
 use soroban_sdk::{Address, Env, Symbol};
 
+use crate::types::{OptionPosition, OptionSeries};
+
 pub fn series_created(env: &Env, series_id: u64, strike_price: i128, expiry: u64, premium: i128) {
     env.events().publish(
         (Symbol::new(env, "series_created"),),
@@ -153,3 +155,46 @@ pub fn option_auto_exercised(
     );
 }
 
+/// Final archival record for a pruned position: carries the full struct,
+/// since after this event the entry is gone from contract storage.
+pub fn position_pruned(env: &Env, position: OptionPosition) {
+    env.events().publish(
+        (
+            Symbol::new(env, "position_pruned"),
+            position.owner.clone(),
+            position.series_id,
+        ),
+        position,
+    );
+}
+
+/// Final archival record for a pruned series (full struct).
+pub fn series_pruned(env: &Env, series: OptionSeries) {
+    env.events().publish(
+        (
+            Symbol::new(env, "series_pruned"),
+            series.underlying.clone(),
+            series.series_id,
+        ),
+        series,
+    );
+}
+
+/// A series released its active-series slot on `underlying`;
+/// `active_count` is the count after the release.
+pub fn series_slot_released(env: &Env, underlying: Symbol, series_id: u64, active_count: u32) {
+    env.events().publish(
+        (Symbol::new(env, "series_slot_released"), underlying),
+        (series_id, active_count),
+    );
+}
+
+pub fn max_active_series_updated(env: &Env, cap: u32) {
+    env.events()
+        .publish((Symbol::new(env, "max_active_series_updated"),), cap);
+}
+
+pub fn counters_migrated(env: &Env) {
+    env.events()
+        .publish((Symbol::new(env, "counters_migrated"),), ());
+}

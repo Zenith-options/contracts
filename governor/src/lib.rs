@@ -36,10 +36,12 @@ mod test;
 mod error;
 mod events;
 pub mod interfaces;
+mod migrations;
 mod types;
 
 use error::Error;
 use interfaces::{TimelockClient, VotesClient};
+pub use migrations::CURRENT_SCHEMA_VERSION;
 use types::DataKey;
 pub use types::{Proposal, ProposalState};
 
@@ -126,6 +128,7 @@ fn state_of(env: &Env, id: &BytesN<32>, p: &Proposal) -> ProposalState {
 }
 
 fn cast(env: &Env, voter: Address, id: BytesN<32>, support: u32) -> i128 {
+    migrations::require_current(env);
     let mut p = load(env, &id);
     if state_of(env, &id, &p) != ProposalState::Active {
         panic_with_error!(env, Error::InvalidState);
@@ -167,6 +170,7 @@ impl Governor {
         Self::apply_voting_period(&env, voting_period);
         Self::apply_quorum_bps(&env, quorum_bps);
         Self::apply_proposal_threshold(&env, proposal_threshold);
+        zenith_common::migrations::init_schema(&env, CURRENT_SCHEMA_VERSION);
     }
 
     /// Deterministic proposal id: sha256 over the XDR of all four inputs.
@@ -191,6 +195,7 @@ impl Governor {
         description_hash: BytesN<32>,
     ) -> BytesN<32> {
         proposer.require_auth();
+        migrations::require_current(&env);
         let n = targets.len();
         if n == 0 || n > MAX_ACTIONS || n != fns.len() || n != args.len() {
             panic_with_error!(&env, Error::InvalidProposal);
@@ -257,6 +262,7 @@ impl Governor {
 
     /// Hands a succeeded proposal to the timelock with its minimum delay.
     pub fn queue(env: Env, id: BytesN<32>) -> u64 {
+        migrations::require_current(&env);
         let mut p = load(&env, &id);
         if state_of(&env, &id, &p) != ProposalState::Succeeded {
             panic_with_error!(&env, Error::InvalidState);
@@ -274,6 +280,7 @@ impl Governor {
     /// has fallen below the proposal threshold.
     pub fn cancel(env: Env, caller: Address, id: BytesN<32>) {
         caller.require_auth();
+        migrations::require_current(&env);
         let mut p = load(&env, &id);
         let state = state_of(&env, &id, &p);
         if !matches!(
@@ -302,25 +309,67 @@ impl Governor {
 
     pub fn set_voting_delay(env: Env, value: u32) {
         only_governance(&env);
+        migrations::require_current(&env);
         Self::apply_voting_delay(&env, value);
     }
 
     pub fn set_voting_period(env: Env, value: u32) {
         only_governance(&env);
+        migrations::require_current(&env);
         Self::apply_voting_period(&env, value);
     }
 
     pub fn set_quorum_bps(env: Env, value: u32) {
         only_governance(&env);
+        migrations::require_current(&env);
         Self::apply_quorum_bps(&env, value);
     }
 
     pub fn set_proposal_threshold(env: Env, value: i128) {
         only_governance(&env);
+        migrations::require_current(&env);
         Self::apply_proposal_threshold(&env, value);
     }
 
+    // ── Schema migrations (docs/migrations.md) ──────────────────────────────
+
+    /// Runs the registered steps `from+1 ..= to`. Returns the version
+    /// reached (less than `to` if a step paginated).
+    pub fn migrate(env: Env, from: u32, to: u32) -> u32 {
+        only_governance(&env);
+        zenith_common::migrations::migrate(
+            &env,
+            from,
+            to,
+            CURRENT_SCHEMA_VERSION,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    /// Continues a paginated migration from `cursor`. Permissionless, like
+    /// `bump`: the target was fixed by the authorized `migrate` call and the
+    /// steps are code in this wasm, so a keeper can only advance it.
+    pub fn migrate_batch(env: Env, cursor: u32, limit: u32) -> u32 {
+        zenith_common::migrations::migrate_batch(
+            &env,
+            cursor,
+            limit,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
     // ── Views ────────────────────────────────────────────────────────────────
+
+    pub fn schema_version(env: Env) -> u32 {
+        zenith_common::migrations::schema_version(&env)
+    }
+
+    /// `(target, cursor)` while a paginated migration is in progress.
+    pub fn migration_state(env: Env) -> Option<(u32, u32)> {
+        zenith_common::migrations::migration_state(&env)
+    }
 
     pub fn state(env: Env, id: BytesN<32>) -> ProposalState {
         state_of(&env, &id, &load(&env, &id))
