@@ -10,27 +10,3 @@
 soroban_sdk::contractimport!(
     file = "../target/wasm32-unknown-unknown/release/zenith_vault.wasm"
 );
-
-use soroban_sdk::{Env, Symbol};
-
-/// options_market's namespaced vault tag for a series' escrow:
-/// `(this contract, "series", series_id)`.
-pub fn series_tag(env: &Env, series_id: u64) -> Tag {
-    Tag {
-        owner: env.current_contract_address(),
-        kind: Symbol::new(env, "series"),
-        id: series_id,
-    }
-}
-
-/// `(this contract, "position", position_id)` — reserved for
-/// per-position custody, so it can never collide with a series tag that
-/// happens to share the same numeric id.
-#[allow(dead_code)]
-pub fn position_tag(env: &Env, position_id: u64) -> Tag {
-    Tag {
-        owner: env.current_contract_address(),
-        kind: Symbol::new(env, "position"),
-        id: position_id,
-    }
-}
