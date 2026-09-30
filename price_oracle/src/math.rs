@@ -93,3 +93,128 @@ mod test {
         assert_eq!(median(&mut b, n), 8);
     }
 }
+
+/// Property-based tests; see README "Property tests". Shrunk failures are
+/// persisted under `proptest-regressions/` and must be committed.
+#[cfg(test)]
+mod proptests {
+    extern crate std;
+
+    use super::*;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::vec::Vec;
+
+    const CASES: u32 = 10_000;
+    const CAP: usize = MAX_FEEDERS as usize;
+
+    /// Prices from 1e3 to 1e15.
+    fn price() -> impl Strategy<Value = i128> {
+        1_000i128..=1_000_000_000_000_000
+    }
+
+    /// 1..=MAX_FEEDERS fresh reports.
+    fn reports() -> impl Strategy<Value = Vec<i128>> {
+        vec(price(), 1..=CAP)
+    }
+
+    fn median_of(values: &[i128]) -> i128 {
+        let mut buffer = [0i128; CAP];
+        buffer[..values.len()].copy_from_slice(values);
+        median(&mut buffer, values.len())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+        #[test]
+        fn is_bounded_by_min_and_max(values in reports()) {
+            let m = median_of(&values);
+            let min = *values.iter().min().unwrap();
+            let max = *values.iter().max().unwrap();
+            prop_assert!(min <= m && m <= max, "{} outside [{}, {}]", m, min, max);
+        }
+
+        #[test]
+        fn is_permutation_invariant(
+            (values, shuffled) in reports()
+                .prop_flat_map(|v| (Just(v.clone()), Just(v).prop_shuffle())),
+        ) {
+            prop_assert_eq!(median_of(&values), median_of(&shuffled));
+        }
+
+        #[test]
+        fn of_a_constant_input_is_that_value(p in price(), n in 1..=CAP) {
+            prop_assert_eq!(median_of(&std::vec![p; n]), p);
+        }
+
+        /// At least half the reports are <= the median and at least half
+        /// are >= it — the defining property of a median.
+        #[test]
+        fn splits_the_reports_in_half(values in reports()) {
+            let m = median_of(&values);
+            let n = values.len();
+            let below = values.iter().filter(|v| **v <= m).count();
+            let above = values.iter().filter(|v| **v >= m).count();
+            prop_assert!(2 * below >= n && 2 * above >= n);
+        }
+
+        /// Raising one report never lowers the median.
+        #[test]
+        fn is_monotonic_in_each_report(
+            (values, i) in reports()
+                .prop_flat_map(|v| { let n = v.len(); (Just(v), 0..n) }),
+            bump in 0i128..=1_000_000_000_000_000,
+        ) {
+            let mut raised = values.clone();
+            raised[i] += bump;
+            prop_assert!(median_of(&values) <= median_of(&raised));
+        }
+
+        /// Shifting every report by c shifts the median by exactly c: for
+        /// positive values the even-count average truncates the same way
+        /// before and after, since the sum moves by 2c.
+        #[test]
+        fn is_translation_equivariant(
+            values in reports(),
+            c in 0i128..=1_000_000_000_000_000,
+        ) {
+            let shifted: Vec<i128> = values.iter().map(|v| v + c).collect();
+            prop_assert_eq!(median_of(&shifted), median_of(&values) + c);
+        }
+
+        /// A single report, however extreme, can't drag the median outside
+        /// the range of the other reports (for 3+ reports).
+        #[test]
+        fn resists_a_single_outlier(
+            values in vec(price(), 3..=CAP),
+            outlier in any::<i64>().prop_map(i128::from),
+        ) {
+            let honest = &values[1..];
+            let mut with_outlier = values.clone();
+            with_outlier[0] = outlier;
+            let m = median_of(&with_outlier);
+            let min = *honest.iter().min().unwrap();
+            let max = *honest.iter().max().unwrap();
+            prop_assert!(min <= m && m <= max);
+        }
+
+        /// Whole i128 domain: either the correct value or a failure exactly
+        /// where averaging the two middle values overflows. Once the
+        /// typed-error work lands this becomes Ok/Err with no panic.
+        #[test]
+        fn overflow_is_never_silent(values in vec(any::<i128>(), 1..=CAP)) {
+            let mut sorted = values.clone();
+            sorted.sort();
+            let n = sorted.len();
+            let expected = if n % 2 == 1 {
+                Some(sorted[n / 2])
+            } else {
+                sorted[n / 2 - 1].checked_add(sorted[n / 2]).map(|s| s / 2)
+            };
+            let actual = catch_unwind(AssertUnwindSafe(|| median_of(&values))).ok();
+            prop_assert_eq!(actual, expected);
+        }
+    }
+}

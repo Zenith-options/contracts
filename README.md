@@ -168,6 +168,36 @@ anything an off-chain indexer would need to parse out of an event is
 pinned down by a test, so a change to a tuple's field order or type
 shows up as a test failure rather than as a silently broken indexer.
 
+### Property tests
+
+The math modules have [proptest](https://docs.rs/proptest) suites
+(`mod proptests` next to each function) that check algebraic properties
+over whole input domains rather than hand-picked examples. Every
+property runs 10,000 cases, pinned in code, so plain `cargo test` in
+CI runs the full count. Realistic domains are prices from 1e3 to 1e15
+and contract sizes from 1 to 1e12. Overflow properties sample the whole
+`i128` domain instead.
+
+When proptest finds a failure it shrinks it and writes the seed to
+`<crate>/proptest-regressions/`. Commit that file with the fix so the
+case is replayed on every future run.
+
+| Function | Properties |
+|---|---|
+| `options_market::math::calc_fee` | `0 <= fee <= amount` for `bps <= 10_000`; equals `floor(amount × bps / 10_000)`; monotonic in amount and in rate; zero when either argument is zero; on the whole `i128` domain, returns the checked result or fails exactly where `amount × bps` overflows |
+| `options_market::math::calc_payout` | non-negative; equals `floor(contracts × intrinsic / PRICE_PRECISION)`; zero at or out of the money; calls non-decreasing and puts non-increasing in settlement price; monotonic in contracts; additive in contracts within 1 unit; scaling contracts by k scales the payout within k − 1; call(K, S) = put(S, K), and at most one side is non-zero; on the whole `i128` domain, returns the checked result or fails exactly on overflow |
+| `options_market::rounding_policy::SafeMathRounding::mul_div_{floor,ceil}` | exact floor and exact ceil; `ceil − floor` is 0 on an exact division and 1 otherwise; operands commute; `ceil(x) = −floor(−x)`; monotonic in the numerator; `mul_div(a, d, d) = a`; zero denominator is `None`; never panics on the whole `i128` domain and returns `None` on overflow, including `i128::MIN / −1` |
+| `price_oracle::math::median` | bounded by the min and max; permutation invariant; equal to the value for a constant input; at least half the reports on each side; monotonic in each report; shifting every report by c shifts the median by c; one outlier can't move it outside the other reports' range; on the whole `i128` domain, returns the correct value or fails exactly where averaging the middle pair overflows |
+| `price_oracle::outlier_filter::OutlierFilter::compute_robust_price` (MAD) | `None` for no reports; result bounded by the min and max; MAD ≥ 0; permutation invariant; for a constant input, returns that price with MAD 0; keeps a strict majority for k ≥ 1; monotonic in k; shifting by c shifts the price by c and leaves MAD and the kept set unchanged; never panics on the whole `i128` domain |
+| `streams::math::mul_div_floor` | exact floor; operands commute; monotonic in the numerator and non-increasing in the divisor; `b <= c ⇒ result <= a`; fails exactly on overflow or a zero divisor, as documented |
+
+The "fails exactly on overflow" properties pin down today's
+panic-on-overflow behaviour of `calc_fee`, `calc_payout`, and `median`.
+Once those functions return typed errors, these properties should be
+tightened to `Ok(correct)` or `Err(overflow)` with no panic. TWAP and
+Black-Scholes helpers don't exist in this repo yet, so their suites
+should come with them. Kani proofs are tracked separately.
+
 ## Deploying
 
 ```sh
