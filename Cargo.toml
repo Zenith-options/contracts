@@ -1,0 +1,56 @@
+[workspace]
+# resolver 2 keeps dev-dependency features (every `features = ["testutils"]`
+# below) out of plain `cargo build` graphs, and xtask builds each contract's
+# wasm with its own `-p` invocation so no other member's features are
+# unified into it. `cargo xtask check-wasm` verifies the result.
+resolver = "2"
+members = [
+    "common",
+    "governor",
+    "grants_escrow",
+    "integration_tests",
+    "multisig",
+    "options_market",
+    "params",
+    "price_oracle",
+    "staking",
+    "streams",
+    "timelock",
+    "vault",
+    "tools/spec-diff",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace.dependencies]
+soroban-sdk = { version = "21.7.7" }
+ed25519-dalek = "2"
+
+# Internal crates. Contracts that call each other on-chain use
+# `contractimport!` against the compiled wasm (see
+# `[package.metadata.zenith] wasm-deps` in each manifest); these entries are
+# only for dev-dependencies that register a real instance in a test Env,
+# plus the zenith-common rlib.
+zenith-common = { path = "common" }
+governor = { package = "zenith-governor", path = "governor" }
+multisig = { package = "zenith-multisig", path = "multisig" }
+options_market = { package = "zenith-options-market", path = "options_market" }
+params = { package = "zenith-params", path = "params" }
+price_oracle = { package = "zenith-price-oracle", path = "price_oracle" }
+timelock = { package = "zenith-timelock", path = "timelock" }
+vault = { package = "zenith-vault", path = "vault" }
+
+# Shared by every contract (profiles in member manifests are ignored inside
+# a workspace).
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1

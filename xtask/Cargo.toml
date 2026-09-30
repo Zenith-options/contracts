@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Build automation for the workspace (the cargo-xtask pattern):
+# `cargo xtask help`. Native-only; never built for wasm.
+
+[dependencies]
+serde_json = "1"

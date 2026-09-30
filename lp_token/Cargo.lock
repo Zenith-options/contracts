@@ -1732,7 +1732,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zenith-staking"
+name = "zenith-lp-token"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",

@@ -1732,26 +1732,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "zenith-common"
+name = "zenith-lp-pool"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
-]
-
-[[package]]
-name = "zenith-multisig"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
-]
-
-[[package]]
-name = "zenith-price-oracle"
-version = "0.1.0"
-dependencies = [
- "soroban-sdk",
- "zenith-common",
- "zenith-multisig",
 ]
 
 [[package]]

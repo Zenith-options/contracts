@@ -9,19 +9,29 @@ pub const FORFEITURE_WINDOW: u64 = 90 * 86_400; // 90d window before unexercised
 pub const DEFAULT_FEE_RATE_BPS: i128 = 50; // 0.5%
 pub const MAX_FEE_RATE_BPS: i128 = 1_000; // 10% hard ceiling, even for the admin
 
-/// Caps how many series can ever be listed for a given underlying, so a
-/// single symbol can't accumulate unbounded storage entries over the
-/// contract's lifetime. This counts every series ever created, not
-/// currently-active ones — cancelling or letting a series expire doesn't
-/// free up room, since nothing about storage usage shrinks when that
-/// happens either.
-pub const MAX_SERIES_PER_UNDERLYING: u32 = 50;
+/// Default cap on concurrently ACTIVE series per underlying (see
+/// `storage::is_slot_releasable` for when a series stops counting). Unlike
+/// the old lifetime cap, a slot is freed once its series settles and its
+/// exercise window closes, is cancelled and fully refunded, or is pruned,
+/// so an underlying can be relisted indefinitely. Overridable via
+/// `set_max_active_series` or the params registry key `max_ser`.
+pub const DEFAULT_MAX_ACTIVE_SERIES: u32 = 50;
+/// Hard ceiling on the configurable cap, whoever sets it.
+pub const MAX_ACTIVE_SERIES_CEILING: u32 = 500;
+
+/// How long a closed series and its terminal positions stay in storage
+/// before `prune_positions`/`prune_series` may remove them, measured from
+/// the series' close (see `lib.rs::retention_anchor`). Gives indexers and
+/// users time to observe the final state before only the archival event
+/// remains.
+pub const PRUNE_RETENTION: u64 = 30 * 86_400;
 
 /// Caps how many position_ids exercise_batch/reclaim_batch will process in
 /// a single call, so a caller with a very large position count can't build
 /// a batch that blows through Soroban's per-call resource limits.
 pub const MAX_BATCH_SIZE: u32 = 25;
 /// Largest page any paginated view returns.
+#[allow(dead_code)] // paginated views are not wired up in this build
 pub const MAX_PAGE_LIMIT: u32 = 50;
 /// Most entries a paginated view reads per call, matching or not.
 pub const MAX_PAGE_SCAN: u32 = 200;
@@ -130,5 +140,271 @@ mod test {
             3 * PRICE_PRECISION,
         );
         assert_eq!(three_contracts, one_contract * 3);
+    }
+}
+
+/// Property-based tests: algebraic properties over whole input domains
+/// rather than hand-picked examples. See README "Property tests" for the
+/// list of properties. Shrunk failures are persisted under
+/// `proptest-regressions/` and must be committed alongside the fix.
+#[cfg(test)]
+mod proptests {
+    extern crate std;
+
+    use super::*;
+    use proptest::prelude::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// Every property runs at least this many cases, in CI and locally.
+    const CASES: u32 = 10_000;
+
+    // Shared strategies for realistic domains.
+
+    /// Prices from 1e3 to 1e15 (in PRICE_PRECISION units).
+    fn price() -> impl Strategy<Value = i128> {
+        1_000i128..=1_000_000_000_000_000
+    }
+
+    /// Contract sizes from 1 to 1e12.
+    fn contracts() -> impl Strategy<Value = i128> {
+        1i128..=1_000_000_000_000
+    }
+
+    /// Fee rates from 0 to 10,000 bps (0%..=100%), wider than
+    /// MAX_FEE_RATE_BPS on purpose so the bound holds at the extreme.
+    fn fee_bps() -> impl Strategy<Value = i128> {
+        0i128..=10_000
+    }
+
+    /// Amounts large enough to exceed any realistic premium, small enough
+    /// that `amount * 10_000` never overflows.
+    fn amount() -> impl Strategy<Value = i128> {
+        0i128..=i128::MAX / 10_000
+    }
+
+    fn option_type() -> impl Strategy<Value = OptionType> {
+        prop_oneof![Just(OptionType::Call), Just(OptionType::Put)]
+    }
+
+    /// Intrinsic value, computed independently of calc_payout.
+    fn intrinsic(option_type: &OptionType, strike: i128, settlement: i128) -> i128 {
+        match option_type {
+            OptionType::Call => (settlement - strike).max(0),
+            OptionType::Put => (strike - settlement).max(0),
+        }
+    }
+
+    /// Runs `f`, turning a panic into `None`.
+    fn no_panic<T>(f: impl FnOnce() -> T) -> Option<T> {
+        catch_unwind(AssertUnwindSafe(f)).ok()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+        // ---- calc_fee ----
+
+        #[test]
+        fn calc_fee_is_bounded_by_zero_and_amount(a in amount(), bps in fee_bps()) {
+            let fee = calc_fee(a, bps);
+            prop_assert!(0 <= fee && fee <= a, "fee {} outside [0, {}]", fee, a);
+        }
+
+        #[test]
+        fn calc_fee_is_the_truncated_exact_fee(a in amount(), bps in fee_bps()) {
+            // fee = floor(a * bps / 10_000), i.e.
+            // fee * 10_000 <= a * bps < (fee + 1) * 10_000.
+            let fee = calc_fee(a, bps);
+            let exact = a * bps;
+            prop_assert!(fee * 10_000 <= exact);
+            prop_assert!(exact < (fee + 1) * 10_000);
+        }
+
+        #[test]
+        fn calc_fee_is_monotonic_in_amount(
+            a1 in amount(),
+            a2 in amount(),
+            bps in fee_bps(),
+        ) {
+            let (lo, hi) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
+            prop_assert!(calc_fee(lo, bps) <= calc_fee(hi, bps));
+        }
+
+        #[test]
+        fn calc_fee_is_monotonic_in_rate(
+            a in amount(),
+            b1 in fee_bps(),
+            b2 in fee_bps(),
+        ) {
+            let (lo, hi) = if b1 <= b2 { (b1, b2) } else { (b2, b1) };
+            prop_assert!(calc_fee(a, lo) <= calc_fee(a, hi));
+        }
+
+        #[test]
+        fn calc_fee_of_zero_is_zero(x in amount(), bps in fee_bps()) {
+            prop_assert_eq!(calc_fee(0, bps), 0);
+            prop_assert_eq!(calc_fee(x, 0), 0);
+        }
+
+        /// Whole i128 domain: either the correct value or a failure exactly
+        /// where the checked arithmetic overflows. Once the typed-error work
+        /// lands this becomes `Ok(correct)` / `Err(Overflow)` with no panic.
+        #[test]
+        fn calc_fee_overflow_is_never_silent(a in any::<i128>(), bps in any::<i128>()) {
+            let expected = a.checked_mul(bps).map(|p| p / 10_000);
+            let actual = no_panic(|| calc_fee(a, bps));
+            prop_assert_eq!(actual, expected);
+        }
+
+        // ---- calc_payout ----
+
+        #[test]
+        fn calc_payout_is_non_negative(
+            t in option_type(),
+            strike in price(),
+            settlement in price(),
+            c in contracts(),
+        ) {
+            prop_assert!(calc_payout(&t, strike, settlement, c) >= 0);
+        }
+
+        #[test]
+        fn calc_payout_is_the_truncated_exact_payout(
+            t in option_type(),
+            strike in price(),
+            settlement in price(),
+            c in contracts(),
+        ) {
+            let payout = calc_payout(&t, strike, settlement, c);
+            let exact = c * intrinsic(&t, strike, settlement);
+            prop_assert!(payout * PRICE_PRECISION <= exact);
+            prop_assert!(exact < (payout + 1) * PRICE_PRECISION);
+        }
+
+        #[test]
+        fn calc_payout_is_zero_at_or_out_of_the_money(
+            t in option_type(),
+            strike in price(),
+            settlement in price(),
+            c in contracts(),
+        ) {
+            let otm_or_atm = match t {
+                OptionType::Call => settlement <= strike,
+                OptionType::Put => settlement >= strike,
+            };
+            prop_assume!(otm_or_atm);
+            prop_assert_eq!(calc_payout(&t, strike, settlement, c), 0);
+        }
+
+        #[test]
+        fn calc_payout_call_is_non_decreasing_in_settlement(
+            strike in price(),
+            s1 in price(),
+            s2 in price(),
+            c in contracts(),
+        ) {
+            let (lo, hi) = if s1 <= s2 { (s1, s2) } else { (s2, s1) };
+            prop_assert!(
+                calc_payout(&OptionType::Call, strike, lo, c)
+                    <= calc_payout(&OptionType::Call, strike, hi, c)
+            );
+        }
+
+        #[test]
+        fn calc_payout_put_is_non_increasing_in_settlement(
+            strike in price(),
+            s1 in price(),
+            s2 in price(),
+            c in contracts(),
+        ) {
+            let (lo, hi) = if s1 <= s2 { (s1, s2) } else { (s2, s1) };
+            prop_assert!(
+                calc_payout(&OptionType::Put, strike, lo, c)
+                    >= calc_payout(&OptionType::Put, strike, hi, c)
+            );
+        }
+
+        #[test]
+        fn calc_payout_is_monotonic_in_contracts(
+            t in option_type(),
+            strike in price(),
+            settlement in price(),
+            c1 in contracts(),
+            c2 in contracts(),
+        ) {
+            let (lo, hi) = if c1 <= c2 { (c1, c2) } else { (c2, c1) };
+            prop_assert!(
+                calc_payout(&t, strike, settlement, lo)
+                    <= calc_payout(&t, strike, settlement, hi)
+            );
+        }
+
+        /// Linear in contracts within rounding: splitting a position in two
+        /// never pays out more than the whole, and loses at most 1 unit.
+        #[test]
+        fn calc_payout_is_additive_in_contracts_within_rounding(
+            t in option_type(),
+            strike in price(),
+            settlement in price(),
+            c1 in contracts(),
+            c2 in contracts(),
+        ) {
+            let whole = calc_payout(&t, strike, settlement, c1 + c2);
+            let parts = calc_payout(&t, strike, settlement, c1)
+                + calc_payout(&t, strike, settlement, c2);
+            prop_assert!(whole - parts == 0 || whole - parts == 1,
+                "whole {} vs parts {}", whole, parts);
+        }
+
+        /// Scaling contracts by k scales the payout by k, within k - 1 of
+        /// rounding.
+        #[test]
+        fn calc_payout_scales_with_contracts_within_rounding(
+            t in option_type(),
+            strike in price(),
+            settlement in price(),
+            c in 1i128..=1_000_000_000,
+            k in 1i128..=1_000,
+        ) {
+            let scaled = calc_payout(&t, strike, settlement, c * k);
+            let times_k = calc_payout(&t, strike, settlement, c) * k;
+            prop_assert!(times_k <= scaled && scaled - times_k < k,
+                "k={} scaled {} vs {}", k, scaled, times_k);
+        }
+
+        /// Call and put payouts are mirror images: exactly one side can be
+        /// in the money, and swapping strike and settlement swaps them.
+        #[test]
+        fn calc_payout_call_put_symmetry(
+            strike in price(),
+            settlement in price(),
+            c in contracts(),
+        ) {
+            let call = calc_payout(&OptionType::Call, strike, settlement, c);
+            let put = calc_payout(&OptionType::Put, strike, settlement, c);
+            prop_assert!(call == 0 || put == 0);
+            prop_assert_eq!(call, calc_payout(&OptionType::Put, settlement, strike, c));
+        }
+
+        /// Whole i128 domain: either the correct value or a failure exactly
+        /// where the checked arithmetic overflows (see calc_fee above).
+        #[test]
+        fn calc_payout_overflow_is_never_silent(
+            t in option_type(),
+            strike in any::<i128>(),
+            settlement in any::<i128>(),
+            c in any::<i128>(),
+        ) {
+            let diff = match t {
+                OptionType::Call => settlement.checked_sub(strike),
+                OptionType::Put => strike.checked_sub(settlement),
+            };
+            let expected = diff
+                .map(|d| d.max(0))
+                .and_then(|i| c.checked_mul(i))
+                .map(|p| p / PRICE_PRECISION);
+            let actual = no_panic(|| calc_payout(&t, strike, settlement, c));
+            prop_assert_eq!(actual, expected);
+        }
     }
 }
