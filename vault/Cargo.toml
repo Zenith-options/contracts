@@ -1,8 +1,8 @@
 [package]
 name = "zenith-vault"
-version = "0.1.0"
-edition = "2021"
-publish = false
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
 
 [lib]
 # rlib alongside cdylib so other contracts (options_market) can depend on
@@ -11,28 +11,25 @@ publish = false
 # on its own — same pattern as price_oracle's Cargo.toml.
 crate-type = ["cdylib", "rlib"]
 
-[profile.release]
-opt-level = "z"
-overflow-checks = true
-debug = 0
-strip = "symbols"
-debug-assertions = false
-panic = "abort"
-codegen-units = 1
-
 [dependencies]
-soroban-sdk = { version = "21.0.0" }
-zenith-common = { path = "../common" }
+soroban-sdk = { workspace = true }
+zenith-common = { workspace = true }
 
 [dev-dependencies]
-soroban-sdk = { version = "21.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }
 # Dev/test-only: registers a REAL multisig contract instance inside the
 # test Env for cross-contract tests. Never linked into the production
 # wasm (see src/multisig_client.rs).
-multisig = { package = "zenith-multisig", path = "../multisig", features = ["testutils"] }
+multisig = { workspace = true, features = ["testutils"] }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
 # Compiles a full-ledger post-condition check into every mutating
 # entrypoint. For tests/fuzzing only; never enable for production wasm.
 invariants = []
+
+[package.metadata.zenith]
+# `cargo xtask test` runs this after the default test pass: ledger
+# invariant post-conditions compiled in, plus the slow 10,000-op fuzz test
+# that's #[ignore]d in the default run.
+extra-test = { features = ["invariants"], args = ["--include-ignored"] }
