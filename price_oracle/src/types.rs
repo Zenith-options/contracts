@@ -10,6 +10,10 @@ pub enum DataKey {
     /// before it returns an aggregate at all. Defaults to 1 at initialize
     /// (the original behavior: any single fresh report is enough).
     MinReports,
+    /// O(1) membership check — see issue #101. `Feeders` below stays around
+    /// only for enumeration (e.g. `get_feeders`), and now lives in
+    /// persistent storage instead of instance storage.
+    IsFeeder(Address),
     Feeders,
     PriceReport(Symbol, Address),
     AggregatedPrice(Symbol),

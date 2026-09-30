@@ -28,7 +28,18 @@ pub enum Error {
     InvalidSeriesParams = 22,
     InvalidBatchSize = 23,
     NothingToEscrow = 24,
-    VaultNotSet = 25,
-    UnauthorizedVault = 26,
-    VaultDepositFailed = 27,
+    PremiumBelowMinimum = 25,
+    NotEligibleForForfeiture = 26,
+    DuplicateSeries = 27,
+    InvalidSplitAmount = 28,
+    /// The entry is not in a terminal state, or still carries a liability.
+    NotPrunable = 29,
+    /// The entry is terminal but `PRUNE_RETENTION` hasn't elapsed yet.
+    RetentionNotElapsed = 30,
+    /// `prune_series` on a series that still has unpruned positions.
+    SeriesHasPositions = 31,
+    /// `migrate_counters` hasn't finished since the upgrade.
+    MigrationPending = 32,
+    InvalidActiveSeriesCap = 33,
+    InvalidPageLimit = 34,
 }

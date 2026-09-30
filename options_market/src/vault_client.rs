@@ -4,9 +4,9 @@
 //! vault's own #[contractimpl] functions into options_market's wasm and
 //! colliding on shared names (pause/transfer_admin again).
 //!
-//! Requires vault's wasm to already be built (`cd ../vault && cargo build
-//! --target wasm32-unknown-unknown --release`) before this crate can
-//! compile at all — see the repo README for the build order this implies.
+//! Requires vault's wasm in the shared workspace target/ before this crate
+//! can compile at all; `cargo xtask build` handles that (see
+//! `[package.metadata.zenith] wasm-deps` in ../Cargo.toml).
 soroban_sdk::contractimport!(
-    file = "../vault/target/wasm32-unknown-unknown/release/zenith_vault.wasm"
+    file = "../target/wasm32-unknown-unknown/release/zenith_vault.wasm"
 );
