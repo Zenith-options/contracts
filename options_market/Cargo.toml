@@ -11,12 +11,26 @@ publish.workspace = true
 # pattern as vault's Cargo.toml.
 crate-type = ["cdylib", "rlib"]
 
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+# Whole-program LTO lets the linker drop and inline across the sdk and
+# zenith-common boundaries — one of the #106 size reductions.
+lto = true
+
 [dependencies]
 soroban-sdk = { workspace = true }
 zenith-common = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+# Property-based tests for the math modules (see README "Property tests").
+proptest = "1"
 ed25519-dalek = { workspace = true }
 # Dev/test-only: registers a REAL price_oracle contract instance inside the
 # test Env for cross-contract tests. Never linked into the production wasm
@@ -24,15 +38,22 @@ ed25519-dalek = { workspace = true }
 # contract instead — via contractimport! against its compiled wasm, not by
 # depending on and linking its actual implementation).
 price_oracle = { workspace = true, features = ["testutils"] }
-# Same reasoning as price_oracle above, for src/multisig_client.rs.
+# Registers a real multisig for the `_via_multisig` tests (options_market
+# itself reaches it through zenith-common's invoke_contract, not a client).
 multisig = { workspace = true, features = ["testutils"] }
 # Same reasoning as price_oracle above, for src/vault_client.rs.
 vault = { workspace = true, features = ["testutils"] }
 # Same reasoning as price_oracle above, for src/params_client.rs.
-params = { workspace = true, features = ["testutils"] }
+params = { package = "zenith-params", path = "../params", features = ["testutils"] }
+# Measures and snapshots per-entrypoint resource usage (src/test_resources.rs).
+resource-snapshot = { path = "../tools/resource-snapshot" }
 
 [features]
 testutils = ["soroban-sdk/testutils"]
+# Registers the built release wasm in src/test_resources.rs instead of the
+# native contract, so resource snapshots measure what runs on-chain.
+# Build the wasm first: cargo build --target wasm32-unknown-unknown --release
+resource-wasm = []
 
 # Contracts whose compiled wasm this crate `contractimport!`s (the
 # src/*_client.rs files). `cargo xtask build` reads this to build them first,

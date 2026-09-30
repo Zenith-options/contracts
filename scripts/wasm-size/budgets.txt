@@ -1,0 +1,11 @@
+# Optimized wasm size budget per contract, in bytes: "<crate> <bytes>".
+# Budget = optimized size at the time it was set + 10%. check.sh fails
+# when a contract's optimized wasm exceeds its budget or has none.
+#
+# Regenerate after a deliberate change (and explain it in the PR):
+#   scripts/wasm-size/check.sh --update <crate>
+#
+# Not yet recorded: these need one build on a machine with the toolchain,
+#   for c in multisig price_oracle vault params; do (cd $c && cargo build --target wasm32-unknown-unknown --release); done
+#   for c in options_market streams staking governor grants_escrow; do (cd $c && cargo build --target wasm32-unknown-unknown --release); done
+#   scripts/wasm-size/check.sh --update
