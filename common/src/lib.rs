@@ -10,6 +10,16 @@
 //!
 //! Deliberately defines no `#[contract]` and exports no contract spec
 //! entries, so linking it can't change any consumer's public ABI.
+//!
+//! Also home to the storage-schema migration framework (`migrations`)
+//! and pinned-multisig wasm upgrades (`upgrade`) every contract uses —
+//! see docs/migrations.md.
+
+pub mod migrations;
+pub mod upgrade;
+
+#[cfg(test)]
+mod test;
 
 use soroban_sdk::{contracttype, panic_with_error, vec, Address, Env, IntoVal, Symbol, Val};
 

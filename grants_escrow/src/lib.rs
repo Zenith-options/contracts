@@ -18,10 +18,12 @@ mod test;
 
 mod error;
 mod events;
+mod migrations;
 mod ttl;
 mod types;
 
 use error::Error;
+pub use migrations::CURRENT_SCHEMA_VERSION;
 use types::DataKey;
 pub use types::{Grant, Milestone, MilestoneStatus};
 
@@ -60,6 +62,7 @@ impl GrantsEscrow {
     ) -> u64 {
         ttl::extend_instance(&env);
         funder.require_auth();
+        migrations::require_current(&env);
 
         if milestones.is_empty() || milestones.len() > MAX_MILESTONES {
             panic_with_error!(&env, Error::InvalidMilestones);
@@ -140,6 +143,7 @@ impl GrantsEscrow {
         ttl::extend_instance(&env);
         let mut grant = Self::load(&env, grant_id);
         grant.grantee.require_auth();
+        migrations::require_current(&env);
 
         let mut milestone = Self::milestone(&env, &grant, idx);
         if milestone.status != MilestoneStatus::Pending {
@@ -161,6 +165,7 @@ impl GrantsEscrow {
     pub fn approve_milestone(env: Env, grant_id: u64, idx: u32, reviewer: Address) {
         ttl::extend_instance(&env);
         reviewer.require_auth();
+        migrations::require_current(&env);
         let mut grant = Self::load(&env, grant_id);
         if !grant.reviewers.contains(&reviewer) {
             panic_with_error!(&env, Error::NotAReviewer);
@@ -199,6 +204,7 @@ impl GrantsEscrow {
         ttl::extend_instance(&env);
         let mut grant = Self::load(&env, grant_id);
         grant.funder.require_auth();
+        migrations::require_current(&env);
 
         let now = env.ledger().timestamp();
         let mut total: i128 = 0;
@@ -226,6 +232,49 @@ impl GrantsEscrow {
         );
         events::funds_reclaimed(&env, grant_id, total);
         total
+    }
+
+    // ── Schema migrations (docs/migrations.md) ──────────────────────────────
+
+    /// Runs the registered steps `from+1 ..= to`. Returns the version
+    /// reached (less than `to` if a step paginated). Permissionless:
+    /// grants_escrow has no admin, and a new step can only arrive with a new
+    /// wasm (see docs/migrations.md, "Governance decisions").
+    pub fn migrate(env: Env, from: u32, to: u32) -> u32 {
+        ttl::extend_instance(&env);
+        zenith_common::migrations::migrate(
+            &env,
+            from,
+            to,
+            CURRENT_SCHEMA_VERSION,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    /// Continues a paginated migration from `cursor`. Permissionless, like
+    /// `bump`: the target was fixed by `migrate` and the steps are code in
+    /// this wasm, so a keeper can only advance it.
+    pub fn migrate_batch(env: Env, cursor: u32, limit: u32) -> u32 {
+        ttl::extend_instance(&env);
+        zenith_common::migrations::migrate_batch(
+            &env,
+            cursor,
+            limit,
+            migrations::step,
+            &migrations::ERRORS,
+        )
+    }
+
+    pub fn schema_version(env: Env) -> u32 {
+        ttl::extend_instance(&env);
+        zenith_common::migrations::schema_version(&env)
+    }
+
+    /// `(target, cursor)` while a paginated migration is in progress.
+    pub fn migration_state(env: Env) -> Option<(u32, u32)> {
+        ttl::extend_instance(&env);
+        zenith_common::migrations::migration_state(&env)
     }
 
     pub fn get_grant(env: Env, grant_id: u64) -> Option<Grant> {
