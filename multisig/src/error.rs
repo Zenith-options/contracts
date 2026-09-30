@@ -22,4 +22,11 @@ pub enum Error {
     ProposalTooLarge = 16,
     InvalidPageLimit = 17,
     NotExpired = 18,
+    InvalidWeight = 19,
+    WeightOverflow = 20,
+    InvalidSignerChange = 21,
+    SignerChangeNotFound = 22,
+    StaleSignerChange = 23,
+    RotationDelayActive = 24,
+    SignerChangeNotQueued = 25,
 }
