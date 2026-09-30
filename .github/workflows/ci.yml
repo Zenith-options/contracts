@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, lp_token, lp_pool, integration_tests, tools/spec-diff]
+        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, lp_token, lp_pool, integration_tests, tools/spec-diff, tools/resource-snapshot]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, lp_token, lp_pool, integration_tests]
+        crate: [options_market, price_oracle, vault, multisig, common, streams, staking, timelock, governor, params, grants_escrow, lp_token, lp_pool, integration_tests, tools/resource-snapshot]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -139,3 +139,53 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: tools/spec-diff/check.sh origin/${{ github.base_ref }}
+
+  budgets:
+    runs-on: ubuntu-latest
+    env:
+      # Build order: options_market needs multisig, price_oracle, vault and
+      # params wasm first (see the note at the top of this file).
+      CONTRACTS: multisig price_oracle vault params options_market streams staking governor grants_escrow
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-opt (binaryen)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: Build every contract wasm
+        run: |
+          for c in $CONTRACTS; do
+            (cd "$c" && cargo build --target wasm32-unknown-unknown --release)
+          done
+      # Prints raw and optimized size per contract to the job summary and
+      # fails above budget. --in-place swaps each release wasm for its
+      # optimized build so the steps below test what would be deployed.
+      - name: Optimize and enforce wasm size budgets
+        run: scripts/wasm-size/check.sh --in-place $CONTRACTS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: optimized-wasm
+          path: target/wasm-opt/*.wasm
+          if-no-files-found: warn
+      - name: resource-snapshot self-tests
+        if: always()
+        run: cargo test
+        working-directory: tools/resource-snapshot
+      # Registers the optimized options_market wasm (resource-wasm feature)
+      # and fails if any metric regresses more than its tolerance (5% by
+      # default) against options_market/snapshots/resources/.
+      - name: Resource snapshots (optimized wasm)
+        if: always()
+        run: cargo test --features resource-wasm resource_snapshots
+        working-directory: options_market
+      - name: Resource summary table
+        if: always()
+        run: >
+          python3 scripts/resource-diff/resource_diff.py
+          ${{ github.event_name == 'pull_request' && format('--base-ref origin/{0}', github.base_ref) || '' }}
+          options_market

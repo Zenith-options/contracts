@@ -9,19 +9,29 @@ pub const FORFEITURE_WINDOW: u64 = 90 * 86_400; // 90d window before unexercised
 pub const DEFAULT_FEE_RATE_BPS: i128 = 50; // 0.5%
 pub const MAX_FEE_RATE_BPS: i128 = 1_000; // 10% hard ceiling, even for the admin
 
-/// Caps how many series can ever be listed for a given underlying, so a
-/// single symbol can't accumulate unbounded storage entries over the
-/// contract's lifetime. This counts every series ever created, not
-/// currently-active ones — cancelling or letting a series expire doesn't
-/// free up room, since nothing about storage usage shrinks when that
-/// happens either.
-pub const MAX_SERIES_PER_UNDERLYING: u32 = 50;
+/// Default cap on concurrently ACTIVE series per underlying (see
+/// `storage::is_slot_releasable` for when a series stops counting). Unlike
+/// the old lifetime cap, a slot is freed once its series settles and its
+/// exercise window closes, is cancelled and fully refunded, or is pruned,
+/// so an underlying can be relisted indefinitely. Overridable via
+/// `set_max_active_series` or the params registry key `max_ser`.
+pub const DEFAULT_MAX_ACTIVE_SERIES: u32 = 50;
+/// Hard ceiling on the configurable cap, whoever sets it.
+pub const MAX_ACTIVE_SERIES_CEILING: u32 = 500;
+
+/// How long a closed series and its terminal positions stay in storage
+/// before `prune_positions`/`prune_series` may remove them, measured from
+/// the series' close (see `lib.rs::retention_anchor`). Gives indexers and
+/// users time to observe the final state before only the archival event
+/// remains.
+pub const PRUNE_RETENTION: u64 = 30 * 86_400;
 
 /// Caps how many position_ids exercise_batch/reclaim_batch will process in
 /// a single call, so a caller with a very large position count can't build
 /// a batch that blows through Soroban's per-call resource limits.
 pub const MAX_BATCH_SIZE: u32 = 25;
 /// Largest page any paginated view returns.
+#[allow(dead_code)] // paginated views are not wired up in this build
 pub const MAX_PAGE_LIMIT: u32 = 50;
 /// Most entries a paginated view reads per call, matching or not.
 pub const MAX_PAGE_SCAN: u32 = 200;

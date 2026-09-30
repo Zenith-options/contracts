@@ -11,7 +11,8 @@ git -C "$root" worktree add --detach "$tmp/base" "$base_ref" >/dev/null
 trap 'git -C "$root" worktree remove --force "$tmp/base"' EXIT
 
 build() {
-  for c in multisig price_oracle vault options_market; do
+  # params before options_market, which contractimport!s its wasm.
+  for c in multisig price_oracle vault params options_market; do
     (cd "$1/$c" && cargo build -q --target wasm32-unknown-unknown --release)
   done
 }
