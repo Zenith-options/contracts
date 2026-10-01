@@ -85,3 +85,15 @@ pub fn signers_rotated(env: &Env, change_id: BytesN<32>, epoch: u32) {
     env.events()
         .publish((Symbol::new(env, "signers_rotated"), change_id), epoch);
 }
+
+pub fn vetoed(env: &Env, vetoer: Address, action_id: BytesN<32>, description_hash: BytesN<32>) {
+    env.events().publish(
+        (Symbol::new(env, "vetoed"), vetoer, action_id),
+        description_hash,
+    );
+}
+
+pub fn action_expired(env: &Env, action_id: BytesN<32>, execute_by: u64) {
+    env.events()
+        .publish((Symbol::new(env, "action_expired"), action_id), execute_by);
+}

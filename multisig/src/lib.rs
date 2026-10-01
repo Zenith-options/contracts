@@ -39,7 +39,9 @@ mod ttl;
 mod types;
 
 use error::Error;
-use types::{ActionMeta, ActionStatus, DataKey, Proposal, SignerChange, SignerWeight};
+use types::{
+    ActionApprovals, ActionMeta, ActionStatus, DataKey, Proposal, SignerChange, SignerWeight,
+};
 
 /// Hard cap on the pending-actions index as a whole.
 pub const MAX_PENDING_ACTIONS: u32 = 100;
@@ -48,6 +50,10 @@ pub const MAX_PENDING_ACTIONS: u32 = 100;
 pub const MAX_PENDING_PER_SIGNER: u32 = 10;
 /// Largest page `get_pending_actions` returns.
 pub const MAX_PAGE_LIMIT: u32 = 50;
+/// Signers are indexed into a `u32` approval bitmap.
+pub const MAX_SIGNERS: u32 = 32;
+/// Most actions one `prune` call may name.
+pub const MAX_PRUNE: u32 = 20;
 /// Bounds a proposal's stored argument list.
 pub const MAX_PROPOSAL_ARGS: u32 = 10;
 /// Rotation delay the legacy equal-weight `initialize` uses.
@@ -234,7 +240,7 @@ impl Multisig {
 
         let meta = match Self::get_action(env.clone(), action_id.clone()) {
             Some(meta) if meta.status == ActionStatus::Pending => meta,
-            Some(meta) if meta.status == ActionStatus::Executed => {
+            Some(meta) if matches!(meta.status, ActionStatus::Executed | ActionStatus::Vetoed) => {
                 panic_with_error!(&env, Error::ActionNotPending)
             }
             _ => Self::register(
@@ -245,14 +251,18 @@ impl Multisig {
             ),
         };
 
-        if Self::has_approved(env.clone(), action_id.clone(), signer.clone()) {
+        let (idx, ttl) = (Self::signer_index(&env, &signer), Self::approval_ttl(&env));
+        let now = env.ledger().timestamp();
+        let mut approvals = Self::load_approvals(&env, &action_id);
+        if Self::is_fresh(&approvals, idx, ttl, now) {
             panic_with_error!(&env, Error::AlreadyApproved);
         }
-        ttl::set_persistent(
-            &env,
-            &DataKey::Approval(Self::epoch(&env), action_id.clone(), signer.clone()),
-            &env.ledger().timestamp(),
-        );
+        approvals.bitmap |= 1 << idx;
+        while approvals.timestamps.len() <= idx {
+            approvals.timestamps.push_back(0);
+        }
+        approvals.timestamps.set(idx, now);
+        Self::save_approvals(&env, &action_id, &approvals);
         events::approved(&env, signer, action_id, meta.description_hash);
     }
 
@@ -264,14 +274,16 @@ impl Multisig {
         ttl::extend_instance(&env);
         signer.require_auth();
 
-        if !Self::has_approved(env.clone(), action_id.clone(), signer.clone()) {
+        Self::require_signer(&env, &signer);
+        let idx = Self::signer_index(&env, &signer);
+        let mut approvals = Self::load_approvals(&env, &action_id);
+        let (ttl, now) = (Self::approval_ttl(&env), env.ledger().timestamp());
+        if !Self::is_fresh(&approvals, idx, ttl, now) {
             panic_with_error!(&env, Error::NotYetApproved);
         }
-        env.storage().persistent().remove(&DataKey::Approval(
-            Self::epoch(&env),
-            action_id.clone(),
-            signer.clone(),
-        ));
+        approvals.bitmap &= !(1 << idx);
+        approvals.timestamps.set(idx, 0);
+        Self::save_approvals(&env, &action_id, &approvals);
         let hash = Self::description_hash(&env, &action_id);
         events::revoked(&env, signer, action_id, hash);
     }
@@ -281,58 +293,42 @@ impl Multisig {
     /// `approval_ttl` (zero ttl = never expires).
     pub fn has_approved(env: Env, action_id: BytesN<32>, signer: Address) -> bool {
         ttl::extend_instance(&env);
-        let approved_at: Option<u64> = ttl::get_persistent(
-            &env,
-            &DataKey::Approval(Self::epoch(&env), action_id, signer),
-        );
-        let Some(approved_at) = approved_at else {
+        let Some(idx) = Self::signers(&env).keys().first_index_of(signer) else {
             return false;
         };
-        let ttl: u64 = env.storage().instance().get(&DataKey::ApprovalTtl).unwrap();
-        if ttl == 0 {
-            return true;
-        }
-        env.ledger()
-            .timestamp()
-            .checked_sub(approved_at)
-            .unwrap_or(u64::MAX)
-            <= ttl
+        let approvals = Self::load_approvals(&env, &action_id);
+        Self::is_fresh(
+            &approvals,
+            idx,
+            Self::approval_ttl(&env),
+            env.ledger().timestamp(),
+        )
     }
 
     /// Number of signers with a fresh approval of `action_id`, regardless
     /// of their weight.
     pub fn get_approval_count(env: Env, action_id: BytesN<32>) -> u32 {
         ttl::extend_instance(&env);
-        let mut count = 0u32;
-        for (signer, _) in Self::signers(&env).iter() {
-            if Self::has_approved(env.clone(), action_id.clone(), signer) {
-                count += 1;
-            }
-        }
-        count
+        Self::tally(&env, &action_id).0
     }
 
     /// Summed weight of every fresh approval of `action_id` — recomputed
-    /// from each signer's freshness rather than an incremental counter,
+    /// from each approval's freshness rather than an incremental counter,
     /// since an approval can go stale purely from time passing.
     pub fn get_approval_weight(env: Env, action_id: BytesN<32>) -> u32 {
         ttl::extend_instance(&env);
-        let mut weight = 0u32;
-        for (signer, w) in Self::signers(&env).iter() {
-            if Self::has_approved(env.clone(), action_id.clone(), signer) {
-                // Bounded by the total weight, which initialize and every
-                // rotation checked fits in a u32.
-                weight += w;
-            }
-        }
-        weight
+        Self::tally(&env, &action_id).1
     }
 
+    /// False once the action is vetoed (its approvals are cleared and it
+    /// can never be approved again) or its `execute_by` deadline passed.
     pub fn is_approved(env: Env, action_id: BytesN<32>) -> bool {
         ttl::extend_instance(&env);
-        let weight = Self::get_approval_weight(env.clone(), action_id);
+        let weight = Self::tally(&env, &action_id).1;
         let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap();
-        weight >= threshold
+        // The deadline is only read once quorum is otherwise met, keeping
+        // the common path at a single approvals read.
+        weight >= threshold && !Self::past_deadline(&env, &action_id)
     }
 
     /// Clears every signer's approval of `action_id` — for whoever
@@ -372,7 +368,10 @@ impl Multisig {
         proposer.require_auth();
         Self::require_signer(&env, &proposer);
         if let Some(meta) = Self::get_action(env.clone(), action_id.clone()) {
-            if matches!(meta.status, ActionStatus::Pending | ActionStatus::Executed) {
+            if matches!(
+                meta.status,
+                ActionStatus::Pending | ActionStatus::Executed | ActionStatus::Vetoed
+            ) {
                 panic_with_error!(&env, Error::ActionAlreadyRegistered);
             }
         }
@@ -388,6 +387,13 @@ impl Multisig {
         if meta.status != ActionStatus::Pending {
             panic_with_error!(&env, Error::ActionNotPending);
         }
+        if Self::past_deadline(&env, &action_id) {
+            let execute_by = Self::get_execute_by(env.clone(), action_id.clone()).unwrap();
+            Self::clear_approvals(&env, &action_id);
+            Self::finish(&env, &action_id, ActionStatus::Expired);
+            events::action_expired(&env, action_id, execute_by);
+            return;
+        }
         let ttl: u64 = env.storage().instance().get(&DataKey::ApprovalTtl).unwrap();
         let age = env.ledger().timestamp().saturating_sub(meta.created_at);
         if ttl == 0 || age <= ttl || Self::get_approval_count(env.clone(), action_id.clone()) > 0 {
@@ -396,6 +402,99 @@ impl Multisig {
         Self::clear_approvals(&env, &action_id);
         let hash = Self::finish(&env, &action_id, ActionStatus::Expired);
         events::expired(&env, action_id, hash);
+    }
+
+    /// Sets the vetoer exactly once. It can only be called by this
+    /// contract itself, i.e. through an approved `propose`/`execute`, and
+    /// is immutable afterwards (rotating a compromised vetoer means
+    /// redeploying), so a compromised signer majority can't swap it out.
+    pub fn set_vetoer(env: Env, vetoer: Address) {
+        ttl::extend_instance(&env);
+        env.current_contract_address().require_auth();
+        if env.storage().instance().has(&DataKey::Vetoer) {
+            panic_with_error!(&env, Error::VetoerAlreadySet);
+        }
+        env.storage().instance().set(&DataKey::Vetoer, &vetoer);
+    }
+
+    pub fn get_vetoer(env: Env) -> Option<Address> {
+        ttl::extend_instance(&env);
+        env.storage().instance().get(&DataKey::Vetoer)
+    }
+
+    /// Cancels a pending action for good: its approvals are cleared and
+    /// `is_approved` stays false. Vetoing an already-executed (or
+    /// otherwise finished) action is rejected. The vetoer may also be a
+    /// signer.
+    pub fn veto(env: Env, vetoer: Address, action_id: BytesN<32>) {
+        ttl::extend_instance(&env);
+        vetoer.require_auth();
+        let stored: Option<Address> = env.storage().instance().get(&DataKey::Vetoer);
+        if stored != Some(vetoer.clone()) {
+            panic_with_error!(&env, Error::NotVetoer);
+        }
+        Self::require_pending(&env, &action_id);
+        Self::clear_approvals(&env, &action_id);
+        let hash = Self::finish(&env, &action_id, ActionStatus::Vetoed);
+        events::vetoed(&env, vetoer, action_id, hash);
+    }
+
+    /// Sets a hard deadline (ledger timestamp) after which `is_approved`
+    /// is false for this pending action, regardless of `approval_ttl`.
+    /// Only the action's proposer may set it, once, and it must lie in
+    /// the future. The boundary is inclusive: at `execute_by` the action
+    /// is still approved.
+    pub fn set_execute_by(env: Env, proposer: Address, action_id: BytesN<32>, execute_by: u64) {
+        ttl::extend_instance(&env);
+        proposer.require_auth();
+        let meta = Self::get_action(env.clone(), action_id.clone())
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ActionNotPending));
+        if meta.status != ActionStatus::Pending {
+            panic_with_error!(&env, Error::ActionNotPending);
+        }
+        if meta.proposer != proposer {
+            panic_with_error!(&env, Error::NotProposer);
+        }
+        if execute_by <= env.ledger().timestamp() {
+            panic_with_error!(&env, Error::InvalidDeadline);
+        }
+        let key = DataKey::ExecuteBy(action_id);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, Error::DeadlineAlreadySet);
+        }
+        ttl::set_persistent(&env, &key, &execute_by);
+    }
+
+    pub fn get_execute_by(env: Env, action_id: BytesN<32>) -> Option<u64> {
+        ttl::get_persistent(&env, &DataKey::ExecuteBy(action_id))
+    }
+
+    /// Permissionless, bounded cleanup: removes the approvals entry of every
+    /// named action whose entry can no longer affect `is_approved` — it is
+    /// finished (executed, reset, expired, vetoed) or holds no fresh
+    /// approval and has no passed deadline. Actions that don't qualify are
+    /// skipped. Returns how many entries were removed. Action registry
+    /// entries (the executed flag) and deadlines are never pruned.
+    pub fn prune(env: Env, action_ids: Vec<BytesN<32>>) -> u32 {
+        ttl::extend_instance(&env);
+        if action_ids.len() > MAX_PRUNE {
+            panic_with_error!(&env, Error::InvalidPageLimit);
+        }
+        let mut removed = 0u32;
+        for id in action_ids.iter() {
+            if !Self::approvals_exist(&env, &id) {
+                continue;
+            }
+            let finished = Self::get_action(env.clone(), id.clone())
+                .map(|m| m.status != ActionStatus::Pending)
+                .unwrap_or(true);
+            let dead = Self::tally(&env, &id).0 == 0 && !Self::past_deadline(&env, &id);
+            if finished || dead {
+                Self::clear_approvals(&env, &id);
+                removed += 1;
+            }
+        }
+        removed
     }
 
     pub fn get_action(env: Env, action_id: BytesN<32>) -> Option<ActionMeta> {
@@ -648,6 +747,9 @@ impl Multisig {
         rotation_threshold: u32,
     ) {
         let total = Self::total_weight(env, signers);
+        if signers.len() > MAX_SIGNERS {
+            panic_with_error!(env, Error::TooManySigners);
+        }
         if signers.is_empty() || threshold == 0 || threshold > total {
             panic_with_error!(env, Error::InvalidThreshold);
         }
@@ -813,18 +915,114 @@ impl Multisig {
                 .set(&count_key, &count.saturating_sub(1));
         }
         meta.status = status;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Action(action_id.clone()), &meta);
+        // Executed-flag retention policy: the finished entry is the replay
+        // protection, so it is never pruned and is kept alive with the
+        // standard persistent TTL (renewable by anyone through `bump`).
+        ttl::set_persistent(env, &DataKey::Action(action_id.clone()), &meta);
         meta.description_hash
     }
 
+    fn approval_ttl(env: &Env) -> u64 {
+        env.storage().instance().get(&DataKey::ApprovalTtl).unwrap()
+    }
+
+    fn signer_index(env: &Env, signer: &Address) -> u32 {
+        Self::signers(env)
+            .keys()
+            .first_index_of(signer.clone())
+            .unwrap_or_else(|| panic_with_error!(env, Error::NotASigner))
+    }
+
+    fn is_fresh(approvals: &ActionApprovals, idx: u32, ttl: u64, now: u64) -> bool {
+        if approvals.bitmap & (1 << idx) == 0 {
+            return false;
+        }
+        let at = approvals.timestamps.get(idx).unwrap_or(0);
+        ttl == 0 || now.checked_sub(at).unwrap_or(u64::MAX) <= ttl
+    }
+
+    /// (fresh approval count, fresh approval weight) from the one entry.
+    fn tally(env: &Env, action_id: &BytesN<32>) -> (u32, u32) {
+        let approvals = Self::load_approvals(env, action_id);
+        if approvals.bitmap == 0 {
+            return (0, 0);
+        }
+        let (ttl, now) = (Self::approval_ttl(env), env.ledger().timestamp());
+        let (mut count, mut weight) = (0u32, 0u32);
+        for (i, (_, w)) in Self::signers(env).iter().enumerate() {
+            if Self::is_fresh(&approvals, i as u32, ttl, now) {
+                count += 1;
+                // Bounded by the total weight, which initialize and every
+                // rotation checked fits in a u32.
+                weight += w;
+            }
+        }
+        (count, weight)
+    }
+
+    fn past_deadline(env: &Env, action_id: &BytesN<32>) -> bool {
+        let at: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExecuteBy(action_id.clone()));
+        at.map(|t| env.ledger().timestamp() > t).unwrap_or(false)
+    }
+
+    // Storage class: with `approval_ttl > 0` an approvals entry can only
+    // matter while its newest approval is fresh, so it lives in temporary
+    // storage with a TTL covering `approval_ttl` (conservatively assuming
+    // ledgers close at least every 3s): when it lapses, every approval in it
+    // has already expired, which is exactly "no approvals". With
+    // `approval_ttl == 0` approvals never expire, so they stay persistent.
+    fn approvals_key(env: &Env, action_id: &BytesN<32>) -> DataKey {
+        DataKey::Approvals(Self::epoch(env), action_id.clone())
+    }
+
+    fn approvals_exist(env: &Env, action_id: &BytesN<32>) -> bool {
+        let key = Self::approvals_key(env, action_id);
+        if Self::approval_ttl(env) > 0 {
+            env.storage().temporary().has(&key)
+        } else {
+            env.storage().persistent().has(&key)
+        }
+    }
+
+    fn load_approvals(env: &Env, action_id: &BytesN<32>) -> ActionApprovals {
+        let key = Self::approvals_key(env, action_id);
+        let found: Option<ActionApprovals> = if Self::approval_ttl(env) > 0 {
+            env.storage().temporary().get(&key)
+        } else {
+            ttl::get_persistent(env, &key)
+        };
+        found.unwrap_or(ActionApprovals {
+            bitmap: 0,
+            timestamps: Vec::new(env),
+        })
+    }
+
+    fn save_approvals(env: &Env, action_id: &BytesN<32>, approvals: &ActionApprovals) {
+        if approvals.bitmap == 0 {
+            return Self::clear_approvals(env, action_id);
+        }
+        let key = Self::approvals_key(env, action_id);
+        let ttl = Self::approval_ttl(env);
+        if ttl > 0 {
+            let storage = env.storage().temporary();
+            storage.set(&key, approvals);
+            let ledgers = (ttl / 3 + 1).min(u32::MAX as u64) as u32;
+            let ledgers = ledgers.min(env.storage().max_ttl());
+            storage.extend_ttl(&key, ledgers, ledgers);
+        } else {
+            ttl::set_persistent(env, &key, approvals);
+        }
+    }
+
     fn clear_approvals(env: &Env, action_id: &BytesN<32>) {
-        let epoch = Self::epoch(env);
-        for (signer, _) in Self::signers(env).iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Approval(epoch, action_id.clone(), signer));
+        let key = Self::approvals_key(env, action_id);
+        if Self::approval_ttl(env) > 0 {
+            env.storage().temporary().remove(&key);
+        } else {
+            env.storage().persistent().remove(&key);
         }
     }
 }

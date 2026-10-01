@@ -1,0 +1,19 @@
+[package]
+name = "zenith-params"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+# rlib alongside cdylib so options_market can register a real registry in
+# its tests, same as multisig and price_oracle.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
