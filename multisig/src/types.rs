@@ -3,11 +3,6 @@ use soroban_sdk::{contracttype, Address, BytesN, Symbol, Val, Vec};
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
-use soroban_sdk::{contracttype, Address, BytesN, Symbol, Val, Vec};
-
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
     /// O(1) membership check — see issue #101.
     IsSigner(Address),
     /// Map<Address, u32>: every signer and their voting weight.
@@ -18,14 +13,16 @@ pub enum DataKey {
     /// Fixed at initialize, immutable — same rationale as Signers and
     /// Threshold. Zero means approvals never expire.
     ApprovalTtl,
-    /// The ledger timestamp at which `signer` approved `action_id`.
-    /// Absent means never approved, or approved and then revoked.
-    /// `action_id` is entirely caller-defined — this contract never
-    /// interprets what the action actually does, only how many of the
-    /// fixed signer set have signed off on it, and since when.
-    /// Keyed by the signer-set epoch too, so a rotation invalidates
-    /// every outstanding vote in O(1) by bumping `SignerEpoch`.
-    Approval(u32, BytesN<32>, Address),
+    /// Every signer's approval of `action_id` in one entry (bitmap by signer
+    /// index in the `Signers` map, plus per-index approval timestamps).
+    /// Absent means no approvals. Keyed by the signer-set epoch, so a
+    /// rotation invalidates every outstanding vote in O(1). Lives in
+    /// temporary storage when `ApprovalTtl > 0`, persistent otherwise.
+    Approvals(u32, BytesN<32>),
+    /// The one-time vetoer address; immutable once set.
+    Vetoer,
+    /// action_id -> hard `execute_by` timestamp, independent of the ttl.
+    ExecuteBy(BytesN<32>),
     /// action_id -> ActionMeta, the on-chain registry entry.
     Action(BytesN<32>),
     /// Bounded index of every action still awaiting a vote. Entries are
@@ -82,6 +79,7 @@ pub enum ActionStatus {
     Executed = 1,
     Reset = 2,
     Expired = 3,
+    Vetoed = 4,
 }
 
 #[contracttype]
@@ -102,4 +100,14 @@ pub struct Proposal {
     pub function: Symbol,
     pub args: Vec<Val>,
     pub nonce: u64,
+}
+
+/// Per-action approvals in a single ledger entry. `timestamps[i]` is when
+/// the signer at index `i` approved; it is only meaningful while bit `i`
+/// of `bitmap` is set. Signer indexes are stable within a signer-set epoch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionApprovals {
+    pub bitmap: u32,
+    pub timestamps: Vec<u64>,
 }

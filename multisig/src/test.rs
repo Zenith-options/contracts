@@ -911,16 +911,14 @@ fn ttl_policy_keeps_approvals_live_and_bump_extends_them() {
     let addr = h.client.address.clone();
     for _ in 0..5 {
         advance_ledgers(&h.env, 20 * ttl::DAY_IN_LEDGERS);
-        h.client.bump(&vec![
-            &h.env,
-            DataKey::Approval(0, id.clone(), h.signers[0].clone()),
-        ]);
+        h.client
+            .bump(&vec![&h.env, DataKey::Approvals(0, id.clone())]);
     }
     assert!(is_live(&h.env, &addr, None));
     assert!(is_live(
         &h.env,
         &addr,
-        Some(DataKey::Approval(0, id.clone(), h.signers[0].clone()))
+        Some(DataKey::Approvals(0, id.clone()))
     ));
     assert!(h.client.has_approved(&id, &h.signers[0]));
 }
@@ -939,7 +937,7 @@ fn archived_approval_restores_and_counts_identically() {
     assert!(!is_live(
         &h.env,
         &addr,
-        Some(DataKey::Approval(0, id.clone(), h.signers[0].clone()))
+        Some(DataKey::Approvals(0, id.clone()))
     ));
 
     restore_archived(&h.env);
@@ -1428,4 +1426,186 @@ fn signer_changes_cannot_be_reset_through_the_generic_path() {
     );
     approve_all(&h, &id);
     h.client.reset(&id);
+}
+
+/// Benchmark (run with `--nocapture`): CPU cost of `is_approved` with 16
+/// signers, all approved. Read-entry count is 1 + N per call before the
+/// single-entry bitmap storage, and 1 (+ instance) after.
+#[test]
+fn bench_is_approved_16_signers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let mut signers = Vec::new(&env);
+    for _ in 0..16 {
+        signers.push_back(Address::generate(&env));
+    }
+    let client = MultisigClient::new(&env, &env.register_contract(None, Multisig));
+    client.initialize(&signers, &16, &0);
+    let id = aid(&env, 1);
+    for s in signers.iter() {
+        client.approve(&s, &id);
+    }
+    env.budget().reset_default();
+    assert!(client.is_approved(&id));
+    std::println!(
+        "BENCH is_approved cpu={}",
+        env.budget().cpu_instruction_cost()
+    );
+}
+
+// ─── veto, deadlines, prune, bitmap storage ─────────────────────────────────
+
+fn set_time(env: &Env, ts: u64) {
+    env.ledger().with_mut(|l| l.timestamp = ts);
+}
+
+fn with_ttl<'a>(ttl: u64) -> Harness<'a> {
+    let h = setup();
+    let env = h.env.clone();
+    let contract_id = env.register_contract(None, Multisig);
+    let client = MultisigClient::new(&env, &contract_id);
+    client.initialize(&Vec::from_array(&env, h.signers.clone()), &2, &ttl);
+    Harness {
+        env,
+        client,
+        signers: h.signers,
+    }
+}
+
+#[test]
+fn veto_blocks_approval_permanently() {
+    let h = setup();
+    let vetoer = Address::generate(&h.env);
+    h.client.set_vetoer(&vetoer);
+    let id = aid(&h.env, 1);
+    h.client.approve(&h.signers[0], &id);
+    h.client.approve(&h.signers[1], &id);
+    assert!(h.client.is_approved(&id));
+    h.client.veto(&vetoer, &id);
+    assert!(!h.client.is_approved(&id));
+    assert_eq!(
+        h.client.get_action(&id).unwrap().status,
+        ActionStatus::Vetoed
+    );
+    assert!(h.client.try_approve(&h.signers[2], &id).is_err());
+    assert!(!h.client.is_approved(&id));
+    // A second veto, or one on a finished action, is rejected.
+    assert!(h.client.try_veto(&vetoer, &id).is_err());
+}
+
+#[test]
+fn veto_rejects_non_vetoer_and_executed_actions() {
+    let h = setup();
+    let vetoer = Address::generate(&h.env);
+    let id = aid(&h.env, 1);
+    h.client.approve(&h.signers[0], &id);
+    assert!(h.client.try_veto(&vetoer, &id).is_err()); // none configured
+    h.client.set_vetoer(&vetoer);
+    assert!(h.client.try_set_vetoer(&vetoer).is_err()); // immutable
+    assert!(h.client.try_veto(&h.signers[0], &id).is_err());
+    h.client.approve(&h.signers[1], &id);
+    h.client.reset(&id);
+    assert!(h.client.try_veto(&vetoer, &id).is_err());
+}
+
+#[test]
+fn execute_by_deadline_boundary() {
+    let h = setup();
+    set_time(&h.env, 100);
+    let id = aid(&h.env, 1);
+    h.client.approve(&h.signers[0], &id);
+    h.client.approve(&h.signers[1], &id);
+    assert!(h
+        .client
+        .try_set_execute_by(&h.signers[1], &id, &200)
+        .is_err()); // not proposer
+    assert!(h
+        .client
+        .try_set_execute_by(&h.signers[0], &id, &100)
+        .is_err()); // not future
+    h.client.set_execute_by(&h.signers[0], &id, &200);
+    assert!(h
+        .client
+        .try_set_execute_by(&h.signers[0], &id, &300)
+        .is_err()); // once
+    set_time(&h.env, 200);
+    assert!(h.client.is_approved(&id));
+    set_time(&h.env, 201);
+    assert!(!h.client.is_approved(&id));
+    h.client.expire(&id);
+    assert_eq!(
+        h.client.get_action(&id).unwrap().status,
+        ActionStatus::Expired
+    );
+    assert!(!h.client.is_approved(&id));
+}
+
+#[test]
+fn prune_never_changes_is_approved() {
+    let h = with_ttl(100);
+    set_time(&h.env, 1_000);
+    let (live, stale, done) = (aid(&h.env, 1), aid(&h.env, 2), aid(&h.env, 3));
+    h.client.approve(&h.signers[0], &stale);
+    h.client.approve(&h.signers[0], &done);
+    h.client.approve(&h.signers[1], &done);
+    h.client.reset(&done);
+    set_time(&h.env, 1_500);
+    h.client.approve(&h.signers[0], &live);
+    h.client.approve(&h.signers[1], &live);
+    let ids = vec![
+        &h.env,
+        live.clone(),
+        stale.clone(),
+        done.clone(),
+        aid(&h.env, 9),
+    ];
+    let before: std::vec::Vec<bool> = ids.iter().map(|i| h.client.is_approved(&i)).collect();
+    assert_eq!(h.client.prune(&ids), 1); // only `stale`; `done` already cleared
+    let after: std::vec::Vec<bool> = ids.iter().map(|i| h.client.is_approved(&i)).collect();
+    assert_eq!(before, after);
+    assert_eq!(h.client.get_approval_count(&live), 2);
+    assert_eq!(
+        h.client.get_action(&done).unwrap().status,
+        ActionStatus::Reset
+    );
+}
+
+#[test]
+fn prune_is_bounded() {
+    let h = setup();
+    let mut ids = Vec::new(&h.env);
+    for i in 0..=crate::MAX_PRUNE as u8 {
+        ids.push_back(aid(&h.env, i));
+    }
+    assert!(h.client.try_prune(&ids).is_err());
+}
+
+#[test]
+fn temporary_approvals_lapse_with_the_ttl() {
+    let h = with_ttl(100);
+    set_time(&h.env, 1_000);
+    let id = aid(&h.env, 1);
+    h.client.approve(&h.signers[0], &id);
+    h.client.approve(&h.signers[1], &id);
+    assert!(h.client.is_approved(&id));
+    // Past the ttl in both timestamp and ledgers: gone either way.
+    set_time(&h.env, 1_101);
+    advance_ledgers(&h.env, 100);
+    assert!(!h.client.is_approved(&id));
+    assert_eq!(h.client.get_approval_count(&id), 0);
+    // Re-approving after expiry works.
+    h.client.approve(&h.signers[0], &id);
+    assert!(h.client.has_approved(&id, &h.signers[0]));
+}
+
+#[test]
+fn more_than_32_signers_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let mut s = Vec::new(&env);
+    for _ in 0..33 {
+        s.push_back(Address::generate(&env));
+    }
+    let client = MultisigClient::new(&env, &env.register_contract(None, Multisig));
+    assert!(client.try_initialize(&s, &2, &0).is_err());
 }

@@ -889,6 +889,60 @@ stellar tx simulate --network testnet < pause.signed.tx \
 | 24 | `RotationDelayActive` |
 | 25 | `SignerChangeNotQueued` |
 
+### Approval storage, veto and deadlines, pruning
+
+**Single-entry approvals.** Every action's approvals live in one entry,
+`Approvals(epoch, action_id) -> { bitmap: u32, timestamps: Vec<u64> }`, indexed
+by the signer's position in the signer map, so `is_approved`,
+`has_approved`, `get_approval_count`, `approve`, `revoke` and `reset` each touch
+one approvals entry instead of one per signer. At most 32 signers are
+allowed (`TooManySigners`). A signer-set rotation bumps the epoch, which
+starts a fresh index space. Expired approvals are detected by comparing
+the stored timestamps. Entries written by older deployments (one
+`Approval(epoch, id, signer)` entry per signer) are not read; such a
+deployment must be re-approved or upgraded with a migration.
+
+| `is_approved`, 16 signers, all approved | before | after |
+|---|---|---|
+| approval ledger entries read | 16 | 1 |
+| CPU instructions | 887,941 | 136,629 |
+
+(`bench_is_approved_16_signers`; the deadline entry is read only once quorum
+is met.)
+
+**Storage class.** With `approval_ttl > 0` the approvals entry is
+*temporary* storage whose TTL covers `approval_ttl` (assuming ledgers close at
+least every 3 s, i.e. it can only outlive the approvals). When it lapses every
+approval in it has already expired, which is exactly "no approvals".
+With `approval_ttl == 0` approvals never expire and stay persistent. The
+action registry entry (`Action(id)`, which carries the executed flag used as
+replay protection) is persistent, never pruned, and re-extended to the standard
+persistent TTL when an action finishes; anyone can keep it alive with `bump`.
+
+**`prune(action_ids)`** is permissionless and bounded (`MAX_PRUNE` = 20). It
+deletes the approvals entry of an action only if that cannot change
+`is_approved`: the action is finished, or it has no fresh approval and no passed
+deadline. Registry entries and deadlines are never removed. Nothing prunes
+automatically.
+
+**Veto and deadlines.** `set_vetoer` can only be called by the multisig itself
+(through an approved `propose`/`execute`), exactly once; the vetoer is then
+immutable (replacing it means redeploying). `veto(vetoer, id)` cancels a
+*pending* action permanently: approvals are cleared, `approve` rejects it, and
+`is_approved` stays false; a veto after execution is rejected, and the
+vetoer may also be a signer. The proposer of a pending action may call
+`set_execute_by(id, ts)` once; after `ts` (inclusive boundary) `is_approved`
+is false regardless of `approval_ttl`, and `expire` retires it with an
+`action_expired` event. `veto` emits `vetoed`.
+
+```
+register ──approve──▶ Pending ──threshold──▶ is_approved ──execute/reset──▶ Executed/Reset
+              │          │                        │
+              │          ├─ veto (vetoer) ────────┴──▶ Vetoed   (terminal, never approved again)
+              │          └─ now > execute_by ─ expire ▶ Expired (action_expired)
+              └─ approval older than approval_ttl stops counting (temporary entry lapses)
+```
+
 ### Migrating from `_via_multisig` to executor mode
 
 1. Deploy and `initialize` a multisig with the intended signers and threshold.
